@@ -1,8 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * This eBPF/XDP program implements a selective socket redirection mechanism
- * based on source IP and destination port/protocol.
- */
 
 #include <linux/bpf.h>
 #include <linux/types.h>
@@ -12,8 +8,34 @@
 
 #include "parsing_helpers.h"
 
-#define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
+
+struct genevehdr {
+	__u8 ver_opt_len;
+	__u8 flags;
+	__be16 proto_type;
+	__u8 vni[3];
+	__u8 reserved;
+};
+
+static __always_inline int parse_genevehdr(struct hdr_cursor *nh, void *data_end, struct genevehdr **ghdr)
+{
+	struct genevehdr *gh = nh->pos;
+
+	if ((void *)(gh + 1) > data_end)
+		return -1;
+
+	if ((gh->ver_opt_len >> 6) != 0) // Only version 0 supported
+		return -1;
+
+	// Check that the protocol type is valid (IPv4 or IPv6).
+	if (bpf_ntohs(gh->proto_type) != ETH_P_IP && bpf_ntohs(gh->proto_type) != ETH_P_IPV6)
+		return -1;
+
+	*ghdr = gh;
+	nh->pos = gh + 1; // Advance cursor past GENEVE header
+	return 0;
+}
 
 #define MAX_QUEUES 256
 
@@ -34,7 +56,6 @@ struct {
 #define MAX_BINDS 16
 
 struct bind_key {
-	__u8 proto; // IPPROTO_UDP, IPPROTO_TCP
 	__u8 family; // AF_INET or AF_INET6
 	__u32 addr[4]; // IPv4 uses only dst_ip[0], IPv6 uses all 4.
 	__u16 port; // Destination port
@@ -61,6 +82,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	struct tcphdr *tcph;
 	struct udphdr *udph;
 	struct bind_key key = { 0 };
+	struct genevehdr *geneve;
 
 	qidconf = bpf_map_lookup_elem(&qidconf_map, &index);
 	if (!qidconf)
@@ -72,7 +94,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
 	if (nh_type == bpf_htons(ETH_P_IPV6)) {
 		ip_proto = parse_ip6hdr(&nh, data_end, &ip6h);
-		if (ip_proto < 0)
+		if (ip_proto != IPPROTO_UDP)
 			return XDP_PASS;
 
 		key.family = AF_INET6;
@@ -80,27 +102,22 @@ int xdp_sock_prog(struct xdp_md *ctx)
 			key.addr[i] = bpf_ntohl(ip6h->daddr.s6_addr32[i]);
 	} else {
 		ip_proto = parse_iphdr(&nh, data_end, &iph);
-		if (ip_proto < 0)
+		if (ip_proto != IPPROTO_UDP)
 			return XDP_PASS;
 
 		key.family = AF_INET;
 		key.addr[0] = bpf_ntohl(iph->daddr);
 	}
-	key.proto = (__u8)ip_proto;
 
-	if (ip_proto == IPPROTO_TCP) {
-		if (parse_tcphdr(&nh, data_end, &tcph) < 0)
+	if (parse_udphdr(&nh, data_end, &udph) < 0)
 			return XDP_PASS;
-		key.port = bpf_ntohs(tcph->dest);
-	} else if (ip_proto == IPPROTO_UDP) {
-		if (parse_udphdr(&nh, data_end, &udph) < 0)
-			return XDP_PASS;
-		key.port = bpf_ntohs(udph->dest);
-	} else {
-		return XDP_PASS;
-	}
+	
+	key.port = bpf_ntohs(udph->dest);
 
 	if (!bpf_map_lookup_elem(&bind_map, &key))
+		return XDP_PASS;
+
+	if (parse_genevehdr(&nh, data_end, &geneve) < 0)
 		return XDP_PASS;
 
 	return bpf_redirect_map(&xsks_map, index, XDP_PASS);

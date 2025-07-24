@@ -13,9 +13,8 @@ import (
 )
 
 type bindBindKey struct {
-	Proto  uint8
 	Family uint8
-	_      [2]byte
+	_      [3]byte
 	Addr   [4]uint32
 	Port   uint16
 	_      [2]byte
