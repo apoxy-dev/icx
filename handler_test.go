@@ -2,6 +2,7 @@ package icx_test
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -29,7 +30,10 @@ func TestHandler(t *testing.T) {
 	var key [16]byte
 	copy(key[:], []byte("0123456789abcdef"))
 
-	h, err := icx.NewHandler(localAddr, peerAddr, virtMAC, 0x12345, key, key, true)
+	h, err := icx.NewHandler(localAddr, virtMAC, true)
+	require.NoError(t, err)
+
+	err = h.AddVirtualNetwork(0x12345, peerAddr, key, key, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
 	require.NoError(t, err)
 
 	virtFrame := makeIPv4UDPEthernetFrame(virtMAC)
@@ -50,6 +54,18 @@ func TestHandler(t *testing.T) {
 	eth := header.Ethernet(receivedFrame)
 
 	require.Equal(t, virtMAC, eth.DestinationAddress())
+
+	// Now test removing the virtual network
+	require.NoError(t, h.RemoveVirtualNetwork(0x12345))
+
+	// Attempt to send the same frame again
+	frameLen, loopback = h.VirtToPhy(virtFrame, phyFrame)
+	require.Zero(t, frameLen)
+	require.False(t, loopback)
+
+	// Attempt to decode again (should also fail)
+	decodedLen = h.PhyToVirt(phyFrame[:frameLen], receivedFrame)
+	require.Zero(t, decodedLen)
 }
 
 func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {

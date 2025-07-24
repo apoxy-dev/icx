@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 
@@ -19,47 +20,34 @@ import (
 	"github.com/apoxy-dev/icx/replay"
 	"github.com/apoxy-dev/icx/tunnel"
 	"github.com/apoxy-dev/icx/udp"
+	"github.com/dpeckett/triemap"
 )
 
 var _ tunnel.Handler = (*Handler)(nil)
 
-type Handler struct {
-	localAddr         *tcpip.FullAddress
-	peerAddr          *tcpip.FullAddress
-	virtualNetworkID  uint
-	virtMAC           tcpip.LinkAddress
-	sourcePortHashing bool
-	fakeSrcMAC        tcpip.LinkAddress // Fake source MAC address for virtual L2 frames
-	proxyARP          *proxyarp.ProxyARP
-	rxCipher          cipher.AEAD
-	txCipher          cipher.AEAD
-	txCounter         atomic.Uint64
-	replayFilter      replay.Filter
-	hdrPool           *sync.Pool
+// The state associated with each virtual network.
+type virtualNetwork struct {
+	id           uint // The VNI of the network
+	remoteAddr   *tcpip.FullAddress
+	rxCipher     cipher.AEAD
+	txCipher     cipher.AEAD
+	txCounter    atomic.Uint64
+	replayFilter replay.Filter
 }
 
-func NewHandler(localAddr, peerAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, virtualNetworkID uint, rxKey, txKey [16]byte, sourcePortHashing bool) (*Handler, error) {
+type Handler struct {
+	localAddr         *tcpip.FullAddress                // Local address of the physical interface (will be used as source address for UDP frames)
+	virtMAC           tcpip.LinkAddress                 // Mac address of the virtual interface
+	fakeSrcMAC        tcpip.LinkAddress                 // Fake source MAC address for virtual L2 frames
+	networkByID       sync.Map                          // Maps VNI to network
+	networkByAddress  *triemap.TrieMap[*virtualNetwork] // Maps tunnel destination address to network
+	proxyARP          *proxyarp.ProxyARP
+	hdrPool           *sync.Pool
+	sourcePortHashing bool
+}
+
+func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourcePortHashing bool) (*Handler, error) {
 	fakeSrcMAC := tcpip.GetRandMacAddr()
-
-	rxBlock, err := aes.NewCipher(rxKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("failed to create AES cipher for RX: %w", err)
-	}
-
-	rxCipher, err := cipher.NewGCM(rxBlock)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM cipher for RX: %w", err)
-	}
-
-	txBlock, err := aes.NewCipher(txKey[:])
-	if err != nil {
-		return nil, fmt.Errorf("failed to create AES cipher for TX: %w", err)
-	}
-
-	txCipher, err := cipher.NewGCM(txBlock)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM cipher for TX: %w", err)
-	}
 
 	hdrPool := &sync.Pool{
 		New: func() any {
@@ -69,15 +57,66 @@ func NewHandler(localAddr, peerAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddres
 
 	return &Handler{
 		localAddr:         localAddr,
-		peerAddr:          peerAddr,
 		virtMAC:           virtMAC,
-		sourcePortHashing: sourcePortHashing,
 		fakeSrcMAC:        fakeSrcMAC,
+		networkByAddress:  triemap.New[*virtualNetwork](),
 		proxyARP:          proxyarp.NewProxyARP(fakeSrcMAC),
-		rxCipher:          rxCipher,
-		txCipher:          txCipher,
+		sourcePortHashing: sourcePortHashing,
 		hdrPool:           hdrPool,
 	}, nil
+}
+
+// AddVirtualNetwork adds a new network with the given VNI and remote address.
+func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, rxKey, txKey [16]byte, tunnelAddrs []netip.Prefix) error {
+	if _, exists := h.networkByID.Load(vni); exists {
+		return fmt.Errorf("network with VNI %d already exists", vni)
+	}
+
+	rxBlock, err := aes.NewCipher(rxKey[:])
+	if err != nil {
+		return fmt.Errorf("failed to create AES cipher for RX: %w", err)
+	}
+	rxCipher, err := cipher.NewGCM(rxBlock)
+	if err != nil {
+		return fmt.Errorf("failed to create GCM cipher for RX: %w", err)
+	}
+
+	txBlock, err := aes.NewCipher(txKey[:])
+	if err != nil {
+		return fmt.Errorf("failed to create AES cipher for TX: %w", err)
+	}
+	txCipher, err := cipher.NewGCM(txBlock)
+	if err != nil {
+		return fmt.Errorf("failed to create GCM cipher for TX: %w", err)
+	}
+
+	net := &virtualNetwork{
+		id:         vni,
+		remoteAddr: remoteAddr,
+		rxCipher:   rxCipher,
+		txCipher:   txCipher,
+	}
+
+	h.networkByID.Store(vni, net)
+	for _, addr := range tunnelAddrs {
+		h.networkByAddress.Insert(addr, net)
+	}
+
+	return nil
+}
+
+// RemoveVirtualNetwork removes a network by its VNI.
+func (h *Handler) RemoveVirtualNetwork(vni uint) error {
+	value, exists := h.networkByID.Load(vni)
+	if !exists {
+		return fmt.Errorf("network with VNI %d does not exist", vni)
+	}
+	h.networkByID.Delete(vni)
+
+	net := value.(*virtualNetwork)
+	h.networkByAddress.RemoveValue(net)
+
+	return nil
 }
 
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
@@ -100,12 +139,13 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
-	if hdr.VNI != uint32(h.virtualNetworkID) {
-		slog.Debug("Dropping frame with mismatched VNI",
-			slog.Uint64("expected", uint64(h.virtualNetworkID)),
-			slog.Uint64("received", uint64(hdr.VNI)))
+	// Is it a valid VNI?
+	value, exists := h.networkByID.Load(uint(hdr.VNI))
+	if !exists {
+		slog.Debug("Dropping frame with unknown VNI", slog.Uint64("vni", uint64(hdr.VNI)))
 		return 0
 	}
+	vnet := value.(*virtualNetwork)
 
 	// TODO: implement key rotation using epochs.
 
@@ -123,13 +163,13 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 	txCounter := binary.BigEndian.Uint64(nonce[4:])
 
-	if !h.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
+	if !vnet.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
 		// Delayed packets can cause some uneccesary noise here.
 		slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
 		return 0
 	}
 
-	decryptedFrame, err := h.rxCipher.Open(virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize], nonce, payload[hdrLen:], payload[:hdrLen])
+	decryptedFrame, err := vnet.rxCipher.Open(virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize], nonce, payload[hdrLen:], payload[:hdrLen])
 	if err != nil {
 		slog.Warn("Failed to decrypt payload", slog.Any("error", err))
 		return 0
@@ -180,13 +220,39 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	// Strip off the ethernet header
 	virtFrame = virtFrame[header.EthernetMinimumSize:]
 
+	// Get the tunnel destination address for the IP packet.
+	var dstAddr netip.Addr
+	switch ethType {
+	case header.IPv4ProtocolNumber:
+		var ok bool
+		dstAddr, ok = netip.AddrFromSlice(virtFrame[16:20])
+		if !ok {
+			slog.Warn("Invalid IPv4 address in frame")
+			return 0, false
+		}
+	case header.IPv6ProtocolNumber:
+		var ok bool
+		dstAddr, ok = netip.AddrFromSlice(virtFrame[24:40])
+		if !ok {
+			slog.Warn("Invalid IPv6 address in frame")
+			return 0, false
+		}
+	}
+
+	// Find the virtual network by the destination address.
+	vnet, ok := h.networkByAddress.Get(dstAddr)
+	if !ok {
+		slog.Debug("Dropping frame with unknown tunnel destination address", slog.String("dstAddr", dstAddr.String()))
+		return 0, false
+	}
+
 	hdr := h.hdrPool.Get().(*geneve.Header)
 	defer func() {
 		h.hdrPool.Put(hdr)
 	}()
 
 	*hdr = geneve.Header{
-		VNI:        uint32(h.virtualNetworkID),
+		VNI:        uint32(vnet.id),
 		NumOptions: 2,
 		Critical:   true,
 		Options: [geneve.MaxOptions]geneve.Option{
@@ -206,7 +272,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 
 	nonce := hdr.Options[1].Value[:12]
-	binary.BigEndian.PutUint64(nonce[4:], h.txCounter.Add(1))
+	binary.BigEndian.PutUint64(nonce[4:], vnet.txCounter.Add(1))
 
 	ipVersion := virtFrame[0] >> 4
 	switch ipVersion {
@@ -220,7 +286,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 
 	var payload []byte
-	if h.peerAddr.Addr.Len() == net.IPv4len {
+	if vnet.remoteAddr.Addr.Len() == net.IPv4len {
 		payload = phyFrame[udp.PayloadOffsetIPv4:]
 	} else {
 		payload = phyFrame[udp.PayloadOffsetIPv6:]
@@ -232,14 +298,14 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
-	encryptedFrameLen := len(h.txCipher.Seal(payload[hdrLen:hdrLen], nonce, virtFrame, payload[:hdrLen]))
+	encryptedFrameLen := len(vnet.txCipher.Seal(payload[hdrLen:hdrLen], nonce, virtFrame, payload[:hdrLen]))
 
 	localAddr := *h.localAddr
 	if h.sourcePortHashing {
 		localAddr.Port = flowhash.Hash(virtFrame)
 	}
 
-	frameLen, err := udp.Encode(phyFrame, &localAddr, h.peerAddr, hdrLen+encryptedFrameLen, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, hdrLen+encryptedFrameLen, false)
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
 		return 0, false

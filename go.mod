@@ -5,6 +5,7 @@ go 1.24.3
 require (
 	github.com/avast/retry-go/v4 v4.6.1
 	github.com/cilium/ebpf v0.18.0
+	github.com/dpeckett/triemap v0.3.1
 	github.com/google/gopacket v1.1.19
 	github.com/safchain/ethtool v0.6.1
 	github.com/slavc/xdp v0.3.4

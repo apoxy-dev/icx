@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -246,9 +247,18 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to decode tx-key: %w", err)
 	}
 
-	h, err := icx.NewHandler(localAddr, peerAddr, virtMAC, c.Uint("vni"), rxKey, txKey, c.Bool("source-port-hash"))
+	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"))
 	if err != nil {
 		return fmt.Errorf("failed to create handler: %w", err)
+	}
+
+	allPrefixes := []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	}
+
+	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, rxKey, txKey, allPrefixes); err != nil {
+		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 
 	tun, err := tunnel.NewTunnel(phyName, vethDev.Peer.Attrs().Name, ingressFilter, h, pcapWriter)

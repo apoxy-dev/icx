@@ -16,6 +16,7 @@ require (
 	github.com/avast/retry-go/v4 v4.6.1 // indirect
 	github.com/cilium/ebpf v0.18.0 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
+	github.com/dpeckett/triemap v0.3.1 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/safchain/ethtool v0.6.1 // indirect
