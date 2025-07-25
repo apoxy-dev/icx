@@ -83,7 +83,7 @@ func BenchmarkHandler(b *testing.B) {
 
 	const vni = 0x12345
 
-	err = handler.AddVirtualNetwork(vni, remoteAddr, key, key, []netip.Prefix{netip.MustParsePrefix("192.168.1.2/32")})
+	err = handler.AddVirtualNetwork(vni, remoteAddr, key, key, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
 	require.NoError(b, err)
 
 	virtMAC := tcpip.GetRandMacAddr()
@@ -124,7 +124,7 @@ func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
 
-	udp := header.UDP(frame[header.IPv4MinimumSize:])
+	udp := header.UDP(frame[header.EthernetMinimumSize+header.IPv4MinimumSize:])
 	udp.Encode(&header.UDPFields{
 		SrcPort: 1234,
 		DstPort: 5678,

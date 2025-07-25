@@ -33,6 +33,7 @@ type virtualNetwork struct {
 	txCipher     cipher.AEAD
 	txCounter    atomic.Uint64
 	replayFilter replay.Filter
+	tunnelAddrs  []netip.Prefix
 }
 
 type Handler struct {
@@ -91,10 +92,11 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, rxK
 	}
 
 	net := &virtualNetwork{
-		id:         vni,
-		remoteAddr: remoteAddr,
-		rxCipher:   rxCipher,
-		txCipher:   txCipher,
+		id:          vni,
+		remoteAddr:  remoteAddr,
+		rxCipher:    rxCipher,
+		txCipher:    txCipher,
+		tunnelAddrs: tunnelAddrs,
 	}
 
 	h.networkByID.Store(vni, net)
@@ -175,7 +177,41 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
-	isIPv6 := virtFrame[header.EthernetMinimumSize]>>4 == header.IPv6Version
+	isIPv6 := decryptedFrame[0]>>4 == header.IPv6Version
+
+	// Get the source address of the decrypted frame.
+	var srcAddr netip.Addr
+	if isIPv6 {
+		var ok bool
+		ipHdr := header.IPv6(decryptedFrame)
+		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv6 address in frame")
+			return 0
+		}
+	} else {
+		var ok bool
+		ipHdr := header.IPv4(decryptedFrame)
+		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv4 address in frame")
+			return 0
+		}
+	}
+
+	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
+	var validSrcAddr bool
+	for _, prefix := range vnet.tunnelAddrs {
+		// The list of prefixes is going to be very small.
+		if prefix.Contains(srcAddr) {
+			validSrcAddr = true
+			break
+		}
+	}
+	if !validSrcAddr {
+		slog.Debug("Dropping frame with invalid tunnel source address", slog.String("srcAddr", srcAddr.String()))
+		return 0
+	}
 
 	eth := header.Ethernet(virtFrame)
 	eth.Encode(&header.EthernetFields{
@@ -225,14 +261,16 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	switch ethType {
 	case header.IPv4ProtocolNumber:
 		var ok bool
-		dstAddr, ok = netip.AddrFromSlice(virtFrame[16:20])
+		ipHdr := header.IPv4(virtFrame)
+		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv4 address in frame")
 			return 0, false
 		}
 	case header.IPv6ProtocolNumber:
 		var ok bool
-		dstAddr, ok = netip.AddrFromSlice(virtFrame[24:40])
+		ipHdr := header.IPv6(virtFrame)
+		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv6 address in frame")
 			return 0, false
