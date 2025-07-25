@@ -1,6 +1,7 @@
 package icx_test
 
 import (
+	"log/slog"
 	"net"
 	"net/netip"
 	"testing"
@@ -13,6 +14,10 @@ import (
 )
 
 func TestHandler(t *testing.T) {
+	if testing.Verbose() {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
 	localAddr := &tcpip.FullAddress{
 		NIC:  1,
 		Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()),
@@ -55,17 +60,49 @@ func TestHandler(t *testing.T) {
 
 	require.Equal(t, virtMAC, eth.DestinationAddress())
 
-	// Now test removing the virtual network
 	require.NoError(t, h.RemoveVirtualNetwork(0x12345))
 
-	// Attempt to send the same frame again
 	frameLen, loopback = h.VirtToPhy(virtFrame, phyFrame)
 	require.Zero(t, frameLen)
 	require.False(t, loopback)
+}
 
-	// Attempt to decode again (should also fail)
-	decodedLen = h.PhyToVirt(phyFrame[:frameLen], receivedFrame)
-	require.Zero(t, decodedLen)
+func BenchmarkHandler(b *testing.B) {
+	if testing.Verbose() {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	localAddr := mustNewFullAddress("10.0.0.1", 6081)
+	remoteAddr := mustNewFullAddress("10.0.0.2", 6081)
+
+	handler, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false)
+	require.NoError(b, err)
+
+	var key [16]byte
+	copy(key[:], []byte("0123456789abcdef"))
+
+	const vni = 0x12345
+
+	err = handler.AddVirtualNetwork(vni, remoteAddr, key, key, []netip.Prefix{netip.MustParsePrefix("192.168.1.2/32")})
+	require.NoError(b, err)
+
+	virtMAC := tcpip.GetRandMacAddr()
+	virtFrame := makeIPv4UDPEthernetFrame(virtMAC)
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		phyFrame := make([]byte, 1500)
+		decodedFrame := make([]byte, 1400)
+
+		for pb.Next() {
+			n, _ := handler.VirtToPhy(virtFrame, phyFrame)
+			require.NotZero(b, n, "Failed to encode frame")
+
+			n = handler.PhyToVirt(phyFrame, decodedFrame)
+			require.NotZero(b, n, "Failed to decode frame")
+		}
+	})
 }
 
 func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {
@@ -95,4 +132,25 @@ func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {
 	})
 
 	return frame
+}
+
+func mustNewFullAddress(ip string, port uint16) *tcpip.FullAddress {
+	netAddr := netip.MustParseAddr(ip)
+
+	switch netAddr.BitLen() {
+	case 32:
+		addr := tcpip.AddrFrom4Slice(netAddr.AsSlice())
+		return &tcpip.FullAddress{
+			Addr: addr,
+			Port: port,
+		}
+	case 128:
+		addr := tcpip.AddrFrom16Slice(netAddr.AsSlice())
+		return &tcpip.FullAddress{
+			Addr: addr,
+			Port: port,
+		}
+	default:
+		panic("Unsupported IP address length")
+	}
 }
