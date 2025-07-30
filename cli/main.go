@@ -232,6 +232,7 @@ func run(c *cli.Context) error {
 
 	virtMAC := tcpip.LinkAddress(vethDev.Link.Attrs().HardwareAddr)
 
+	var epoch uint32 = 1
 	var rxKey, txKey [16]byte
 	// Hex decode the keys provided by the user
 	if len(c.String("rx-key")) != 32 || len(c.String("tx-key")) != 32 {
@@ -254,7 +255,7 @@ func run(c *cli.Context) error {
 		netip.MustParsePrefix("::/0"),
 	}
 
-	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, rxKey, txKey, allPrefixes); err != nil {
+	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, epoch, rxKey, txKey, allPrefixes); err != nil {
 		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 

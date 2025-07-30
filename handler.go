@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -27,17 +28,30 @@ import (
 // The size of the GENEVE header with icx options.
 const HeaderSize = 32
 
+const (
+	// The maximum lifetime of the keys used for encryption/decryption
+	keyLifespan = 24 * time.Hour
+	// How long to continue accepting packets with an old key after a new key is set.
+	keyGracePeriod = 30 * time.Second
+)
+
 var _ tunnel.Handler = (*Handler)(nil)
+
+type receiveCipher struct {
+	cipher.AEAD
+	expiresAt    time.Time
+	replayFilter replay.Filter
+}
 
 // The state associated with each virtual network.
 type virtualNetwork struct {
-	id           uint // The VNI of the network
-	remoteAddr   *tcpip.FullAddress
-	rxCipher     cipher.AEAD
-	txCipher     cipher.AEAD
-	txCounter    atomic.Uint64
-	replayFilter replay.Filter
-	tunnelAddrs  []netip.Prefix
+	id         uint // The VNI of the network
+	remoteAddr *tcpip.FullAddress
+	rxCiphers  sync.Map
+	txEpoch    atomic.Uint32
+	txCipher   cipher.AEAD
+	txCounter  atomic.Uint64
+	addrs      []netip.Prefix
 }
 
 type Handler struct {
@@ -72,43 +86,23 @@ func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourceP
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
-func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, rxKey, txKey [16]byte, tunnelAddrs []netip.Prefix) error {
+func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, epoch uint32, rxKey, txKey [16]byte, addrs []netip.Prefix) error {
 	if _, exists := h.networkByID.Load(vni); exists {
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
 
-	rxBlock, err := aes.NewCipher(rxKey[:])
-	if err != nil {
-		return fmt.Errorf("failed to create AES cipher for RX: %w", err)
-	}
-	rxCipher, err := cipher.NewGCM(rxBlock)
-	if err != nil {
-		return fmt.Errorf("failed to create GCM cipher for RX: %w", err)
-	}
-
-	txBlock, err := aes.NewCipher(txKey[:])
-	if err != nil {
-		return fmt.Errorf("failed to create AES cipher for TX: %w", err)
-	}
-	txCipher, err := cipher.NewGCM(txBlock)
-	if err != nil {
-		return fmt.Errorf("failed to create GCM cipher for TX: %w", err)
-	}
-
 	net := &virtualNetwork{
-		id:          vni,
-		remoteAddr:  remoteAddr,
-		rxCipher:    rxCipher,
-		txCipher:    txCipher,
-		tunnelAddrs: tunnelAddrs,
+		id:         vni,
+		remoteAddr: remoteAddr,
+		addrs:      addrs,
 	}
 
 	h.networkByID.Store(vni, net)
-	for _, addr := range tunnelAddrs {
+	for _, addr := range addrs {
 		h.networkByAddress.Insert(addr, net)
 	}
 
-	return nil
+	return h.SetVirtualNetworkKey(vni, epoch, rxKey, txKey)
 }
 
 // RemoveVirtualNetwork removes a network by its VNI.
@@ -121,6 +115,64 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 
 	net := value.(*virtualNetwork)
 	h.networkByAddress.RemoveValue(net)
+
+	return nil
+}
+
+// SetVirtualNetworkKey sets/rotates the encryption keys for a virtual network.
+// This must be called atleast once every 24 hours or after (1 << 60) messages.
+func (h *Handler) SetVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]byte) error {
+	value, ok := h.networkByID.Load(vni)
+	if !ok {
+		return fmt.Errorf("VNI %d not found", vni)
+	}
+	vnet := value.(*virtualNetwork)
+
+	// Set grace period (30s) on the previous RX key, if it exists
+	prevEpoch := vnet.txEpoch.Load()
+	if prevEpoch != epoch {
+		if prevCipherAny, ok := vnet.rxCiphers.Load(prevEpoch); ok {
+			if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
+				prevCipher.expiresAt = time.Now().Add(30 * time.Second)
+			}
+		}
+	}
+
+	// Delete expired keys (to free key material from memory)
+	now := time.Now()
+	vnet.rxCiphers.Range(func(key, value any) bool {
+		cipher := value.(*receiveCipher)
+		if cipher.expiresAt.Before(now) {
+			vnet.rxCiphers.Delete(key)
+		}
+		return true
+	})
+
+	rxBlock, err := aes.NewCipher(rxKey[:])
+	if err != nil {
+		return fmt.Errorf("failed to create RX cipher: %w", err)
+	}
+	rxCipher, err := cipher.NewGCM(rxBlock)
+	if err != nil {
+		return fmt.Errorf("failed to create RX GCM: %w", err)
+	}
+
+	txBlock, err := aes.NewCipher(txKey[:])
+	if err != nil {
+		return fmt.Errorf("failed to create TX cipher: %w", err)
+	}
+	txCipher, err := cipher.NewGCM(txBlock)
+	if err != nil {
+		return fmt.Errorf("failed to create TX GCM: %w", err)
+	}
+
+	vnet.rxCiphers.Store(epoch, &receiveCipher{
+		AEAD:      rxCipher,
+		expiresAt: time.Now().Add(keyLifespan),
+	})
+
+	vnet.txEpoch.Store(epoch)
+	vnet.txCipher = txCipher
 
 	return nil
 }
@@ -153,13 +205,17 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	}
 	vnet := value.(*virtualNetwork)
 
-	// TODO: implement key rotation using epochs.
-
 	var nonce []byte
+	var epoch uint32
 	for i := 0; i < hdr.NumOptions; i++ {
-		if hdr.Options[i].Class == geneve.ClassExperimental && hdr.Options[i].Type == geneve.OptionTypeTxCounter {
-			nonce = hdr.Options[i].Value[:12]
-			break
+		opt := hdr.Options[i]
+		if opt.Class == geneve.ClassExperimental {
+			switch opt.Type {
+			case geneve.OptionTypeTxCounter:
+				nonce = opt.Value[:12]
+			case geneve.OptionTypeKeyEpoch:
+				epoch = binary.BigEndian.Uint32(opt.Value[:4])
+			}
 		}
 	}
 	if len(nonce) == 0 {
@@ -167,15 +223,30 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
+	rxCipherAny, ok := vnet.rxCiphers.Load(epoch)
+	if !ok {
+		// Probably a delayed packet with an old key.
+		slog.Debug("No matching RX key for epoch", slog.Uint64("epoch", uint64(epoch)))
+		return 0
+	}
+
+	rxCipher := rxCipherAny.(*receiveCipher)
+	if rxCipher.expiresAt.Before(time.Now()) {
+		slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
+		// Delete expired key (to free key material from memory)
+		vnet.rxCiphers.Delete(epoch)
+		return 0
+	}
+
 	txCounter := binary.BigEndian.Uint64(nonce[4:])
 
-	if !vnet.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
+	if !rxCipher.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
 		// Delayed packets can cause some uneccesary noise here.
 		slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
 		return 0
 	}
 
-	decryptedFrame, err := vnet.rxCipher.Open(virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize], nonce, payload[hdrLen:], payload[:hdrLen])
+	decryptedFrame, err := rxCipher.Open(virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize], nonce, payload[hdrLen:], payload[:hdrLen])
 	if err != nil {
 		slog.Warn("Failed to decrypt payload", slog.Any("error", err))
 		return 0
@@ -205,7 +276,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
 	var validSrcAddr bool
-	for _, prefix := range vnet.tunnelAddrs {
+	for _, prefix := range vnet.addrs {
 		// The list of prefixes is going to be very small.
 		if prefix.Contains(srcAddr) {
 			validSrcAddr = true
@@ -302,8 +373,6 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 				Class:  geneve.ClassExperimental,
 				Type:   geneve.OptionTypeKeyEpoch,
 				Length: 1,
-				// TODO: implement key rotation using epochs.
-
 			},
 			{
 				Class:  geneve.ClassExperimental,
@@ -312,6 +381,8 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 			},
 		},
 	}
+
+	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], vnet.txEpoch.Load())
 
 	nonce := hdr.Options[1].Value[:12]
 	binary.BigEndian.PutUint64(nonce[4:], vnet.txCounter.Add(1))

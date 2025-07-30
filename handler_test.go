@@ -38,7 +38,7 @@ func TestHandler(t *testing.T) {
 	h, err := icx.NewHandler(localAddr, virtMAC, true)
 	require.NoError(t, err)
 
-	err = h.AddVirtualNetwork(0x12345, peerAddr, key, key, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	err = h.AddVirtualNetwork(0x12345, peerAddr, 1, key, key, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
 	require.NoError(t, err)
 
 	virtFrame := makeIPv4UDPEthernetFrame(virtMAC)
@@ -83,7 +83,7 @@ func BenchmarkHandler(b *testing.B) {
 
 	const vni = 0x12345
 
-	err = handler.AddVirtualNetwork(vni, remoteAddr, key, key, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	err = handler.AddVirtualNetwork(vni, remoteAddr, 1, key, key, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
 	require.NoError(b, err)
 
 	virtMAC := tcpip.GetRandMacAddr()
