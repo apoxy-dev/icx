@@ -11,6 +11,8 @@ import (
 )
 
 const (
+	// RekeyAfterMessages is the maximum number of messages that can be sent before rekeying.
+	RekeyAfterMessages = (1 << 60)
 	// RejectAfterMessages is the maximum number of messages that can be accepted before rejecting further messages.
 	RejectAfterMessages = (1 << 64) - (1 << 13) - 1
 )

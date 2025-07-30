@@ -41,14 +41,18 @@ type receiveCipher struct {
 	replayFilter replay.Filter
 }
 
+type transmitCipher struct {
+	cipher.AEAD
+	epoch   uint32
+	counter atomic.Uint64
+}
+
 // The state associated with each virtual network.
 type virtualNetwork struct {
-	id         uint // The VNI of the network
+	id         uint
 	remoteAddr *tcpip.FullAddress
 	rxCiphers  sync.Map
-	txEpoch    atomic.Uint32
-	txCipher   cipher.AEAD
-	txCounter  atomic.Uint64
+	txCipher   atomic.Pointer[transmitCipher]
 	addrs      []netip.Prefix
 }
 
@@ -119,7 +123,8 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 }
 
 // SetVirtualNetworkKey sets/rotates the encryption keys for a virtual network.
-// This must be called atleast once every 24 hours or after (1 << 60) messages.
+// This must be called atleast once every 24 hours or after `replay.RekeyAfterMessages`
+// messages.
 func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
@@ -128,11 +133,13 @@ func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [
 	vnet := value.(*virtualNetwork)
 
 	// Set grace period (30s) on the previous RX key, if it exists
-	prevEpoch := vnet.txEpoch.Load()
-	if prevEpoch != epoch {
-		if prevCipherAny, ok := vnet.rxCiphers.Load(prevEpoch); ok {
-			if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
-				prevCipher.expiresAt = time.Now().Add(keyGracePeriod)
+	if txCipher := vnet.txCipher.Load(); txCipher != nil {
+		prevEpoch := txCipher.epoch
+		if prevEpoch != epoch {
+			if prevCipherAny, ok := vnet.rxCiphers.Load(prevEpoch); ok {
+				if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
+					prevCipher.expiresAt = time.Now().Add(keyGracePeriod)
+				}
 			}
 		}
 	}
@@ -170,8 +177,10 @@ func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [
 		expiresAt: expiresAt,
 	})
 
-	vnet.txEpoch.Store(epoch)
-	vnet.txCipher = txCipher
+	vnet.txCipher.Store(&transmitCipher{
+		AEAD:  txCipher,
+		epoch: epoch,
+	})
 
 	return nil
 }
@@ -381,10 +390,21 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		},
 	}
 
-	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], vnet.txEpoch.Load())
+	txCipher := vnet.txCipher.Load()
+	if txCipher == nil {
+		slog.Warn("TX cipher not available")
+		return 0, false
+	}
+
+	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], txCipher.epoch)
+
+	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
+		slog.Warn("TX counter overflow, you must rotate the key")
+		return 0, false
+	}
 
 	nonce := hdr.Options[1].Value[:12]
-	binary.BigEndian.PutUint64(nonce[4:], vnet.txCounter.Add(1))
+	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
 	ipVersion := virtFrame[0] >> 4
 	switch ipVersion {
@@ -410,7 +430,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
-	encryptedFrameLen := len(vnet.txCipher.Seal(payload[hdrLen:hdrLen], nonce, virtFrame, payload[:hdrLen]))
+	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, virtFrame, payload[:hdrLen]))
 
 	localAddr := *h.localAddr
 	if h.sourcePortHashing {
