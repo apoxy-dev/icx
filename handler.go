@@ -29,8 +29,6 @@ import (
 const HeaderSize = 32
 
 const (
-	// The maximum lifetime of the keys used for encryption/decryption
-	keyLifespan = 24 * time.Hour
 	// How long to continue accepting packets with an old key after a new key is set.
 	keyGracePeriod = 30 * time.Second
 )
@@ -86,7 +84,8 @@ func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourceP
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
-func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, epoch uint32, rxKey, txKey [16]byte, addrs []netip.Prefix) error {
+func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, addrs []netip.Prefix,
+	epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	if _, exists := h.networkByID.Load(vni); exists {
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
@@ -102,7 +101,7 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, epo
 		h.networkByAddress.Insert(addr, net)
 	}
 
-	return h.SetVirtualNetworkKey(vni, epoch, rxKey, txKey)
+	return h.UpdateVirtualNetworkKey(vni, epoch, rxKey, txKey, expiresAt)
 }
 
 // RemoveVirtualNetwork removes a network by its VNI.
@@ -121,7 +120,7 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 
 // SetVirtualNetworkKey sets/rotates the encryption keys for a virtual network.
 // This must be called atleast once every 24 hours or after (1 << 60) messages.
-func (h *Handler) SetVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]byte) error {
+func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)
@@ -133,7 +132,7 @@ func (h *Handler) SetVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]
 	if prevEpoch != epoch {
 		if prevCipherAny, ok := vnet.rxCiphers.Load(prevEpoch); ok {
 			if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
-				prevCipher.expiresAt = time.Now().Add(30 * time.Second)
+				prevCipher.expiresAt = time.Now().Add(keyGracePeriod)
 			}
 		}
 	}
@@ -168,7 +167,7 @@ func (h *Handler) SetVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]
 
 	vnet.rxCiphers.Store(epoch, &receiveCipher{
 		AEAD:      rxCipher,
-		expiresAt: time.Now().Add(keyLifespan),
+		expiresAt: expiresAt,
 	})
 
 	vnet.txEpoch.Store(epoch)
