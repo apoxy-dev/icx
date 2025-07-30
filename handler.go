@@ -14,14 +14,18 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 
+	"github.com/dpeckett/triemap"
+
 	"github.com/apoxy-dev/icx/flowhash"
 	"github.com/apoxy-dev/icx/geneve"
 	"github.com/apoxy-dev/icx/proxyarp"
 	"github.com/apoxy-dev/icx/replay"
 	"github.com/apoxy-dev/icx/tunnel"
 	"github.com/apoxy-dev/icx/udp"
-	"github.com/dpeckett/triemap"
 )
+
+// The size of the GENEVE header with icx options.
+const HeaderSize = 32
 
 var _ tunnel.Handler = (*Handler)(nil)
 

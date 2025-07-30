@@ -78,10 +78,7 @@ func main() {
 				Name:    "tun-mtu",
 				Aliases: []string{"m"},
 				Usage:   "MTU to use for the tunnel interface",
-				// MTU - 40 (IPv6) - 8 (UDP) - 32 (Geneve+opts) - 16 (AES-GCM Tag)
-				// Round down to the nearest AES block (16 bytes)
-				// For IPv4 you can bump this up to 1424
-				Value: 1404,
+				Value:   icx.MTU(1500),
 			},
 			&cli.BoolFlag{
 				Name:  "source-port-hash",
