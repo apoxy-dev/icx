@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"strings"
+	"time"
 
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
@@ -244,6 +245,7 @@ func run(c *cli.Context) error {
 	if _, err := hex.Decode(txKey[:], []byte(c.String("tx-key"))); err != nil {
 		return fmt.Errorf("failed to decode tx-key: %w", err)
 	}
+	expiresAt := time.Now().Add(24 * time.Hour)
 
 	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"))
 	if err != nil {
@@ -255,7 +257,7 @@ func run(c *cli.Context) error {
 		netip.MustParsePrefix("::/0"),
 	}
 
-	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, epoch, rxKey, txKey, allPrefixes); err != nil {
+	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, allPrefixes, epoch, rxKey, txKey, expiresAt); err != nil {
 		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 
