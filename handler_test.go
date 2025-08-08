@@ -36,7 +36,7 @@ func TestHandler(t *testing.T) {
 	var key [16]byte
 	copy(key[:], []byte("0123456789abcdef"))
 
-	h, err := icx.NewHandler(localAddr, virtMAC, true)
+	h, err := icx.NewHandler(localAddr, virtMAC, true, false)
 	require.NoError(t, err)
 
 	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
@@ -77,7 +77,7 @@ func BenchmarkHandler(b *testing.B) {
 	localAddr := mustNewFullAddress("10.0.0.1", 6081)
 	remoteAddr := mustNewFullAddress("10.0.0.2", 6081)
 
-	handler, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false)
+	handler, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, false)
 	require.NoError(b, err)
 
 	var key [16]byte

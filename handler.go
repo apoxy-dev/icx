@@ -65,9 +65,10 @@ type Handler struct {
 	proxyARP          *proxyarp.ProxyARP
 	hdrPool           *sync.Pool
 	sourcePortHashing bool
+	layer3            bool
 }
 
-func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourcePortHashing bool) (*Handler, error) {
+func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourcePortHashing, layer3 bool) (*Handler, error) {
 	fakeSrcMAC := tcpip.GetRandMacAddr()
 
 	hdrPool := &sync.Pool{
@@ -82,8 +83,9 @@ func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourceP
 		fakeSrcMAC:        fakeSrcMAC,
 		networkByAddress:  triemap.New[*virtualNetwork](),
 		proxyARP:          proxyarp.NewProxyARP(fakeSrcMAC),
-		sourcePortHashing: sourcePortHashing,
 		hdrPool:           hdrPool,
+		sourcePortHashing: sourcePortHashing,
+		layer3:            layer3,
 	}, nil
 }
 
@@ -188,7 +190,7 @@ func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
-	payload, err := udp.Decode(phyFrame, nil, true)
+	payload, err := udp.Decode(phyFrame, nil, h.layer3, true)
 	if err != nil {
 		slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
 		return 0
@@ -437,7 +439,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		localAddr.Port = flowhash.Hash(virtFrame)
 	}
 
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, hdrLen+encryptedFrameLen, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, hdrLen+encryptedFrameLen, h.layer3, false)
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
 		return 0, false
