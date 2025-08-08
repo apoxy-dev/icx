@@ -122,8 +122,8 @@ func BenchmarkHandler(b *testing.B) {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	}
 
-	localAddr := mustNewFullAddress("10.0.0.1", 6081)
-	remoteAddr := mustNewFullAddress("10.0.0.2", 6081)
+	localAddr := mustNewFullAddress("10.0.0.1:6081")
+	remoteAddr := mustNewFullAddress("10.0.0.2:6081")
 
 	h, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, false)
 	require.NoError(b, err)
@@ -197,21 +197,19 @@ func makeIPv4UDPPacket() []byte {
 	return ipPacket
 }
 
-func mustNewFullAddress(ip string, port uint16) *tcpip.FullAddress {
-	netAddr := netip.MustParseAddr(ip)
+func mustNewFullAddress(addrPortStr string) *tcpip.FullAddress {
+	addrPort := netip.MustParseAddrPort(addrPortStr)
 
-	switch netAddr.BitLen() {
+	switch addrPort.Addr().BitLen() {
 	case 32:
-		addr := tcpip.AddrFrom4Slice(netAddr.AsSlice())
 		return &tcpip.FullAddress{
-			Addr: addr,
-			Port: port,
+			Addr: tcpip.AddrFrom4Slice(addrPort.Addr().AsSlice()),
+			Port: addrPort.Port(),
 		}
 	case 128:
-		addr := tcpip.AddrFrom16Slice(netAddr.AsSlice())
 		return &tcpip.FullAddress{
-			Addr: addr,
-			Port: port,
+			Addr: tcpip.AddrFrom16Slice(addrPort.Addr().AsSlice()),
+			Port: addrPort.Port(),
 		}
 	default:
 		panic("Unsupported IP address length")
