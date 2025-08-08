@@ -39,8 +39,10 @@ func TestHandler(t *testing.T) {
 	h, err := icx.NewHandler(localAddr, virtMAC, true, false)
 	require.NoError(t, err)
 
-	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")},
-		1, key, key, time.Now().Add(time.Hour))
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	require.NoError(t, err)
+
+	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
 	require.NoError(t, err)
 
 	virtFrame := makeIPv4UDPEthernetFrame(virtMAC)
@@ -93,8 +95,10 @@ func TestHandler_Layer3(t *testing.T) {
 	h, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, true)
 	require.NoError(t, err)
 
-	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
-		1, key, key, time.Now().Add(time.Hour))
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	require.NoError(t, err)
+
+	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
 	require.NoError(t, err)
 
 	ipPacket := makeIPv4UDPPacket()
@@ -121,7 +125,7 @@ func BenchmarkHandler(b *testing.B) {
 	localAddr := mustNewFullAddress("10.0.0.1", 6081)
 	remoteAddr := mustNewFullAddress("10.0.0.2", 6081)
 
-	handler, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, false)
+	h, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, false)
 	require.NoError(b, err)
 
 	var key [16]byte
@@ -129,8 +133,10 @@ func BenchmarkHandler(b *testing.B) {
 
 	const vni = 0x12345
 
-	err = handler.AddVirtualNetwork(vni, remoteAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
-		1, key, key, time.Now().Add(time.Hour))
+	err = h.AddVirtualNetwork(vni, remoteAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	require.NoError(b, err)
+
+	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
 	require.NoError(b, err)
 
 	virtMAC := tcpip.GetRandMacAddr()
@@ -143,10 +149,10 @@ func BenchmarkHandler(b *testing.B) {
 		decodedFrame := make([]byte, 1400)
 
 		for pb.Next() {
-			n, _ := handler.VirtToPhy(virtFrame, phyFrame)
+			n, _ := h.VirtToPhy(virtFrame, phyFrame)
 			require.NotZero(b, n, "Failed to encode frame")
 
-			n = handler.PhyToVirt(phyFrame, decodedFrame)
+			n = h.PhyToVirt(phyFrame, decodedFrame)
 			require.NotZero(b, n, "Failed to decode frame")
 		}
 	})

@@ -90,8 +90,7 @@ func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourceP
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
-func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, addrs []netip.Prefix,
-	epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
+func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, addrs []netip.Prefix) error {
 	if _, exists := h.networkByID.Load(vni); exists {
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
@@ -107,7 +106,7 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, add
 		h.networkByAddress.Insert(addr, net)
 	}
 
-	return h.UpdateVirtualNetworkKey(vni, epoch, rxKey, txKey, expiresAt)
+	return nil
 }
 
 // RemoveVirtualNetwork removes a network by its VNI.
@@ -124,10 +123,10 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 	return nil
 }
 
-// SetVirtualNetworkKey sets/rotates the encryption keys for a virtual network.
+// UpdateVirtualNetworkKeys sets/rotates the encryption keys for a virtual network.
 // This must be called atleast once every 24 hours or after `replay.RekeyAfterMessages`
 // messages.
-func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
+func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)

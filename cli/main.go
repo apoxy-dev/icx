@@ -233,6 +233,20 @@ func run(c *cli.Context) error {
 
 	virtMAC := tcpip.LinkAddress(vethDev.Link.Attrs().HardwareAddr)
 
+	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"), false)
+	if err != nil {
+		return fmt.Errorf("failed to create handler: %w", err)
+	}
+
+	allPrefixes := []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/0"),
+		netip.MustParsePrefix("::/0"),
+	}
+
+	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, allPrefixes); err != nil {
+		return fmt.Errorf("failed to add virtual network: %w", err)
+	}
+
 	var epoch uint32 = 1
 	var rxKey, txKey [16]byte
 	// Hex decode the keys provided by the user
@@ -247,18 +261,8 @@ func run(c *cli.Context) error {
 	}
 	expiresAt := time.Now().Add(24 * time.Hour)
 
-	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"), false)
-	if err != nil {
-		return fmt.Errorf("failed to create handler: %w", err)
-	}
-
-	allPrefixes := []netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/0"),
-		netip.MustParsePrefix("::/0"),
-	}
-
-	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, allPrefixes, epoch, rxKey, txKey, expiresAt); err != nil {
-		return fmt.Errorf("failed to add virtual network: %w", err)
+	if err := h.UpdateVirtualNetworkKeys(c.Uint("vni"), epoch, rxKey, txKey, expiresAt); err != nil {
+		return fmt.Errorf("failed to update virtual network key: %w", err)
 	}
 
 	tun, err := tunnel.NewTunnel(phyName, vethDev.Peer.Attrs().Name, ingressFilter, h, pcapWriter)
