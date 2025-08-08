@@ -15,39 +15,24 @@ var (
 	PayloadOffsetIPv6 = header.EthernetMinimumSize + header.IPv6MinimumSize + header.UDPMinimumSize
 )
 
-// Decode extracts the source address and payload from a UDP ethernet frame/packet.
-func Decode(frame []byte, addr *tcpip.FullAddress, layer3, skipChecksumValidation bool) ([]byte, error) {
+// Decode extracts the source address and payload from a UDP ethernet frame.
+func Decode(frame []byte, addr *tcpip.FullAddress, skipChecksumValidation bool) ([]byte, error) {
 	var (
 		udp     header.UDP
 		srcAddr tcpip.Address
 		dstAddr tcpip.Address
 	)
 
-	offset := 0
-	if !layer3 {
-		if len(frame) < header.EthernetMinimumSize {
-			return nil, errors.New("frame too short for Ethernet")
-		}
-		eth := header.Ethernet(frame)
-		ethType := eth.Type()
-		offset = header.EthernetMinimumSize
-
-		if ethType != header.IPv4ProtocolNumber && ethType != header.IPv6ProtocolNumber {
-			return nil, errors.New("unsupported ethertype")
-		}
+	if len(frame) < header.EthernetMinimumSize {
+		return nil, errors.New("frame too short")
 	}
 
-	ipProto := header.IPv4ProtocolNumber
-	if len(frame) < offset+1 {
-		return nil, errors.New("frame too short for IP header")
-	}
-	if frame[offset]>>4 == 6 {
-		ipProto = header.IPv6ProtocolNumber
-	}
+	eth := header.Ethernet(frame)
+	ethType := eth.Type()
 
-	switch ipProto {
+	switch ethType {
 	case header.IPv4ProtocolNumber:
-		ip := header.IPv4(frame[offset:])
+		ip := header.IPv4(frame[header.EthernetMinimumSize:])
 		if !ip.IsValid(len(ip)) || ip.Protocol() != uint8(header.UDPProtocolNumber) {
 			return nil, errors.New("not a valid IPv4 UDP packet")
 		}
@@ -56,7 +41,7 @@ func Decode(frame []byte, addr *tcpip.FullAddress, layer3, skipChecksumValidatio
 		udp = header.UDP(ip.Payload())
 
 	case header.IPv6ProtocolNumber:
-		ip := header.IPv6(frame[offset:])
+		ip := header.IPv6(frame[header.EthernetMinimumSize:])
 		if !ip.IsValid(len(ip)) || ip.TransportProtocol() != header.UDPProtocolNumber {
 			return nil, errors.New("not a valid IPv6 UDP packet")
 		}
@@ -65,7 +50,7 @@ func Decode(frame []byte, addr *tcpip.FullAddress, layer3, skipChecksumValidatio
 		udp = header.UDP(ip.Payload())
 
 	default:
-		return nil, errors.New("unsupported IP protocol")
+		return nil, errors.New("unsupported ethertype")
 	}
 
 	lengthValid, csumValid := header.UDPValid(
@@ -84,36 +69,32 @@ func Decode(frame []byte, addr *tcpip.FullAddress, layer3, skipChecksumValidatio
 	if addr != nil {
 		addr.Addr = srcAddr
 		addr.Port = udp.SourcePort()
-		if !layer3 {
-			eth := header.Ethernet(frame)
-			addr.LinkAddr = eth.SourceAddress()
-		}
+		addr.LinkAddr = eth.SourceAddress()
 	}
 
 	return udp.Payload(), nil
 }
 
-// Encode constructs a UDP ethernet frame / packet with the given parameters.
+// Encode constructs a UDP ethernet frame with the given parameters.
 // It assumes that the payload is already in the frame buffer at the correct
 // offset.
-func Encode(frame []byte, src, dst *tcpip.FullAddress, payloadLength int, layer3, skipChecksumCalculation bool) (int, error) {
-	offset := 0
+func Encode(frame []byte, src, dst *tcpip.FullAddress, payloadLength int, skipChecksumCalculation bool) (int, error) {
+	var offset int
+
 	isIPv6 := src.Addr.Len() == net.IPv6len
 
-	if !layer3 {
-		eth := header.Ethernet(frame[offset:])
-		eth.Encode(&header.EthernetFields{
-			SrcAddr: src.LinkAddr,
-			DstAddr: dst.LinkAddr,
-			Type: func() tcpip.NetworkProtocolNumber {
-				if isIPv6 {
-					return header.IPv6ProtocolNumber
-				}
-				return header.IPv4ProtocolNumber
-			}(),
-		})
-		offset += header.EthernetMinimumSize
-	}
+	eth := header.Ethernet(frame[offset:])
+	eth.Encode(&header.EthernetFields{
+		SrcAddr: src.LinkAddr,
+		DstAddr: dst.LinkAddr,
+		Type: func() tcpip.NetworkProtocolNumber {
+			if isIPv6 {
+				return header.IPv6ProtocolNumber
+			}
+			return header.IPv4ProtocolNumber
+		}(),
+	})
+	offset += header.EthernetMinimumSize
 
 	udpPayloadLength := header.UDPMinimumSize + payloadLength
 

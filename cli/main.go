@@ -247,7 +247,7 @@ func run(c *cli.Context) error {
 	}
 	expiresAt := time.Now().Add(24 * time.Hour)
 
-	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"))
+	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"), false)
 	if err != nil {
 		return fmt.Errorf("failed to create handler: %w", err)
 	}

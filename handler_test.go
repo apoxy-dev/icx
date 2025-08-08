@@ -69,6 +69,50 @@ func TestHandler(t *testing.T) {
 	require.False(t, loopback)
 }
 
+func TestHandler_Layer3(t *testing.T) {
+	if testing.Verbose() {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	}
+
+	localAddr := &tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()),
+		Port: 1234,
+	}
+
+	peerAddr := &tcpip.FullAddress{
+		NIC:  2,
+		Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()),
+		Port: 4321,
+	}
+
+	var key [16]byte
+	copy(key[:], []byte("0123456789abcdef"))
+
+	// Create handler with layer3 mode enabled
+	h, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, true)
+	require.NoError(t, err)
+
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")},
+		1, key, key, time.Now().Add(time.Hour))
+	require.NoError(t, err)
+
+	ipPacket := makeIPv4UDPPacket()
+
+	phyFrame := make([]byte, 1500)
+	frameLen, loopback := h.VirtToPhy(ipPacket, phyFrame)
+	require.NotZero(t, frameLen)
+	require.False(t, loopback)
+
+	decoded := make([]byte, 1500)
+	decodedLen := h.PhyToVirt(phyFrame[:frameLen], decoded)
+	require.NotZero(t, decodedLen)
+
+	require.Equal(t, ipPacket, decoded[:decodedLen])
+
+	require.NoError(t, h.RemoveVirtualNetwork(0x12345))
+}
+
 func BenchmarkHandler(b *testing.B) {
 	if testing.Verbose() {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
@@ -109,7 +153,11 @@ func BenchmarkHandler(b *testing.B) {
 }
 
 func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {
-	frame := make([]byte, header.EthernetMinimumSize+header.IPv4MinimumSize+header.UDPMinimumSize)
+	ipPacket := makeIPv4UDPPacket()
+
+	frame := make([]byte, header.EthernetMinimumSize+len(ipPacket))
+	copy(frame[header.EthernetMinimumSize:], ipPacket)
+
 	eth := header.Ethernet(frame)
 	eth.Encode(&header.EthernetFields{
 		SrcAddr: tcpip.GetRandMacAddr(),
@@ -117,9 +165,15 @@ func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {
 		Type:    header.IPv4ProtocolNumber,
 	})
 
-	ip := header.IPv4(frame[header.EthernetMinimumSize:])
+	return frame
+}
+
+func makeIPv4UDPPacket() []byte {
+	ipPacket := make([]byte, header.IPv4MinimumSize+header.UDPMinimumSize)
+
+	ip := header.IPv4(ipPacket)
 	ip.Encode(&header.IPv4Fields{
-		TotalLength: uint16(len(frame) - header.EthernetMinimumSize),
+		TotalLength: uint16(len(ipPacket)),
 		TTL:         64,
 		Protocol:    uint8(header.UDPProtocolNumber),
 		SrcAddr:     tcpip.AddrFrom4Slice(net.IPv4(192, 168, 1, 1).To4()),
@@ -127,14 +181,14 @@ func makeIPv4UDPEthernetFrame(virtMAC tcpip.LinkAddress) []byte {
 	})
 	ip.SetChecksum(^ip.CalculateChecksum())
 
-	udp := header.UDP(frame[header.EthernetMinimumSize+header.IPv4MinimumSize:])
+	udp := header.UDP(ipPacket[header.IPv4MinimumSize:])
 	udp.Encode(&header.UDPFields{
 		SrcPort: 1234,
 		DstPort: 5678,
 		Length:  header.UDPMinimumSize,
 	})
 
-	return frame
+	return ipPacket
 }
 
 func mustNewFullAddress(ip string, port uint16) *tcpip.FullAddress {

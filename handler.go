@@ -65,7 +65,7 @@ type Handler struct {
 	proxyARP          *proxyarp.ProxyARP
 	hdrPool           *sync.Pool
 	sourcePortHashing bool
-	layer3            bool
+	layer3            bool // Virtframes are layer 3 (IP) packets, not layer 2 (Ethernet) frames
 }
 
 func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourcePortHashing, layer3 bool) (*Handler, error) {
@@ -190,7 +190,7 @@ func (h *Handler) UpdateVirtualNetworkKey(vni uint, epoch uint32, rxKey, txKey [
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
-	payload, err := udp.Decode(phyFrame, nil, h.layer3, true)
+	payload, err := udp.Decode(phyFrame, nil, true)
 	if err != nil {
 		slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
 		return 0
@@ -256,32 +256,43 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
-	decryptedFrame, err := rxCipher.Open(virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize], nonce, payload[hdrLen:], payload[:hdrLen])
+	var ipPacket []byte
+	if h.layer3 {
+		ipPacket = virtFrame[:0]
+	} else {
+		ipPacket = virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize]
+	}
+
+	ipPacket, err = rxCipher.Open(ipPacket, nonce, payload[hdrLen:], payload[:hdrLen])
 	if err != nil {
 		slog.Warn("Failed to decrypt payload", slog.Any("error", err))
 		return 0
 	}
 
-	isIPv6 := decryptedFrame[0]>>4 == header.IPv6Version
+	ipVersion := ipPacket[0] >> 4
 
 	// Get the source address of the decrypted frame.
 	var srcAddr netip.Addr
-	if isIPv6 {
+	switch ipVersion {
+	case header.IPv4Version:
 		var ok bool
-		ipHdr := header.IPv6(decryptedFrame)
-		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
-		if !ok {
-			slog.Warn("Invalid IPv6 address in frame")
-			return 0
-		}
-	} else {
-		var ok bool
-		ipHdr := header.IPv4(decryptedFrame)
+		ipHdr := header.IPv4(ipPacket)
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv4 address in frame")
 			return 0
 		}
+	case header.IPv6Version:
+		var ok bool
+		ipHdr := header.IPv6(ipPacket)
+		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv6 address in frame")
+			return 0
+		}
+	default:
+		slog.Warn("Unsupported IP version", slog.Int("version", int(ipVersion)))
+		return 0
 	}
 
 	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
@@ -298,63 +309,74 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
+	if h.layer3 {
+		return len(ipPacket)
+	}
+
+	// If we are in layer 2 mode, we need to attach an Ethernet header.
 	eth := header.Ethernet(virtFrame)
 	eth.Encode(&header.EthernetFields{
 		SrcAddr: h.fakeSrcMAC,
 		DstAddr: h.virtMAC,
 		Type: func() tcpip.NetworkProtocolNumber {
-			if isIPv6 {
+			if ipVersion == header.IPv6Version {
 				return header.IPv6ProtocolNumber
 			}
 			return header.IPv4ProtocolNumber
 		}(),
 	})
 
-	return header.EthernetMinimumSize + len(decryptedFrame)
+	return header.EthernetMinimumSize + len(ipPacket)
 }
 
 // VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
 // Returns the length of the resulting physical frame.
 func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
-	eth := header.Ethernet(virtFrame)
-	ethType := eth.Type()
+	ipPacket := virtFrame
 
-	if ethType == header.ARPProtocolNumber {
-		// Immediately reply to the ARP request with a loopback response.
-		frameLen, err := h.proxyARP.Reply(virtFrame, phyFrame)
-		if err != nil {
-			slog.Warn("Failed to handle ARP request", slog.Any("error", err))
+	if !h.layer3 {
+		eth := header.Ethernet(virtFrame)
+		ethType := eth.Type()
+
+		if ethType == header.ARPProtocolNumber {
+			// Immediately reply to the ARP request with a loopback response.
+			frameLen, err := h.proxyARP.Reply(virtFrame, phyFrame)
+			if err != nil {
+				slog.Warn("Failed to handle ARP request", slog.Any("error", err))
+				return 0, false
+			}
+
+			return frameLen, true
+		}
+
+		// Drop non ip frames
+		if ethType != header.IPv4ProtocolNumber && ethType != header.IPv6ProtocolNumber {
+			slog.Debug("Dropping non-IP frame",
+				slog.Int("frameSize", len(virtFrame)),
+				slog.Int("ethType", int(ethType)))
 			return 0, false
 		}
 
-		return frameLen, true
+		// Strip off the ethernet header
+		ipPacket = virtFrame[header.EthernetMinimumSize:]
 	}
 
-	// Drop non ip frames
-	if ethType != header.IPv4ProtocolNumber && ethType != header.IPv6ProtocolNumber {
-		slog.Debug("Dropping non-IP frame",
-			slog.Int("frameSize", len(virtFrame)),
-			slog.Int("ethType", int(ethType)))
-		return 0, false
-	}
-
-	// Strip off the ethernet header
-	virtFrame = virtFrame[header.EthernetMinimumSize:]
+	ipVersion := ipPacket[0] >> 4
 
 	// Get the tunnel destination address for the IP packet.
 	var dstAddr netip.Addr
-	switch ethType {
-	case header.IPv4ProtocolNumber:
+	switch ipVersion {
+	case header.IPv4Version:
 		var ok bool
-		ipHdr := header.IPv4(virtFrame)
+		ipHdr := header.IPv4(ipPacket)
 		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv4 address in frame")
 			return 0, false
 		}
-	case header.IPv6ProtocolNumber:
+	case header.IPv6Version:
 		var ok bool
-		ipHdr := header.IPv6(virtFrame)
+		ipHdr := header.IPv6(ipPacket)
 		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv6 address in frame")
@@ -408,11 +430,10 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	nonce := hdr.Options[1].Value[:12]
 	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
-	ipVersion := virtFrame[0] >> 4
 	switch ipVersion {
-	case 4:
+	case header.IPv4Version:
 		hdr.ProtocolType = uint16(header.IPv4ProtocolNumber)
-	case 6:
+	case header.IPv6Version:
 		hdr.ProtocolType = uint16(header.IPv6ProtocolNumber)
 	default:
 		slog.Warn("Unsupported IP version", slog.Int("version", int(ipVersion)))
@@ -432,14 +453,14 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
-	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, virtFrame, payload[:hdrLen]))
+	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
 	localAddr := *h.localAddr
 	if h.sourcePortHashing {
-		localAddr.Port = flowhash.Hash(virtFrame)
+		localAddr.Port = flowhash.Hash(ipPacket)
 	}
 
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, hdrLen+encryptedFrameLen, h.layer3, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, hdrLen+encryptedFrameLen, false)
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
 		return 0, false
