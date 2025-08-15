@@ -233,7 +233,15 @@ func run(c *cli.Context) error {
 
 	virtMAC := tcpip.LinkAddress(vethDev.Link.Attrs().HardwareAddr)
 
-	h, err := icx.NewHandler(localAddr, virtMAC, c.Bool("source-port-hash"), false)
+	opts := []icx.HandlerOption{
+		icx.WithLocalAddr(localAddr),
+		icx.WithVirtMAC(virtMAC),
+	}
+	if c.Bool("source-port-hash") {
+		opts = append(opts, icx.WithSourcePortHashing())
+	}
+
+	h, err := icx.NewHandler(opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create handler: %w", err)
 	}

@@ -24,10 +24,9 @@ import (
 	"github.com/apoxy-dev/icx/udp"
 )
 
-// The size of the GENEVE header with icx options.
-const HeaderSize = 32
-
 const (
+	// The size of the GENEVE header with icx options.
+	HeaderSize = 32
 	// How long to continue accepting packets with an old key after a new key is set.
 	keyGracePeriod = 30 * time.Second
 )
@@ -96,20 +95,133 @@ type virtualNetwork struct {
 	stats      stats
 }
 
-type Handler struct {
-	localAddr         *tcpip.FullAddress                // Local address of the physical interface (will be used as source address for UDP frames)
-	virtMAC           tcpip.LinkAddress                 // Mac address of the virtual interface
-	fakeSrcMAC        tcpip.LinkAddress                 // Fake source MAC address for virtual L2 frames
-	networkByID       sync.Map                          // Maps VNI to network
-	networkByAddress  *triemap.TrieMap[*virtualNetwork] // Maps tunnel destination address to network
-	proxyARP          *proxyarp.ProxyARP
-	hdrPool           *sync.Pool
+type HandlerOption func(*handlerOptions) error
+
+type handlerOptions struct {
+	localAddr         *tcpip.FullAddress
+	virtMAC           tcpip.LinkAddress
+	srcMAC            tcpip.LinkAddress
 	sourcePortHashing bool
-	layer3            bool // Virtframes are layer 3 (IP) packets, not layer 2 (Ethernet) frames
+	layer3            bool
+	payloadOnly       bool
 }
 
-func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourcePortHashing, layer3 bool) (*Handler, error) {
-	fakeSrcMAC := tcpip.GetRandMacAddr()
+func defaultHandlerOptions() handlerOptions {
+	return handlerOptions{
+		srcMAC:            tcpip.GetRandMacAddr(),
+		sourcePortHashing: false,
+		layer3:            false,
+	}
+}
+
+// WithLocalAddr sets the local UDP endpoint used as the source for
+// encapsulated packets. This option is required.
+//
+// If WithSourcePortHashing is enabled, the Port field of this address is
+// overridden per packet with a hash of the inner flow. Otherwise, the Port
+// specified here is used as-is.
+func WithLocalAddr(a *tcpip.FullAddress) HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.localAddr = a
+		return nil
+	}
+}
+
+// WithVirtMAC sets the MAC address used for the virtual interface in L2 mode.
+// This is required when not running in L3 mode (see WithLayer3VirtFrames).
+// Ignored when L3 mode is enabled.
+func WithVirtMAC(mac tcpip.LinkAddress) HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.virtMAC = mac
+		return nil
+	}
+}
+
+// WithSourceMAC overrides the synthetic source MAC used for L2 frames and for
+// ProxyARP replies. By default, a random MAC is generated at handler creation.
+// Ignored when L3 mode is enabled.
+func WithSourceMAC(mac tcpip.LinkAddress) HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.srcMAC = mac
+		return nil
+	}
+}
+
+// WithSourcePortHashing enables per-packet UDP source-port selection based on
+// a hash of the inner IP flow. This improves ECMP distribution in the underlay.
+// When enabled, it overrides the Port from WithLocalAddr for each packet.
+func WithSourcePortHashing() HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.sourcePortHashing = true
+		return nil
+	}
+}
+
+// WithLayer3VirtFrames configures the handler for L3 mode, where virtual frames
+// are raw IP packets (no Ethernet header). In this mode:
+//   - VirtToPhy expects an IP packet as input.
+//   - PhyToVirt returns a decrypted IP packet.
+//   - WithVirtMAC and WithSourceMAC are ignored.
+//
+// Default is L2 mode (Ethernet frames).
+func WithLayer3VirtFrames() HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.layer3 = true
+		return nil
+	}
+}
+
+// WithPayloadOnlyPhyFrames configures the handler to treat physical frames as
+// “payload only,” i.e., the caller provides/consumes just the GENEVE header
+// plus ciphertext without UDP/IP encapsulation.
+//
+// In this mode:
+//   - VirtToPhy writes the GENEVE header + ciphertext starting at offset 0 of
+//     phyFrame, and does not add UDP/IP headers.
+//   - PhyToVirt expects phyFrame to already be just the GENEVE header +
+//     ciphertext (no UDP/IP headers).
+//
+// This is useful when the caller performs UDP/IP encapsulation externally
+// (e.g., kernel or NIC offload).
+func WithPayloadOnlyPhyFrames() HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.payloadOnly = true
+		return nil
+	}
+}
+
+// Handler processes encapsulated GENEVE traffic for one or more virtual
+// networks. It performs encryption/decryption, replay protection, address
+// validation, and translation between physical and virtual frame formats.
+//
+// A Handler tracks virtual networks by VNI and allowed address prefixes,
+// supports both L2 and L3 operation, and is safe for concurrent use.
+type Handler struct {
+	opts             *handlerOptions
+	networkByID      sync.Map                          // Maps VNI to network
+	networkByAddress *triemap.TrieMap[*virtualNetwork] // Maps tunnel destination address to network
+	proxyARP         *proxyarp.ProxyARP
+	hdrPool          *sync.Pool
+}
+
+// NewHandler returns a new Handler configured with the given options.
+// It validates required parameters and allocates internal state for
+// managing virtual networks and packet processing.
+func NewHandler(opts ...HandlerOption) (*Handler, error) {
+	options := defaultHandlerOptions()
+	for _, opt := range opts {
+		if err := opt(&options); err != nil {
+			return nil, err
+		}
+	}
+
+	if options.localAddr == nil {
+		return nil, fmt.Errorf("local address must be set")
+	}
+
+	if options.virtMAC == "" && !options.layer3 {
+		return nil, fmt.Errorf("virtual MAC must be set for L2 mode")
+	}
 
 	hdrPool := &sync.Pool{
 		New: func() any {
@@ -118,14 +230,10 @@ func NewHandler(localAddr *tcpip.FullAddress, virtMAC tcpip.LinkAddress, sourceP
 	}
 
 	return &Handler{
-		localAddr:         localAddr,
-		virtMAC:           virtMAC,
-		fakeSrcMAC:        fakeSrcMAC,
-		networkByAddress:  triemap.New[*virtualNetwork](),
-		proxyARP:          proxyarp.NewProxyARP(fakeSrcMAC),
-		hdrPool:           hdrPool,
-		sourcePortHashing: sourcePortHashing,
-		layer3:            layer3,
+		opts:             &options,
+		networkByAddress: triemap.New[*virtualNetwork](),
+		proxyARP:         proxyarp.NewProxyARP(options.srcMAC),
+		hdrPool:          hdrPool,
 	}, nil
 }
 
@@ -253,10 +361,18 @@ func (h *Handler) AllStats() []VirtualNetworkStats {
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
-	payload, err := udp.Decode(phyFrame, nil, true)
-	if err != nil {
-		slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
-		return 0
+	var payload []byte
+	var err error
+
+	if h.opts.payloadOnly {
+		// Caller is providing the datagram payload (GENEVE header + ciphertext).
+		payload = phyFrame
+	} else {
+		payload, err = udp.Decode(phyFrame, nil, true)
+		if err != nil {
+			slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
+			return 0
+		}
 	}
 
 	hdr := h.hdrPool.Get().(*geneve.Header)
@@ -323,7 +439,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	}
 
 	var ipPacket []byte
-	if h.layer3 {
+	if h.opts.layer3 {
 		ipPacket = virtFrame[:0]
 	} else {
 		ipPacket = virtFrame[header.EthernetMinimumSize:header.EthernetMinimumSize]
@@ -368,7 +484,6 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
 	var validSrcAddr bool
 	for _, prefix := range vnet.addrs {
-		// The list of prefixes is going to be very small.
 		if prefix.Contains(srcAddr) {
 			validSrcAddr = true
 			break
@@ -385,15 +500,15 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	vnet.stats.rxBytes.Add(uint64(len(ipPacket)))
 	vnet.stats.lastRXUnixNano.Store(time.Now().UnixNano())
 
-	if h.layer3 {
+	if h.opts.layer3 {
 		return len(ipPacket)
 	}
 
 	// If we are in layer 2 mode, we need to attach an Ethernet header.
 	eth := header.Ethernet(virtFrame)
 	eth.Encode(&header.EthernetFields{
-		SrcAddr: h.fakeSrcMAC,
-		DstAddr: h.virtMAC,
+		SrcAddr: h.opts.srcMAC,
+		DstAddr: h.opts.virtMAC,
 		Type: func() tcpip.NetworkProtocolNumber {
 			if ipVersion == header.IPv6Version {
 				return header.IPv6ProtocolNumber
@@ -407,10 +522,12 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 // VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
 // Returns the length of the resulting physical frame.
+// VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
+// Returns the length of the resulting physical frame.
 func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	ipPacket := virtFrame
 
-	if !h.layer3 {
+	if !h.opts.layer3 {
 		eth := header.Ethernet(virtFrame)
 		ethType := eth.Type()
 
@@ -519,11 +636,16 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
+	// Choose where to write the (GENEVE header + ciphertext) payload.
 	var payload []byte
-	if vnet.remoteAddr.Addr.Len() == net.IPv4len {
-		payload = phyFrame[udp.PayloadOffsetIPv4:]
+	if h.opts.payloadOnly {
+		payload = phyFrame[:] // write starting at offset 0
 	} else {
-		payload = phyFrame[udp.PayloadOffsetIPv6:]
+		if vnet.remoteAddr.Addr.Len() == net.IPv4len {
+			payload = phyFrame[udp.PayloadOffsetIPv4:]
+		} else {
+			payload = phyFrame[udp.PayloadOffsetIPv6:]
+		}
 	}
 
 	hdrLen, err := hdr.MarshalBinary(payload)
@@ -535,8 +657,17 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
-	localAddr := *h.localAddr
-	if h.sourcePortHashing {
+	// If payloadOnly, the caller will encapsulate/wrap this payload itself.
+	if h.opts.payloadOnly {
+		// Success: count bytes/packets and timestamp
+		vnet.stats.txPackets.Add(1)
+		vnet.stats.txBytes.Add(uint64(len(ipPacket)))
+		vnet.stats.lastTXUnixNano.Store(time.Now().UnixNano())
+		return hdrLen + encryptedFrameLen, false
+	}
+
+	localAddr := *h.opts.localAddr
+	if h.opts.sourcePortHashing {
 		localAddr.Port = flowhash.Hash(ipPacket)
 	}
 

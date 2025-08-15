@@ -36,7 +36,9 @@ func TestHandler(t *testing.T) {
 	var key [16]byte
 	copy(key[:], []byte("0123456789abcdef"))
 
-	h, err := icx.NewHandler(localAddr, virtMAC, true, false)
+	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr),
+		icx.WithVirtMAC(virtMAC),
+		icx.WithSourcePortHashing())
 	require.NoError(t, err)
 
 	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
@@ -92,7 +94,9 @@ func TestHandler_Layer3(t *testing.T) {
 	copy(key[:], []byte("0123456789abcdef"))
 
 	// Create handler with layer3 mode enabled
-	h, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, true)
+	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr),
+		icx.WithLayer3VirtFrames(),
+		icx.WithSourcePortHashing())
 	require.NoError(t, err)
 
 	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
@@ -125,7 +129,8 @@ func BenchmarkHandler(b *testing.B) {
 	localAddr := mustNewFullAddress("10.0.0.1:6081")
 	remoteAddr := mustNewFullAddress("10.0.0.2:6081")
 
-	h, err := icx.NewHandler(localAddr, tcpip.GetRandMacAddr(), false, false)
+	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr),
+		icx.WithVirtMAC(tcpip.GetRandMacAddr()))
 	require.NoError(b, err)
 
 	var key [16]byte
