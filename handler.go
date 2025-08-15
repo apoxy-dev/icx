@@ -103,7 +103,6 @@ type handlerOptions struct {
 	srcMAC            tcpip.LinkAddress
 	sourcePortHashing bool
 	layer3            bool
-	payloadOnly       bool
 }
 
 func defaultHandlerOptions() handlerOptions {
@@ -167,25 +166,6 @@ func WithSourcePortHashing() HandlerOption {
 func WithLayer3VirtFrames() HandlerOption {
 	return func(opts *handlerOptions) error {
 		opts.layer3 = true
-		return nil
-	}
-}
-
-// WithPayloadOnlyPhyFrames configures the handler to treat physical frames as
-// “payload only,” i.e., the caller provides/consumes just the GENEVE header
-// plus ciphertext without UDP/IP encapsulation.
-//
-// In this mode:
-//   - VirtToPhy writes the GENEVE header + ciphertext starting at offset 0 of
-//     phyFrame, and does not add UDP/IP headers.
-//   - PhyToVirt expects phyFrame to already be just the GENEVE header +
-//     ciphertext (no UDP/IP headers).
-//
-// This is useful when the caller performs UDP/IP encapsulation externally
-// (e.g., kernel or NIC offload).
-func WithPayloadOnlyPhyFrames() HandlerOption {
-	return func(opts *handlerOptions) error {
-		opts.payloadOnly = true
 		return nil
 	}
 }
@@ -361,18 +341,10 @@ func (h *Handler) AllStats() []VirtualNetworkStats {
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
-	var payload []byte
-	var err error
-
-	if h.opts.payloadOnly {
-		// Caller is providing the datagram payload (GENEVE header + ciphertext).
-		payload = phyFrame
-	} else {
-		payload, err = udp.Decode(phyFrame, nil, true)
-		if err != nil {
-			slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
-			return 0
-		}
+	payload, err := udp.Decode(phyFrame, nil, true)
+	if err != nil {
+		slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
+		return 0
 	}
 
 	hdr := h.hdrPool.Get().(*geneve.Header)
@@ -636,16 +608,11 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
-	// Choose where to write the (GENEVE header + ciphertext) payload.
 	var payload []byte
-	if h.opts.payloadOnly {
-		payload = phyFrame[:] // write starting at offset 0
+	if vnet.remoteAddr.Addr.Len() == net.IPv4len {
+		payload = phyFrame[udp.PayloadOffsetIPv4:]
 	} else {
-		if vnet.remoteAddr.Addr.Len() == net.IPv4len {
-			payload = phyFrame[udp.PayloadOffsetIPv4:]
-		} else {
-			payload = phyFrame[udp.PayloadOffsetIPv6:]
-		}
+		payload = phyFrame[udp.PayloadOffsetIPv6:]
 	}
 
 	hdrLen, err := hdr.MarshalBinary(payload)
@@ -656,15 +623,6 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
-
-	// If payloadOnly, the caller will encapsulate/wrap this payload itself.
-	if h.opts.payloadOnly {
-		// Success: count bytes/packets and timestamp
-		vnet.stats.txPackets.Add(1)
-		vnet.stats.txBytes.Add(uint64(len(ipPacket)))
-		vnet.stats.lastTXUnixNano.Store(time.Now().UnixNano())
-		return hdrLen + encryptedFrameLen, false
-	}
 
 	localAddr := *h.opts.localAddr
 	if h.opts.sourcePortHashing {
