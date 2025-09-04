@@ -251,6 +251,22 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 	return nil
 }
 
+// UpdateVirtualNetworkAddrs updates the allowed address prefixes for a virtual network.
+func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) error {
+	v, ok := h.networkByID.Load(vni)
+	if !ok {
+		return fmt.Errorf("VNI %d not found", vni)
+	}
+	vnet := v.(*virtualNetwork)
+	// Remove all old mappings for this vnet, then insert the new ones.
+	h.networkByAddress.RemoveValue(vnet)
+	vnet.addrs = addrs
+	for _, a := range addrs {
+		h.networkByAddress.Insert(a, vnet)
+	}
+	return nil
+}
+
 // UpdateVirtualNetworkKeys sets/rotates the encryption keys for a virtual network.
 // This must be called atleast once every 24 hours or after `replay.RekeyAfterMessages`
 // messages.
