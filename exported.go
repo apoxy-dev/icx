@@ -1,8 +1,27 @@
 package icx
 
-import "time"
+import (
+	"net/netip"
+	"time"
 
-// VirtualNetwork is a statistics snapshot for a virtual network.
+	"gvisor.dev/gvisor/pkg/tcpip"
+)
+
+// VirtualNetwork describes a configured virtual network.
+type VirtualNetwork struct {
+	// VNI is the virtual network identifier.
+	VNI uint
+	// RemoteAddr is the address of the remote endpoint.
+	RemoteAddr tcpip.FullAddress
+	// Addrs is the list of local IP prefixes.
+	Addrs []netip.Prefix
+	// KeyEpoch is the current key epoch.
+	KeyEpoch uint32
+	// Stats is a statistics snapshot.
+	Stats VirtualNetworkStats
+}
+
+// VirtualNetworkStats is a statistics snapshot for a virtual network.
 type VirtualNetworkStats struct {
 	// VNI is the virtual network identifier.
 	VNI uint

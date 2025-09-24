@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -333,24 +334,37 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 	return nil
 }
 
-// StatsForVNI returns a snapshot for a single virtual network.
-func (h *Handler) StatsForVNI(vni uint) (VirtualNetworkStats, bool) {
-	v, ok := h.networkByID.Load(vni)
+// GetVirtualNetwork retrieves a virtual network by its VNI.
+func (h *Handler) GetVirtualNetwork(vni uint) (*VirtualNetwork, bool) {
+	value, ok := h.networkByID.Load(vni)
 	if !ok {
-		return VirtualNetworkStats{}, false
+		return nil, false
 	}
-	vnet := v.(*virtualNetwork)
-	return vnet.stats.snapshot(vnet.id), true
+	vn := value.(*virtualNetwork)
+	return &VirtualNetwork{
+		VNI:        vn.id,
+		RemoteAddr: *vn.remoteAddr,
+		Addrs:      append([]netip.Prefix(nil), vn.addrs...),
+		KeyEpoch:   vn.stats.keyEpoch.Load(),
+		Stats:      vn.stats.snapshot(vn.id),
+	}, true
 }
 
-// AllStats returns snapshots for all currently registered virtual networks.
-func (h *Handler) AllStats() []VirtualNetworkStats {
-	var out []VirtualNetworkStats
+// ListVirtualNetworks returns a snapshot of all configured virtual networks.
+func (h *Handler) ListVirtualNetworks() []VirtualNetwork {
+	var out []VirtualNetwork
 	h.networkByID.Range(func(_, value any) bool {
-		vnet := value.(*virtualNetwork)
-		out = append(out, vnet.stats.snapshot(vnet.id))
+		vn := value.(*virtualNetwork)
+		out = append(out, VirtualNetwork{
+			VNI:        vn.id,
+			RemoteAddr: *vn.remoteAddr,
+			Addrs:      append([]netip.Prefix(nil), vn.addrs...),
+			KeyEpoch:   vn.stats.keyEpoch.Load(),
+			Stats:      vn.stats.snapshot(vn.id),
+		})
 		return true
 	})
+	sort.Slice(out, func(i, j int) bool { return out[i].VNI < out[j].VNI })
 	return out
 }
 
