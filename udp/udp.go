@@ -79,10 +79,13 @@ func Decode(frame []byte, addr *tcpip.FullAddress, skipChecksumValidation bool) 
 // It assumes that the payload is already in the frame buffer at the correct
 // offset.
 func Encode(frame []byte, src, dst *tcpip.FullAddress, payloadLength int, skipChecksumCalculation bool) (int, error) {
+	if src.Addr.Len() != dst.Addr.Len() {
+		return 0, errors.New("source and destination addresses must be of the same address family")
+	}
+
+	isIPv6 := dst.Addr.Len() == net.IPv6len
+
 	var offset int
-
-	isIPv6 := src.Addr.Len() == net.IPv6len
-
 	eth := header.Ethernet(frame[offset:])
 	eth.Encode(&header.EthernetFields{
 		SrcAddr: src.LinkAddr,

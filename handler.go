@@ -18,6 +18,7 @@ import (
 
 	"github.com/dpeckett/triemap"
 
+	"github.com/apoxy-dev/icx/addrselect"
 	"github.com/apoxy-dev/icx/flowhash"
 	"github.com/apoxy-dev/icx/geneve"
 	"github.com/apoxy-dev/icx/proxyarp"
@@ -99,7 +100,7 @@ type virtualNetwork struct {
 type HandlerOption func(*handlerOptions) error
 
 type handlerOptions struct {
-	localAddr         *tcpip.FullAddress
+	localAddrs        addrselect.AddressList
 	virtMAC           tcpip.LinkAddress
 	srcMAC            tcpip.LinkAddress
 	sourcePortHashing bool
@@ -115,14 +116,16 @@ func defaultHandlerOptions() handlerOptions {
 }
 
 // WithLocalAddr sets the local UDP endpoint used as the source for
-// encapsulated packets. This option is required.
+// encapsulated packets. This option is required. If multiple
+// addresses are provided, the best one is chosen per packet based
+// on the remote address.
 //
 // If WithSourcePortHashing is enabled, the Port field of this address is
 // overridden per packet with a hash of the inner flow. Otherwise, the Port
 // specified here is used as-is.
 func WithLocalAddr(a *tcpip.FullAddress) HandlerOption {
 	return func(opts *handlerOptions) error {
-		opts.localAddr = a
+		opts.localAddrs = append(opts.localAddrs, a)
 		return nil
 	}
 }
@@ -196,7 +199,7 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		}
 	}
 
-	if options.localAddr == nil {
+	if len(options.localAddrs) == 0 {
 		return nil, fmt.Errorf("local address must be set")
 	}
 
@@ -524,8 +527,6 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 // VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
 // Returns the length of the resulting physical frame.
-// VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
-// Returns the length of the resulting physical frame.
 func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	ipPacket := virtFrame
 
@@ -654,7 +655,14 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
-	localAddr := *h.opts.localAddr
+	best := h.opts.localAddrs.Pick(vnet.remoteAddr)
+	if best == nil {
+		slog.Warn("No local underlay addresses configured")
+		vnet.stats.txErrors.Add(1)
+		return 0, false
+	}
+
+	localAddr := *best
 	if h.opts.sourcePortHashing {
 		localAddr.Port = flowhash.Hash(ipPacket)
 	}
