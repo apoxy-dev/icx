@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"runtime"
 	"sync"
@@ -30,6 +31,63 @@ type Handler interface {
 	// VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
 	// Returns the length of the resulting physical frame.
 	VirtToPhy(virtFrame, phyFrame []byte) (length int, loopback bool)
+	// ScheduledToPhy is called periodically to allow the handler to send
+	// scheduled frames to the physical interface, e.g. keep-alive packets.
+	// Returns the length of the resulting physical frame.
+	ScheduledToPhy(phyFrame []byte) int
+}
+
+type TunnelOption func(*tunnelOptions) error
+
+type tunnelOptions struct {
+	phyName    string
+	virtName   string
+	phyFilter  *xdp.Program
+	pcapWriter *pcapgo.Writer
+}
+
+func defaultTunnelOptions() tunnelOptions {
+	return tunnelOptions{
+		phyName:  "eth0",
+		virtName: "tun0",
+	}
+}
+
+// WithPhyName sets the name of the physical interface to use.
+// Defaults to "eth0".
+func WithPhyName(name string) TunnelOption {
+	return func(o *tunnelOptions) error {
+		o.phyName = name
+		return nil
+	}
+}
+
+// WithVirtName sets the name of the virtual interface to use.
+// Defaults to "tun0".
+func WithVirtName(name string) TunnelOption {
+	return func(o *tunnelOptions) error {
+		o.virtName = name
+		return nil
+	}
+}
+
+// WithPcapWriter sets a pcap writer to log all frames sent and received on both
+// interfaces. If nil, no pcap logging is performed.
+func WithPcapWriter(writer *pcapgo.Writer) TunnelOption {
+	return func(o *tunnelOptions) error {
+		o.pcapWriter = writer
+		return nil
+	}
+}
+
+// WithPhyFilter sets a custom XDP filter program to use on the physical interface.
+// If nil, a default filter is created that accepts all GENEVE packets addressed
+// to the default port (6081).
+func WithPhyFilter(filter *xdp.Program) TunnelOption {
+	return func(o *tunnelOptions) error {
+		o.phyFilter = filter
+		return nil
+	}
 }
 
 // Tunnel splices frames between a physical and a virtual interface using XDP sockets.
@@ -46,29 +104,37 @@ type Tunnel struct {
 	closeOnce    sync.Once
 }
 
-func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler, pcapWriter *pcapgo.Writer) (*Tunnel, error) {
-	slog.Debug("Creating tunnel",
-		slog.String("phyName", phyName),
-		slog.String("virtName", virtName))
-
-	phyLink, err := netlink.LinkByName(phyName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find physical interface %s: %w", phyName, err)
+// NewTunnel creates a new Tunnel with the given handler and options.
+func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
+	options := defaultTunnelOptions()
+	for _, opt := range opts {
+		if err := opt(&options); err != nil {
+			return nil, err
+		}
 	}
 
-	virtLink, err := netlink.LinkByName(virtName)
+	slog.Debug("Creating tunnel",
+		slog.String("phyName", options.phyName),
+		slog.String("virtName", options.virtName))
+
+	phyLink, err := netlink.LinkByName(options.phyName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find virtual interface %s: %w", virtName, err)
+		return nil, fmt.Errorf("failed to find physical interface %s: %w", options.phyName, err)
+	}
+
+	virtLink, err := netlink.LinkByName(options.virtName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find virtual interface %s: %w", options.virtName, err)
 	}
 
 	phyNumQueues, err := NumQueues(phyLink)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get number of queues for physical device %s: %w", phyName, err)
+		return nil, fmt.Errorf("failed to get number of queues for physical device %s: %w", options.phyName, err)
 	}
 
 	virtNumQueues, err := NumQueues(virtLink)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get number of queues for virtual device %s: %w", virtName, err)
+		return nil, fmt.Errorf("failed to get number of queues for virtual device %s: %w", options.virtName, err)
 	}
 
 	if phyNumQueues != virtNumQueues {
@@ -86,7 +152,23 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 		TxRingNumDescs:         4096,
 	}
 
-	if err := phyFilter.Attach(phyLink.Attrs().Index); err != nil {
+	// If no filter was provided, create a default one that filters on the physical interface and
+	// accepts all GENEVE packets addressed to the default port.
+	if options.phyFilter == nil {
+		const defaultPort = 6081
+
+		phyAddrs, err := addrsForInterface(phyLink, defaultPort)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get addresses for physical interface: %w", err)
+		}
+
+		options.phyFilter, err = filter.Bind(phyAddrs...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create XDP ingress filter: %w", err)
+		}
+	}
+
+	if err := options.phyFilter.Attach(phyLink.Attrs().Index); err != nil {
 		return nil, fmt.Errorf("failed to attach XDP ingress filter: %w", err)
 	}
 
@@ -94,7 +176,7 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 	for queueID := 0; queueID < phyNumQueues; queueID++ {
 		xsk, err := xdp.NewSocket(phyLink.Attrs().Index, queueID, socketOpts)
 		if err != nil {
-			_ = phyFilter.Detach(phyLink.Attrs().Index)
+			_ = options.phyFilter.Detach(phyLink.Attrs().Index)
 			for _, xsk := range phy {
 				_ = xsk.Close()
 			}
@@ -103,8 +185,8 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 
 		phy = append(phy, xsk)
 
-		if err := phyFilter.Register(queueID, xsk.FD()); err != nil {
-			_ = phyFilter.Detach(phyLink.Attrs().Index)
+		if err := options.phyFilter.Register(queueID, xsk.FD()); err != nil {
+			_ = options.phyFilter.Detach(phyLink.Attrs().Index)
 			for _, xsk := range phy {
 				_ = xsk.Close()
 			}
@@ -118,7 +200,7 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 	}
 
 	if err := virtFilter.Attach(virtLink.Attrs().Index); err != nil {
-		_ = phyFilter.Detach(phyLink.Attrs().Index)
+		_ = options.phyFilter.Detach(phyLink.Attrs().Index)
 		for _, xsk := range phy {
 			_ = xsk.Close()
 		}
@@ -129,7 +211,7 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 	for queueID := 0; queueID < virtNumQueues; queueID++ {
 		xsk, err := xdp.NewSocket(virtLink.Attrs().Index, queueID, socketOpts)
 		if err != nil {
-			_ = phyFilter.Detach(phyLink.Attrs().Index)
+			_ = options.phyFilter.Detach(phyLink.Attrs().Index)
 			_ = virtFilter.Detach(virtLink.Attrs().Index)
 			for _, xsk := range phy {
 				_ = xsk.Close()
@@ -143,7 +225,7 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 		virt = append(virt, xsk)
 
 		if err := virtFilter.Register(queueID, xsk.FD()); err != nil {
-			_ = phyFilter.Detach(phyLink.Attrs().Index)
+			_ = options.phyFilter.Detach(phyLink.Attrs().Index)
 			_ = virtFilter.Detach(virtLink.Attrs().Index)
 			for _, xsk := range phy {
 				_ = xsk.Close()
@@ -157,8 +239,8 @@ func NewTunnel(phyName, virtName string, phyFilter *xdp.Program, handler Handler
 
 	return &Tunnel{
 		handler:    handler,
-		phyFilter:  phyFilter,
-		pcapWriter: pcapWriter,
+		phyFilter:  options.phyFilter,
+		pcapWriter: options.pcapWriter,
 		link:       phyLink,
 		phy:        phy,
 		virtFilter: virtFilter,
@@ -255,6 +337,34 @@ func (t *Tunnel) processFrames(queueID int) error {
 
 		if numCompleted := t.virt[queueID].NumCompleted(); numCompleted > 0 {
 			t.virt[queueID].Complete(numCompleted)
+		}
+
+		// Try to emit any scheduled frames.
+		// We do this once per loop (the loop naturally ticks via poll timeout),
+		// and only if there are available TX descriptors.
+
+		// Scheduled to PHY (produce a frame that should go out on the physical iface).
+		if t.phy[queueID].NumFreeTxSlots() > 0 {
+			if txDescs := t.phy[queueID].GetDescs(1, false); len(txDescs) == 1 {
+				txFrame := t.phy[queueID].GetFrame(txDescs[0])
+				if frameLen := t.handler.ScheduledToPhy(txFrame); frameLen > 0 {
+					txDescs[0].Len = uint32(frameLen)
+					if transmitted := t.phy[queueID].Transmit(txDescs); transmitted < 1 {
+						slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
+					} else {
+						if t.pcapWriter != nil {
+							t.pcapWriterMu.Lock()
+							ci := gopacket.CaptureInfo{
+								Timestamp:     time.Now(),
+								CaptureLength: frameLen,
+								Length:        frameLen,
+							}
+							_ = t.pcapWriter.WritePacket(ci, txFrame[:frameLen])
+							t.pcapWriterMu.Unlock()
+						}
+					}
+				}
+			}
 		}
 
 		// Did we receive any frames from the physical device?
@@ -393,4 +503,24 @@ func poll(phy, virt *xdp.Socket, timeout time.Duration) (err error) {
 	}
 
 	return nil
+}
+
+func addrsForInterface(link netlink.Link, port int) ([]net.Addr, error) {
+	nlAddrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get addresses for interface: %w", err)
+	}
+
+	var addrs []net.Addr
+	for _, addr := range nlAddrs {
+		if addr.IP == nil {
+			continue
+		}
+		addrs = append(addrs, &net.UDPAddr{
+			IP:   addr.IP,
+			Port: port,
+		})
+	}
+
+	return addrs, nil
 }

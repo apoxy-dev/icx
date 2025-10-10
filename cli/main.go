@@ -273,7 +273,13 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to update virtual network key: %w", err)
 	}
 
-	tun, err := tunnel.NewTunnel(phyName, vethDev.Peer.Attrs().Name, ingressFilter, h, pcapWriter)
+	tun, err := tunnel.NewTunnel(
+		h,
+		tunnel.WithPhyName(phyName),
+		tunnel.WithVirtName(vethDev.Peer.Attrs().Name),
+		tunnel.WithPhyFilter(ingressFilter),
+		tunnel.WithPcapWriter(pcapWriter),
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create tunnel: %w", err)
 	}

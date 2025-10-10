@@ -89,12 +89,13 @@ func (s *stats) snapshot(vni uint) VirtualNetworkStats {
 
 // The state associated with each virtual network.
 type virtualNetwork struct {
-	id         uint
-	remoteAddr *tcpip.FullAddress
-	rxCiphers  sync.Map
-	txCipher   atomic.Pointer[transmitCipher]
-	addrs      []netip.Prefix
-	stats      stats
+	id                    uint
+	remoteAddr            *tcpip.FullAddress
+	rxCiphers             sync.Map
+	txCipher              atomic.Pointer[transmitCipher]
+	addrs                 []netip.Prefix
+	stats                 stats
+	lastKeepAliveUnixNano atomic.Int64
 }
 
 type HandlerOption func(*handlerOptions) error
@@ -105,6 +106,7 @@ type handlerOptions struct {
 	srcMAC            tcpip.LinkAddress
 	sourcePortHashing bool
 	layer3            bool
+	keepAliveInterval *time.Duration
 }
 
 func defaultHandlerOptions() handlerOptions {
@@ -161,12 +163,7 @@ func WithSourcePortHashing() HandlerOption {
 }
 
 // WithLayer3VirtFrames configures the handler for L3 mode, where virtual frames
-// are raw IP packets (no Ethernet header). In this mode:
-//   - VirtToPhy expects an IP packet as input.
-//   - PhyToVirt returns a decrypted IP packet.
-//   - WithVirtMAC and WithSourceMAC are ignored.
-//
-// Default is L2 mode (Ethernet frames).
+// are raw IP packets (no Ethernet header). Default is L2 mode (Ethernet frames).
 func WithLayer3VirtFrames() HandlerOption {
 	return func(opts *handlerOptions) error {
 		opts.layer3 = true
@@ -174,12 +171,23 @@ func WithLayer3VirtFrames() HandlerOption {
 	}
 }
 
+// WithKeepAliveInterval configures the handler to send keep-alive packets
+// on each virtual network at the given interval. If nil or zero, no keep-alives
+// are sent.
+// A value of between 10 and 30s is recommended to keep NAT mappings alive.
+func WithKeepAliveInterval(interval time.Duration) HandlerOption {
+	return func(opts *handlerOptions) error {
+		if interval <= 0 {
+			opts.keepAliveInterval = nil
+		}
+		opts.keepAliveInterval = &interval
+		return nil
+	}
+}
+
 // Handler processes encapsulated GENEVE traffic for one or more virtual
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
-//
-// A Handler tracks virtual networks by VNI and allowed address prefixes,
-// supports both L2 and L3 operation, and is safe for concurrent use.
 type Handler struct {
 	opts             *handlerOptions
 	networkByID      sync.Map                          // Maps VNI to network
@@ -457,6 +465,16 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
+	// Is it an authenticated out-of-band message?
+	if hdr.ProtocolType == 0 {
+		slog.Debug("Dropping out-of-band message")
+		// Treat as a (zero-byte) virtual packet receive for stats purposes.
+		vnet.stats.rxPackets.Add(1)
+		vnet.stats.rxBytes.Add(uint64(len(ipPacket)))
+		vnet.stats.lastRXUnixNano.Store(time.Now().UnixNano())
+		return 0
+	}
+
 	ipVersion := ipPacket[0] >> 4
 
 	// Get the source address of the decrypted frame.
@@ -680,4 +698,115 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	vnet.stats.lastTXUnixNano.Store(time.Now().UnixNano())
 
 	return frameLen, false
+}
+
+// ScheduledToPhy is called periodically to allow the handler to send
+// scheduled frames to the physical interface, e.g. keep-alive packets.
+// Returns the length of the resulting physical frame.
+func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
+	if h.opts.keepAliveInterval == nil || *h.opts.keepAliveInterval <= 0 {
+		return 0
+	}
+	interval := *h.opts.keepAliveInterval
+	now := time.Now()
+
+	// Pick a virtual network that's due.
+	var vnet *virtualNetwork
+	h.networkByID.Range(func(_, v any) bool {
+		vn := v.(*virtualNetwork)
+		last := time.Unix(0, vn.lastKeepAliveUnixNano.Load())
+		if last.IsZero() || now.Sub(last) >= interval {
+			vnet = vn
+			return false
+		}
+		return true
+	})
+	if vnet == nil {
+		return 0
+	}
+
+	txCipher := vnet.txCipher.Load()
+	if txCipher == nil {
+		slog.Warn("keep-alive: TX cipher not available")
+		vnet.stats.txErrors.Add(1)
+		return 0
+	}
+	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
+		slog.Warn("keep-alive: TX counter overflow, rotate the key")
+		vnet.stats.txErrors.Add(1)
+		return 0
+	}
+
+	hdr := h.hdrPool.Get().(*geneve.Header)
+	defer h.hdrPool.Put(hdr)
+
+	*hdr = geneve.Header{
+		VNI:        uint32(vnet.id),
+		NumOptions: 2,
+		Critical:   true,
+		Options: [geneve.MaxOptions]geneve.Option{
+			{
+				Class:  geneve.ClassExperimental,
+				Type:   geneve.OptionTypeKeyEpoch,
+				Length: 1,
+			},
+			{
+				Class:  geneve.ClassExperimental,
+				Type:   geneve.OptionTypeTxCounter,
+				Length: 3,
+			},
+		},
+		ProtocolType: 0, // EtherType Unknown - indicates no inner payload.
+	}
+
+	// Fill options: epoch + nonce/counter
+	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], txCipher.epoch)
+	nonce := hdr.Options[1].Value[:12]
+	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
+
+	// Place GENEVE payload inside outer UDP frame.
+	var payload []byte
+	if vnet.remoteAddr.Addr.Len() == net.IPv4len {
+		payload = phyFrame[udp.PayloadOffsetIPv4:]
+	} else {
+		payload = phyFrame[udp.PayloadOffsetIPv6:]
+	}
+
+	// Marshal GENEVE header.
+	hdrLen, err := hdr.MarshalBinary(payload)
+	if err != nil {
+		slog.Warn("keep-alive: marshal GENEVE header failed", slog.Any("error", err))
+		vnet.stats.txErrors.Add(1)
+		return 0
+	}
+
+	// AEAD over EMPTY inner payload -> ciphertext is just the tag.
+	plaintext := []byte(nil)
+	ct := txCipher.Seal(payload[hdrLen:hdrLen], nonce, plaintext, payload[:hdrLen])
+	encLen := len(ct) // AEAD tag length
+
+	// Underlay source selection.
+	best := h.opts.localAddrs.Pick(vnet.remoteAddr)
+	if best == nil {
+		slog.Warn("keep-alive: no local underlay addresses configured")
+		vnet.stats.txErrors.Add(1)
+		return 0
+	}
+	localAddr := *best // keep configured source port for stability
+
+	// Finish outer UDP/IP/Ethernet
+	totalGeneveLen := hdrLen + encLen
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, totalGeneveLen, false)
+	if err != nil {
+		slog.Warn("keep-alive: UDP encode failed", slog.Any("error", err))
+		vnet.stats.txErrors.Add(1)
+		return 0
+	}
+
+	// Stats: treat as a (zero-byte) virtual packet send.
+	vnet.stats.txPackets.Add(1)
+	vnet.stats.lastTXUnixNano.Store(now.UnixNano())
+	vnet.lastKeepAliveUnixNano.Store(now.UnixNano())
+
+	return frameLen
 }

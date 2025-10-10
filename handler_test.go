@@ -38,7 +38,9 @@ func TestHandler(t *testing.T) {
 
 	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr),
 		icx.WithVirtMAC(virtMAC),
-		icx.WithSourcePortHashing())
+		icx.WithSourcePortHashing(),
+		icx.WithKeepAliveInterval(500*time.Millisecond),
+	)
 	require.NoError(t, err)
 
 	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
@@ -66,11 +68,17 @@ func TestHandler(t *testing.T) {
 
 	require.Equal(t, virtMAC, eth.DestinationAddress())
 
+	frameLen = h.ScheduledToPhy(phyFrame)
+	require.NotZero(t, frameLen)
+
 	require.NoError(t, h.RemoveVirtualNetwork(0x12345))
 
 	frameLen, loopback = h.VirtToPhy(virtFrame, phyFrame)
 	require.Zero(t, frameLen)
 	require.False(t, loopback)
+
+	frameLen = h.ScheduledToPhy(phyFrame)
+	require.Zero(t, frameLen)
 }
 
 func TestHandler_Layer3(t *testing.T) {

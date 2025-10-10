@@ -18,7 +18,8 @@ struct genevehdr {
 	__u8 reserved;
 };
 
-static __always_inline int parse_genevehdr(struct hdr_cursor *nh, void *data_end, struct genevehdr **ghdr)
+static __always_inline int
+parse_genevehdr(struct hdr_cursor *nh, void *data_end, struct genevehdr **ghdr)
 {
 	struct genevehdr *gh = nh->pos;
 
@@ -28,8 +29,9 @@ static __always_inline int parse_genevehdr(struct hdr_cursor *nh, void *data_end
 	if ((gh->ver_opt_len >> 6) != 0) // Only version 0 supported
 		return -1;
 
-	// Check that the protocol type is valid (IPv4 or IPv6).
-	if (bpf_ntohs(gh->proto_type) != ETH_P_IP && bpf_ntohs(gh->proto_type) != ETH_P_IPV6)
+	// Check that the protocol type is valid (IPv4 or IPv6 or Unknown (out-of-band messages))
+	__u16 ptype = bpf_ntohs(gh->proto_type);
+	if (ptype != ETH_P_IP && ptype != ETH_P_IPV6 && ptype != 0)
 		return -1;
 
 	*ghdr = gh;
@@ -110,8 +112,8 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	}
 
 	if (parse_udphdr(&nh, data_end, &udph) < 0)
-			return XDP_PASS;
-	
+		return XDP_PASS;
+
 	key.port = bpf_ntohs(udph->dest);
 
 	if (!bpf_map_lookup_elem(&bind_map, &key))
