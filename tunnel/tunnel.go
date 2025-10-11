@@ -351,17 +351,6 @@ func (t *Tunnel) processFrames(queueID int) error {
 					txDescs[0].Len = uint32(frameLen)
 					if transmitted := t.phy[queueID].Transmit(txDescs); transmitted < 1 {
 						slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
-					} else {
-						if t.pcapWriter != nil {
-							t.pcapWriterMu.Lock()
-							ci := gopacket.CaptureInfo{
-								Timestamp:     time.Now(),
-								CaptureLength: frameLen,
-								Length:        frameLen,
-							}
-							_ = t.pcapWriter.WritePacket(ci, txFrame[:frameLen])
-							t.pcapWriterMu.Unlock()
-						}
 					}
 				}
 			}
@@ -393,10 +382,10 @@ func (t *Tunnel) processFrames(queueID int) error {
 					t.pcapWriterMu.Lock()
 					ci := gopacket.CaptureInfo{
 						Timestamp:     time.Now(),
-						CaptureLength: len(rxFrame),
-						Length:        len(rxFrame),
+						CaptureLength: frameLen,
+						Length:        frameLen,
 					}
-					_ = t.pcapWriter.WritePacket(ci, rxFrame)
+					_ = t.pcapWriter.WritePacket(ci, txFrame[:frameLen])
 					t.pcapWriterMu.Unlock()
 				}
 			}
@@ -425,8 +414,10 @@ func (t *Tunnel) processFrames(queueID int) error {
 				txFrame := t.phy[queueID].GetFrame(txDescs[populatedDescs])
 
 				frameLen, loopback := t.handler.VirtToPhy(rxFrame, txFrame)
+
 				if !loopback {
 					if frameLen <= 0 {
+						slog.Debug("Dropped frame from virtual device", slog.Int("queueID", queueID))
 						continue
 					}
 
@@ -443,17 +434,6 @@ func (t *Tunnel) processFrames(queueID int) error {
 					} else {
 						slog.Debug("Dropped loopback frame", slog.Int("queueID", queueID))
 					}
-				}
-
-				if t.pcapWriter != nil {
-					t.pcapWriterMu.Lock()
-					ci := gopacket.CaptureInfo{
-						Timestamp:     time.Now(),
-						CaptureLength: len(txFrame),
-						Length:        len(txFrame),
-					}
-					_ = t.pcapWriter.WritePacket(ci, txFrame)
-					t.pcapWriterMu.Unlock()
 				}
 			}
 			if populatedDescs > 0 {

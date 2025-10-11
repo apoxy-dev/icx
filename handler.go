@@ -21,6 +21,7 @@ import (
 	"github.com/apoxy-dev/icx/addrselect"
 	"github.com/apoxy-dev/icx/flowhash"
 	"github.com/apoxy-dev/icx/geneve"
+	"github.com/apoxy-dev/icx/ndproxy"
 	"github.com/apoxy-dev/icx/proxyarp"
 	"github.com/apoxy-dev/icx/replay"
 	"github.com/apoxy-dev/icx/udp"
@@ -193,6 +194,7 @@ type Handler struct {
 	networkByID      sync.Map                          // Maps VNI to network
 	networkByAddress *triemap.TrieMap[*virtualNetwork] // Maps tunnel destination address to network
 	proxyARP         *proxyarp.ProxyARP
+	ndProxy          *ndproxy.NDProxy
 	hdrPool          *sync.Pool
 }
 
@@ -225,6 +227,7 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		opts:             &options,
 		networkByAddress: triemap.New[*virtualNetwork](),
 		proxyARP:         proxyarp.NewProxyARP(options.srcMAC),
+		ndProxy:          ndproxy.NewNDProxy(options.srcMAC),
 		hdrPool:          hdrPool,
 	}, nil
 }
@@ -561,6 +564,27 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 			}
 
 			return frameLen, true
+		}
+
+		// Handle IPv6 Neighbor Solicitation with an immediate local NA reply.
+		if ethType == header.IPv6ProtocolNumber {
+			ipPayload := virtFrame[header.EthernetMinimumSize:]
+			if len(ipPayload) >= header.IPv6MinimumSize {
+				ip6 := header.IPv6(ipPayload)
+				if ip6.IsValid(len(ipPayload)) && ip6.TransportProtocol() == header.ICMPv6ProtocolNumber {
+					icmp := ip6.Payload()
+					// ICMPv6 type 135 = Neighbor Solicitation.
+					if len(icmp) >= header.ICMPv6NeighborSolicitMinimumSize && icmp[0] == byte(header.ICMPv6NeighborSolicit) {
+						frameLen, err := h.ndProxy.Reply(virtFrame, phyFrame)
+						if err != nil {
+							slog.Warn("Failed to handle ND request", slog.Any("error", err))
+							return 0, false
+						}
+
+						return frameLen, true
+					}
+				}
+			}
 		}
 
 		// Drop non ip frames
