@@ -255,7 +255,12 @@ func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
 func (t *Tunnel) Close() (err error) {
 	t.closeOnce.Do(func() {
 		if err = t.phyFilter.Detach(t.link.Attrs().Index); err != nil {
-			err = fmt.Errorf("failed to detach XDP filter: %w", err)
+			err = fmt.Errorf("failed to detach phy XDP filter: %w", err)
+			return
+		}
+
+		if err = t.virtFilter.Detach(t.link.Attrs().Index); err != nil {
+			err = fmt.Errorf("failed to detach virt XDP filter: %w", err)
 			return
 		}
 
@@ -284,35 +289,39 @@ func (t *Tunnel) Close() (err error) {
 func (t *Tunnel) Start(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error {
-		<-ctx.Done()
-
-		slog.Debug("Context canceled, closing tunnel")
-
-		if err := t.Close(); err != nil {
-			slog.Error("Failed to close tunnel", slog.Any("error", err))
-		}
-		return nil
-	})
-
 	for queueID := range t.phy {
 		g.Go(func() error {
-			return t.processFrames(queueID)
+			return t.processFrames(ctx, queueID)
 		})
 	}
 
-	if err := g.Wait(); err != nil && !errors.Is(err, os.ErrClosed) {
+	// Wait for cancellation or a worker error.
+	err := g.Wait()
+
+	// Now it is safe to close sockets/filters; workers have stopped touching them.
+	if closeErr := t.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, os.ErrClosed) {
 		return fmt.Errorf("error while processing frames: %w", err)
 	}
 
 	return nil
 }
 
-func (t *Tunnel) processFrames(queueID int) error {
+func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	for {
+		// Close() is racy so use context cancellation here.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		// Reserve space in the physical rx queue
 		if n := min(t.phy[queueID].NumFilled()+t.phy[queueID].NumFreeFillSlots(), t.virt[queueID].NumFreeTxSlots()); n > 0 {
 			if t.phy[queueID].NumFilled() < n {
