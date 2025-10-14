@@ -102,13 +102,15 @@ int xdp_sock_prog(struct xdp_md *ctx)
 		key.family = AF_INET6;
 		for (int i = 0; i < 4; i++)
 			key.addr[i] = bpf_ntohl(ip6h->daddr.s6_addr32[i]);
-	} else {
+	} else if (nh_type == bpf_htons(ETH_P_IP)) {
 		ip_proto = parse_iphdr(&nh, data_end, &iph);
 		if (ip_proto != IPPROTO_UDP)
 			return XDP_PASS;
 
 		key.family = AF_INET;
 		key.addr[0] = bpf_ntohl(iph->daddr);
+	} else {
+		return XDP_PASS;
 	}
 
 	if (parse_udphdr(&nh, data_end, &udph) < 0)
@@ -116,9 +118,20 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
 	key.port = bpf_ntohs(udph->dest);
 
-	if (!bpf_map_lookup_elem(&bind_map, &key))
-		return XDP_PASS;
+	// First try exact match; if none, try a wildcard bind.
+	if (!bpf_map_lookup_elem(&bind_map, &key)) {
+		struct bind_key any_key = key;
+		any_key.addr[0] = 0;
+		any_key.addr[1] = 0;
+		any_key.addr[2] = 0;
+		any_key.addr[3] = 0;
 
+		if (!bpf_map_lookup_elem(&bind_map, &any_key)) {
+			return XDP_PASS;
+		}
+	}
+
+	// Now make sure it's Geneve traffic.
 	if (parse_genevehdr(&nh, data_end, &geneve) < 0)
 		return XDP_PASS;
 

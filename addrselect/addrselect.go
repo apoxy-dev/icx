@@ -7,10 +7,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
-type AddressList []*tcpip.FullAddress
+type List []*tcpip.FullAddress
 
-// Pick chooses the best local underlay address for a given remote underlay address.
-func (l AddressList) Pick(remote *tcpip.FullAddress) *tcpip.FullAddress {
+// Select chooses the best local underlay address for a given remote underlay address.
+func (l List) Select(remote *tcpip.FullAddress) *tcpip.FullAddress {
 	if len(l) == 0 || remote == nil {
 		return nil
 	}

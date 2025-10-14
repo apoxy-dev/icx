@@ -21,16 +21,16 @@ func fa(s string) *tcpip.FullAddress {
 	return &tcpip.FullAddress{Addr: tcpip.AddrFromSlice(ip)}
 }
 
-func TestPick(t *testing.T) {
+func TestSelect(t *testing.T) {
 	t.Run("empty list returns nil", func(t *testing.T) {
-		var l addrselect.AddressList
-		got := l.Pick(fa("10.0.0.1"))
+		var l addrselect.List
+		got := l.Select(fa("10.0.0.1"))
 		assert.Nil(t, got)
 	})
 
 	t.Run("nil remote returns nil", func(t *testing.T) {
-		l := addrselect.AddressList{fa("10.0.0.1")}
-		got := l.Pick(nil)
+		l := addrselect.List{fa("10.0.0.1")}
+		got := l.Select(nil)
 		assert.Nil(t, got)
 	})
 
@@ -41,8 +41,8 @@ func TestPick(t *testing.T) {
 		v4other := fa("10.0.0.1")
 		v6 := fa("2001:db8::1")
 
-		l := addrselect.AddressList{v6, v4other, best}
-		got := l.Pick(remote)
+		l := addrselect.List{v6, v4other, best}
+		got := l.Select(remote)
 		require.NotNil(t, got)
 		assert.Same(t, best, got)
 	})
@@ -54,8 +54,8 @@ func TestPick(t *testing.T) {
 		best := fa("2001:db8:abcd::1")
 		v6other := fa("2001:db8:ffff::1")
 
-		l := addrselect.AddressList{v4, v6other, best}
-		got := l.Pick(remote)
+		l := addrselect.List{v4, v6other, best}
+		got := l.Select(remote)
 		require.NotNil(t, got)
 		assert.Same(t, best, got)
 	})
@@ -63,9 +63,9 @@ func TestPick(t *testing.T) {
 	t.Run("no same-family candidates falls back to first", func(t *testing.T) {
 		remote := fa("2001:db8::99")
 		first := fa("10.0.0.1")
-		l := addrselect.AddressList{first, fa("10.0.0.2")}
+		l := addrselect.List{first, fa("10.0.0.2")}
 
-		got := l.Pick(remote)
+		got := l.Select(remote)
 		require.NotNil(t, got)
 		assert.Same(t, first, got)
 	})
@@ -73,9 +73,9 @@ func TestPick(t *testing.T) {
 	t.Run("single candidate after family filter is returned", func(t *testing.T) {
 		remote := fa("fd00::abcd")
 		onlyV6 := fa("fd00::1")
-		l := addrselect.AddressList{fa("192.168.1.1"), onlyV6}
+		l := addrselect.List{fa("192.168.1.1"), onlyV6}
 
-		got := l.Pick(remote)
+		got := l.Select(remote)
 		require.NotNil(t, got)
 		assert.Same(t, onlyV6, got)
 	})
@@ -85,9 +85,9 @@ func TestPick(t *testing.T) {
 		// Both share the same prefix length with remote ("10.1" -> 16 bits)
 		first := fa("10.1.9.9")
 		second := fa("10.1.200.200")
-		l := addrselect.AddressList{first, second, fa("192.168.0.1")}
+		l := addrselect.List{first, second, fa("192.168.0.1")}
 
-		got := l.Pick(remote)
+		got := l.Select(remote)
 		require.NotNil(t, got)
 		assert.Same(t, first, got, "stable tie-break should keep the first best candidate")
 	})

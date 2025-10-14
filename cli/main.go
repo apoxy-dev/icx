@@ -181,11 +181,6 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to find interface %s: %w", phyName, err)
 	}
 
-	addrs, err := addrsForInterface(link, c.Int("port"))
-	if err != nil {
-		return fmt.Errorf("failed to get addresses for interface %s: %w", phyName, err)
-	}
-
 	numQueues, err := tunnel.NumQueues(link)
 	if err != nil {
 		return fmt.Errorf("failed to get number of TX queues for interface %s: %w", phyName, err)
@@ -213,7 +208,16 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to resolve peer MAC address: %w", err)
 	}
 
-	ingressFilter, err := filter.Bind(addrs...)
+	port := c.Int("port")
+	ingressFilter, err := filter.Bind(&net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: port,
+	},
+		&net.UDPAddr{
+			IP:   net.IPv6zero,
+			Port: port,
+		},
+	)
 	if err != nil {
 		return fmt.Errorf("failed to create ingress filter: %w", err)
 	}
@@ -289,26 +293,6 @@ func run(c *cli.Context) error {
 	}
 
 	return nil
-}
-
-func addrsForInterface(link netlink.Link, port int) ([]net.Addr, error) {
-	nlAddrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get addresses for interface: %w", err)
-	}
-
-	var addrs []net.Addr
-	for _, addr := range nlAddrs {
-		if addr.IP == nil {
-			continue
-		}
-		addrs = append(addrs, &net.UDPAddr{
-			IP:   addr.IP,
-			Port: port,
-		})
-	}
-
-	return addrs, nil
 }
 
 func selectSourceAddr(link netlink.Link, dstAddr *tcpip.FullAddress) (*tcpip.FullAddress, error) {

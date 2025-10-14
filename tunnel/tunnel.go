@@ -31,10 +31,10 @@ type Handler interface {
 	// VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
 	// Returns the length of the resulting physical frame.
 	VirtToPhy(virtFrame, phyFrame []byte) (length int, loopback bool)
-	// ScheduledToPhy is called periodically to allow the handler to send
+	// ToPhy is called periodically to allow the handler to send
 	// scheduled frames to the physical interface, e.g. keep-alive packets.
 	// Returns the length of the resulting physical frame.
-	ScheduledToPhy(phyFrame []byte) int
+	ToPhy(phyFrame []byte) int
 }
 
 type TunnelOption func(*tunnelOptions) error
@@ -157,12 +157,16 @@ func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
 	if options.phyFilter == nil {
 		const defaultPort = 6081
 
-		phyAddrs, err := addrsForInterface(phyLink, defaultPort)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get addresses for physical interface: %w", err)
-		}
-
-		options.phyFilter, err = filter.Bind(phyAddrs...)
+		options.phyFilter, err = filter.Bind(
+			&net.UDPAddr{
+				IP:   net.IPv4zero,
+				Port: defaultPort,
+			},
+			&net.UDPAddr{
+				IP:   net.IPv6zero,
+				Port: defaultPort,
+			},
+		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create XDP ingress filter: %w", err)
 		}
@@ -347,7 +351,7 @@ func (t *Tunnel) processFrames(queueID int) error {
 		if t.phy[queueID].NumFreeTxSlots() > 0 {
 			if txDescs := t.phy[queueID].GetDescs(1, false); len(txDescs) == 1 {
 				txFrame := t.phy[queueID].GetFrame(txDescs[0])
-				if frameLen := t.handler.ScheduledToPhy(txFrame); frameLen > 0 {
+				if frameLen := t.handler.ToPhy(txFrame); frameLen > 0 {
 					txDescs[0].Len = uint32(frameLen)
 					if transmitted := t.phy[queueID].Transmit(txDescs); transmitted < 1 {
 						slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
@@ -483,24 +487,4 @@ func poll(phy, virt *xdp.Socket, timeout time.Duration) (err error) {
 	}
 
 	return nil
-}
-
-func addrsForInterface(link netlink.Link, port int) ([]net.Addr, error) {
-	nlAddrs, err := netlink.AddrList(link, netlink.FAMILY_ALL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get addresses for interface: %w", err)
-	}
-
-	var addrs []net.Addr
-	for _, addr := range nlAddrs {
-		if addr.IP == nil {
-			continue
-		}
-		addrs = append(addrs, &net.UDPAddr{
-			IP:   addr.IP,
-			Port: port,
-		})
-	}
-
-	return addrs, nil
 }

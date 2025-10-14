@@ -68,7 +68,7 @@ func TestHandler(t *testing.T) {
 
 	require.Equal(t, virtMAC, eth.DestinationAddress())
 
-	frameLen = h.ScheduledToPhy(phyFrame)
+	frameLen = h.ToPhy(phyFrame)
 	require.NotZero(t, frameLen)
 
 	require.NoError(t, h.RemoveVirtualNetwork(0x12345))
@@ -77,7 +77,7 @@ func TestHandler(t *testing.T) {
 	require.Zero(t, frameLen)
 	require.False(t, loopback)
 
-	frameLen = h.ScheduledToPhy(phyFrame)
+	frameLen = h.ToPhy(phyFrame)
 	require.Zero(t, frameLen)
 }
 

@@ -13,10 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/phemmer/go-iptrie"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
-
-	"github.com/dpeckett/triemap"
 
 	"github.com/apoxy-dev/icx/addrselect"
 	"github.com/apoxy-dev/icx/flowhash"
@@ -48,61 +47,57 @@ type transmitCipher struct {
 	counter atomic.Uint64
 }
 
-// statistics for a virtual network.
-type stats struct {
-	keyEpoch          atomic.Uint32
-	keyRotations      atomic.Uint32
-	rxPackets         atomic.Uint64
-	rxBytes           atomic.Uint64
-	rxDropsNoKey      atomic.Uint64
-	rxDropsExpiredKey atomic.Uint64
-	rxReplayDrops     atomic.Uint64
-	rxDecryptErrors   atomic.Uint64
-	rxInvalidSrc      atomic.Uint64
-	txPackets         atomic.Uint64
-	txBytes           atomic.Uint64
-	txErrors          atomic.Uint64
-	lastRXUnixNano    atomic.Int64
-	lastTXUnixNano    atomic.Int64
-}
-
-func (s *stats) snapshot(vni uint) VirtualNetworkStats {
-	lastRX := time.Unix(0, s.lastRXUnixNano.Load())
-	lastTX := time.Unix(0, s.lastTXUnixNano.Load())
-	return VirtualNetworkStats{
-		VNI:               vni,
-		KeyEpoch:          s.keyEpoch.Load(),
-		KeyRotations:      s.keyRotations.Load(),
-		RXPackets:         s.rxPackets.Load(),
-		RXBytes:           s.rxBytes.Load(),
-		RXDropsNoKey:      s.rxDropsNoKey.Load(),
-		RXDropsExpiredKey: s.rxDropsExpiredKey.Load(),
-		RXReplayDrops:     s.rxReplayDrops.Load(),
-		RXDecryptErrors:   s.rxDecryptErrors.Load(),
-		RXInvalidSrc:      s.rxInvalidSrc.Load(),
-		TXPackets:         s.txPackets.Load(),
-		TXBytes:           s.txBytes.Load(),
-		TXErrors:          s.txErrors.Load(),
-		LastRX:            lastRX,
-		LastTX:            lastTX,
-	}
+// Statistics for a virtual network.
+type Statistics struct {
+	KeyEpoch     atomic.Uint32
+	KeyRotations atomic.Uint32
+	// RXPackets is the number of received packets.
+	RXPackets atomic.Uint64
+	// RXBytes is the number of bytes received.
+	RXBytes atomic.Uint64
+	// RXDropsNoKey is the number of received packets dropped due to a missing key.
+	RXDropsNoKey atomic.Uint64
+	// RXDropsExpiredKey is the number of received packets dropped due to an expired key.
+	RXDropsExpiredKey atomic.Uint64
+	// RXReplayDrops is the number of received packets dropped due to a potential replay attack.
+	RXReplayDrops atomic.Uint64
+	// RXDecryptErrors is the number of received packets that failed decryption.
+	RXDecryptErrors atomic.Uint64
+	// RXInvalidSrc is the number of received packets with an invalid source address.
+	RXInvalidSrc atomic.Uint64
+	// TXPackets is the number of transmitted packets.
+	TXPackets atomic.Uint64
+	// TXBytes is the number of bytes transmitted.
+	TXBytes atomic.Uint64
+	// TXErrors is the number of transmission errors.
+	TXErrors atomic.Uint64
+	// LastRXUnixNano is the timestamp of the last received packet.
+	LastRXUnixNano atomic.Int64
+	// LastTXUnixNano is the timestamp of the last transmitted packet.
+	LastTXUnixNano atomic.Int64
+	// LastKeepAliveUnixNano is the timestamp of the last transmitted keep-alive packet.
+	LastKeepAliveUnixNano atomic.Int64
 }
 
 // The state associated with each virtual network.
-type virtualNetwork struct {
-	id                    uint
-	remoteAddr            *tcpip.FullAddress
-	rxCiphers             sync.Map
-	txCipher              atomic.Pointer[transmitCipher]
-	addrs                 []netip.Prefix
-	stats                 stats
-	lastKeepAliveUnixNano atomic.Int64
+type VirtualNetwork struct {
+	// VNI is the virtual network identifier.
+	VNI uint
+	// RemoteAddr is the address of the remote endpoint.
+	RemoteAddr *tcpip.FullAddress
+	// Addrs is the list of local IP prefixes.
+	Addrs []netip.Prefix
+	// Statistics associated with this virtual network.
+	Stats Statistics
+	// Internal state (not exposed)
+	rxCiphers sync.Map
+	txCipher  atomic.Pointer[transmitCipher]
 }
 
 type HandlerOption func(*handlerOptions) error
 
 type handlerOptions struct {
-	localAddrs        addrselect.AddressList
+	localAddrs        addrselect.List
 	virtMAC           tcpip.LinkAddress
 	srcMAC            tcpip.LinkAddress
 	sourcePortHashing bool
@@ -191,8 +186,8 @@ func WithKeepAliveInterval(interval time.Duration) HandlerOption {
 // validation, and translation between physical and virtual frame formats.
 type Handler struct {
 	opts             *handlerOptions
-	networkByID      sync.Map                          // Maps VNI to network
-	networkByAddress *triemap.TrieMap[*virtualNetwork] // Maps tunnel destination address to network
+	networkByID      sync.Map     // Maps VNI to network
+	networkByAddress *iptrie.Trie // Maps tunnel destination address to virtual network
 	proxyARP         *proxyarp.ProxyARP
 	ndProxy          *ndproxy.NDProxy
 	hdrPool          *sync.Pool
@@ -225,7 +220,7 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 
 	return &Handler{
 		opts:             &options,
-		networkByAddress: triemap.New[*virtualNetwork](),
+		networkByAddress: iptrie.NewTrie(),
 		proxyARP:         proxyarp.NewProxyARP(options.srcMAC),
 		ndProxy:          ndproxy.NewNDProxy(options.srcMAC),
 		hdrPool:          hdrPool,
@@ -238,15 +233,15 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, add
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
 
-	net := &virtualNetwork{
-		id:         vni,
-		remoteAddr: remoteAddr,
-		addrs:      addrs,
+	vnet := &VirtualNetwork{
+		VNI:        vni,
+		RemoteAddr: remoteAddr,
+		Addrs:      addrs,
 	}
 
-	h.networkByID.Store(vni, net)
+	h.networkByID.Store(vni, vnet)
 	for _, addr := range addrs {
-		h.networkByAddress.Insert(addr, net)
+		h.networkByAddress.Insert(addr, vnet)
 	}
 
 	return nil
@@ -258,10 +253,14 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 	if !exists {
 		return fmt.Errorf("network with VNI %d does not exist", vni)
 	}
+	vnet := value.(*VirtualNetwork)
+
 	h.networkByID.Delete(vni)
 
-	net := value.(*virtualNetwork)
-	h.networkByAddress.RemoveValue(net)
+	// Remove all address mappings for this vnet.
+	for _, addr := range vnet.Addrs {
+		h.networkByAddress.Remove(addr)
+	}
 
 	return nil
 }
@@ -272,13 +271,19 @@ func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) erro
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)
 	}
-	vnet := v.(*virtualNetwork)
+	vnet := v.(*VirtualNetwork)
+
 	// Remove all old mappings for this vnet, then insert the new ones.
-	h.networkByAddress.RemoveValue(vnet)
-	vnet.addrs = addrs
+	for _, addr := range vnet.Addrs {
+		h.networkByAddress.Remove(addr)
+	}
+
+	// Update the vnet and re-insert the new mappings.
+	vnet.Addrs = addrs
 	for _, a := range addrs {
 		h.networkByAddress.Insert(a, vnet)
 	}
+
 	return nil
 }
 
@@ -290,7 +295,7 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)
 	}
-	vnet := value.(*virtualNetwork)
+	vnet := value.(*VirtualNetwork)
 
 	// Set grace period (30s) on the previous RX key, if it exists
 	if txCipher := vnet.txCipher.Load(); txCipher != nil {
@@ -342,8 +347,8 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 		epoch: epoch,
 	})
 
-	vnet.stats.keyEpoch.Store(epoch)
-	vnet.stats.keyRotations.Add(1)
+	vnet.Stats.KeyEpoch.Store(epoch)
+	vnet.Stats.KeyRotations.Add(1)
 
 	return nil
 }
@@ -354,28 +359,15 @@ func (h *Handler) GetVirtualNetwork(vni uint) (*VirtualNetwork, bool) {
 	if !ok {
 		return nil, false
 	}
-	vn := value.(*virtualNetwork)
-	return &VirtualNetwork{
-		VNI:        vn.id,
-		RemoteAddr: *vn.remoteAddr,
-		Addrs:      append([]netip.Prefix(nil), vn.addrs...),
-		KeyEpoch:   vn.stats.keyEpoch.Load(),
-		Stats:      vn.stats.snapshot(vn.id),
-	}, true
+	return value.(*VirtualNetwork), true
 }
 
 // ListVirtualNetworks returns a snapshot of all configured virtual networks.
-func (h *Handler) ListVirtualNetworks() []VirtualNetwork {
-	var out []VirtualNetwork
+func (h *Handler) ListVirtualNetworks() []*VirtualNetwork {
+	var out []*VirtualNetwork
 	h.networkByID.Range(func(_, value any) bool {
-		vn := value.(*virtualNetwork)
-		out = append(out, VirtualNetwork{
-			VNI:        vn.id,
-			RemoteAddr: *vn.remoteAddr,
-			Addrs:      append([]netip.Prefix(nil), vn.addrs...),
-			KeyEpoch:   vn.stats.keyEpoch.Load(),
-			Stats:      vn.stats.snapshot(vn.id),
-		})
+		vnet := value.(*VirtualNetwork)
+		out = append(out, vnet)
 		return true
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].VNI < out[j].VNI })
@@ -408,7 +400,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		slog.Debug("Dropping frame with unknown VNI", slog.Uint64("vni", uint64(hdr.VNI)))
 		return 0
 	}
-	vnet := value.(*virtualNetwork)
+	vnet := value.(*VirtualNetwork)
 
 	var nonce []byte
 	var epoch uint32
@@ -432,14 +424,14 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	if !ok {
 		// Probably a delayed packet with an old key.
 		slog.Debug("No matching RX key for epoch", slog.Uint64("epoch", uint64(epoch)))
-		vnet.stats.rxDropsNoKey.Add(1)
+		vnet.Stats.RXDropsNoKey.Add(1)
 		return 0
 	}
 
 	rxCipher := rxCipherAny.(*receiveCipher)
 	if rxCipher.expiresAt.Before(time.Now()) {
 		slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
-		vnet.stats.rxDropsExpiredKey.Add(1)
+		vnet.Stats.RXDropsExpiredKey.Add(1)
 		// Delete expired key (to free key material from memory)
 		vnet.rxCiphers.Delete(epoch)
 		return 0
@@ -450,7 +442,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	if !rxCipher.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
 		// Delayed packets can cause some uneccesary noise here.
 		slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
-		vnet.stats.rxReplayDrops.Add(1)
+		vnet.Stats.RXReplayDrops.Add(1)
 		return 0
 	}
 
@@ -464,7 +456,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	ipPacket, err = rxCipher.Open(ipPacket, nonce, payload[hdrLen:], payload[:hdrLen])
 	if err != nil {
 		slog.Warn("Failed to decrypt payload", slog.Any("error", err))
-		vnet.stats.rxDecryptErrors.Add(1)
+		vnet.Stats.RXDecryptErrors.Add(1)
 		return 0
 	}
 
@@ -472,9 +464,9 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	if hdr.ProtocolType == 0 {
 		slog.Debug("Dropping out-of-band message")
 		// Treat as a (zero-byte) virtual packet receive for stats purposes.
-		vnet.stats.rxPackets.Add(1)
-		vnet.stats.rxBytes.Add(uint64(len(ipPacket)))
-		vnet.stats.lastRXUnixNano.Store(time.Now().UnixNano())
+		vnet.Stats.RXPackets.Add(1)
+		vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
+		vnet.Stats.LastRXUnixNano.Store(time.Now().UnixNano())
 		return 0
 	}
 
@@ -489,7 +481,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv4 address in frame")
-			vnet.stats.rxInvalidSrc.Add(1)
+			vnet.Stats.RXInvalidSrc.Add(1)
 			return 0
 		}
 	case header.IPv6Version:
@@ -498,18 +490,18 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv6 address in frame")
-			vnet.stats.rxInvalidSrc.Add(1)
+			vnet.Stats.RXInvalidSrc.Add(1)
 			return 0
 		}
 	default:
 		slog.Warn("Unsupported IP version", slog.Int("version", int(ipVersion)))
-		vnet.stats.rxInvalidSrc.Add(1)
+		vnet.Stats.RXInvalidSrc.Add(1)
 		return 0
 	}
 
 	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
 	var validSrcAddr bool
-	for _, prefix := range vnet.addrs {
+	for _, prefix := range vnet.Addrs {
 		if prefix.Contains(srcAddr) {
 			validSrcAddr = true
 			break
@@ -517,14 +509,14 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	}
 	if !validSrcAddr {
 		slog.Debug("Dropping frame with invalid tunnel source address", slog.String("srcAddr", srcAddr.String()))
-		vnet.stats.rxInvalidSrc.Add(1)
+		vnet.Stats.RXInvalidSrc.Add(1)
 		return 0
 	}
 
 	// Success: count bytes/packets and timestamp
-	vnet.stats.rxPackets.Add(1)
-	vnet.stats.rxBytes.Add(uint64(len(ipPacket)))
-	vnet.stats.lastRXUnixNano.Store(time.Now().UnixNano())
+	vnet.Stats.RXPackets.Add(1)
+	vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
+	vnet.Stats.LastRXUnixNano.Store(time.Now().UnixNano())
 
 	if h.opts.layer3 {
 		return len(ipPacket)
@@ -560,10 +552,9 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 			frameLen, err := h.proxyARP.Reply(virtFrame, phyFrame)
 			if err != nil {
 				slog.Warn("Failed to handle ARP request", slog.Any("error", err))
-				return 0, false
+			} else {
+				return frameLen, true
 			}
-
-			return frameLen, true
 		}
 
 		// Handle IPv6 Neighbor Solicitation with an immediate local NA reply.
@@ -578,10 +569,9 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 						frameLen, err := h.ndProxy.Reply(virtFrame, phyFrame)
 						if err != nil {
 							slog.Warn("Failed to handle ND request", slog.Any("error", err))
-							return 0, false
+						} else {
+							return frameLen, true
 						}
-
-						return frameLen, true
 					}
 				}
 			}
@@ -623,11 +613,12 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 
 	// Find the virtual network by the destination address.
-	vnet, ok := h.networkByAddress.Get(dstAddr)
-	if !ok {
+	value := h.networkByAddress.Find(dstAddr)
+	if value == nil {
 		slog.Debug("Dropping frame with unknown tunnel destination address", slog.String("dstAddr", dstAddr.String()))
 		return 0, false
 	}
+	vnet := value.(*VirtualNetwork)
 
 	hdr := h.hdrPool.Get().(*geneve.Header)
 	defer func() {
@@ -635,7 +626,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}()
 
 	*hdr = geneve.Header{
-		VNI:        uint32(vnet.id),
+		VNI:        uint32(vnet.VNI),
 		NumOptions: 2,
 		Critical:   true,
 		Options: [geneve.MaxOptions]geneve.Option{
@@ -655,7 +646,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
 		slog.Warn("TX cipher not available")
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
 
@@ -663,7 +654,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
 		slog.Warn("TX counter overflow, you must rotate the key")
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
 
@@ -677,12 +668,12 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		hdr.ProtocolType = uint16(header.IPv6ProtocolNumber)
 	default:
 		slog.Warn("Unsupported IP version", slog.Int("version", int(ipVersion)))
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
 
 	var payload []byte
-	if vnet.remoteAddr.Addr.Len() == net.IPv4len {
+	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
 		payload = phyFrame[udp.PayloadOffsetIPv4:]
 	} else {
 		payload = phyFrame[udp.PayloadOffsetIPv6:]
@@ -691,16 +682,16 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	hdrLen, err := hdr.MarshalBinary(payload)
 	if err != nil {
 		slog.Warn("Failed to marshal GENEVE header", slog.Any("error", err))
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
 
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
-	best := h.opts.localAddrs.Pick(vnet.remoteAddr)
+	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
 	if best == nil {
 		slog.Warn("No local underlay addresses configured")
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
 
@@ -709,25 +700,25 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		localAddr.Port = flowhash.Hash(ipPacket)
 	}
 
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, hdrLen+encryptedFrameLen, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, false)
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
 
 	// Success: count bytes/packets and timestamp
-	vnet.stats.txPackets.Add(1)
-	vnet.stats.txBytes.Add(uint64(len(ipPacket)))
-	vnet.stats.lastTXUnixNano.Store(time.Now().UnixNano())
+	vnet.Stats.TXPackets.Add(1)
+	vnet.Stats.TXBytes.Add(uint64(len(ipPacket)))
+	vnet.Stats.LastTXUnixNano.Store(time.Now().UnixNano())
 
 	return frameLen, false
 }
 
-// ScheduledToPhy is called periodically to allow the handler to send
+// ToPhy is called periodically to allow the handler to send
 // scheduled frames to the physical interface, e.g. keep-alive packets.
 // Returns the length of the resulting physical frame.
-func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
+func (h *Handler) ToPhy(phyFrame []byte) int {
 	if h.opts.keepAliveInterval == nil || *h.opts.keepAliveInterval <= 0 {
 		return 0
 	}
@@ -735,10 +726,10 @@ func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
 	now := time.Now()
 
 	// Pick a virtual network that's due.
-	var vnet *virtualNetwork
+	var vnet *VirtualNetwork
 	h.networkByID.Range(func(_, v any) bool {
-		vn := v.(*virtualNetwork)
-		last := time.Unix(0, vn.lastKeepAliveUnixNano.Load())
+		vn := v.(*VirtualNetwork)
+		last := time.Unix(0, vn.Stats.LastKeepAliveUnixNano.Load())
 		if last.IsZero() || now.Sub(last) >= interval {
 			vnet = vn
 			return false
@@ -752,12 +743,12 @@ func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
 		slog.Warn("keep-alive: TX cipher not available")
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
 	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
 		slog.Warn("keep-alive: TX counter overflow, rotate the key")
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
 
@@ -765,7 +756,7 @@ func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
 	defer h.hdrPool.Put(hdr)
 
 	*hdr = geneve.Header{
-		VNI:        uint32(vnet.id),
+		VNI:        uint32(vnet.VNI),
 		NumOptions: 2,
 		Critical:   true,
 		Options: [geneve.MaxOptions]geneve.Option{
@@ -790,7 +781,7 @@ func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
 
 	// Place GENEVE payload inside outer UDP frame.
 	var payload []byte
-	if vnet.remoteAddr.Addr.Len() == net.IPv4len {
+	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
 		payload = phyFrame[udp.PayloadOffsetIPv4:]
 	} else {
 		payload = phyFrame[udp.PayloadOffsetIPv6:]
@@ -800,7 +791,7 @@ func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
 	hdrLen, err := hdr.MarshalBinary(payload)
 	if err != nil {
 		slog.Warn("keep-alive: marshal GENEVE header failed", slog.Any("error", err))
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
 
@@ -810,27 +801,27 @@ func (h *Handler) ScheduledToPhy(phyFrame []byte) int {
 	encLen := len(ct) // AEAD tag length
 
 	// Underlay source selection.
-	best := h.opts.localAddrs.Pick(vnet.remoteAddr)
+	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
 	if best == nil {
 		slog.Warn("keep-alive: no local underlay addresses configured")
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
 	localAddr := *best // keep configured source port for stability
 
 	// Finish outer UDP/IP/Ethernet
 	totalGeneveLen := hdrLen + encLen
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.remoteAddr, totalGeneveLen, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, totalGeneveLen, false)
 	if err != nil {
 		slog.Warn("keep-alive: UDP encode failed", slog.Any("error", err))
-		vnet.stats.txErrors.Add(1)
+		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
 
 	// Stats: treat as a (zero-byte) virtual packet send.
-	vnet.stats.txPackets.Add(1)
-	vnet.stats.lastTXUnixNano.Store(now.UnixNano())
-	vnet.lastKeepAliveUnixNano.Store(now.UnixNano())
+	vnet.Stats.TXPackets.Add(1)
+	vnet.Stats.LastTXUnixNano.Store(now.UnixNano())
+	vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 
 	return frameLen
 }
