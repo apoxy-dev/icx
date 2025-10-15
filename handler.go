@@ -81,8 +81,8 @@ type Statistics struct {
 
 // The state associated with each virtual network.
 type VirtualNetwork struct {
-	// VNI is the virtual network identifier.
-	VNI uint
+	// ID is the virtual network identifier.
+	ID uint
 	// RemoteAddr is the address of the remote endpoint.
 	RemoteAddr *tcpip.FullAddress
 	// Addrs is the list of local IP prefixes.
@@ -94,6 +94,16 @@ type VirtualNetwork struct {
 	txCipher  atomic.Pointer[transmitCipher]
 }
 
+// Clock provides time to the handler. Tests can inject a fake clock.
+type Clock interface {
+	Now() time.Time
+}
+
+// realClock uses the system time.
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
+
 type HandlerOption func(*handlerOptions) error
 
 type handlerOptions struct {
@@ -103,13 +113,13 @@ type handlerOptions struct {
 	sourcePortHashing bool
 	layer3            bool
 	keepAliveInterval *time.Duration
+	clock             Clock
 }
 
 func defaultHandlerOptions() handlerOptions {
 	return handlerOptions{
-		srcMAC:            tcpip.GetRandMacAddr(),
-		sourcePortHashing: false,
-		layer3:            false,
+		srcMAC: tcpip.GetRandMacAddr(),
+		clock:  realClock{},
 	}
 }
 
@@ -181,6 +191,17 @@ func WithKeepAliveInterval(interval time.Duration) HandlerOption {
 	}
 }
 
+// WithClock overrides the time source used by the handler (useful for tests).
+func WithClock(c Clock) HandlerOption {
+	return func(opts *handlerOptions) error {
+		if c == nil {
+			c = realClock{}
+		}
+		opts.clock = c
+		return nil
+	}
+}
+
 // Handler processes encapsulated GENEVE traffic for one or more virtual
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
@@ -191,6 +212,7 @@ type Handler struct {
 	proxyARP         *proxyarp.ProxyARP
 	ndProxy          *ndproxy.NDProxy
 	hdrPool          *sync.Pool
+	clock            Clock
 }
 
 // NewHandler returns a new Handler configured with the given options.
@@ -224,6 +246,7 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		proxyARP:         proxyarp.NewProxyARP(options.srcMAC),
 		ndProxy:          ndproxy.NewNDProxy(options.srcMAC),
 		hdrPool:          hdrPool,
+		clock:            options.clock,
 	}, nil
 }
 
@@ -234,7 +257,7 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, add
 	}
 
 	vnet := &VirtualNetwork{
-		VNI:        vni,
+		ID:         vni,
 		RemoteAddr: remoteAddr,
 		Addrs:      addrs,
 	}
@@ -303,14 +326,14 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 		if prevEpoch != epoch {
 			if prevCipherAny, ok := vnet.rxCiphers.Load(prevEpoch); ok {
 				if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
-					prevCipher.expiresAt = time.Now().Add(keyGracePeriod)
+					prevCipher.expiresAt = h.clock.Now().Add(keyGracePeriod)
 				}
 			}
 		}
 	}
 
 	// Delete expired keys (to free key material from memory)
-	now := time.Now()
+	now := h.clock.Now()
 	vnet.rxCiphers.Range(func(key, value any) bool {
 		cipher := value.(*receiveCipher)
 		if cipher.expiresAt.Before(now) {
@@ -370,7 +393,7 @@ func (h *Handler) ListVirtualNetworks() []*VirtualNetwork {
 		out = append(out, vnet)
 		return true
 	})
-	sort.Slice(out, func(i, j int) bool { return out[i].VNI < out[j].VNI })
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
@@ -429,7 +452,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	}
 
 	rxCipher := rxCipherAny.(*receiveCipher)
-	if rxCipher.expiresAt.Before(time.Now()) {
+	if rxCipher.expiresAt.Before(h.clock.Now()) {
 		slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
 		vnet.Stats.RXDropsExpiredKey.Add(1)
 		// Delete expired key (to free key material from memory)
@@ -466,7 +489,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		// Treat as a (zero-byte) virtual packet receive for stats purposes.
 		vnet.Stats.RXPackets.Add(1)
 		vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
-		vnet.Stats.LastRXUnixNano.Store(time.Now().UnixNano())
+		vnet.Stats.LastRXUnixNano.Store(h.clock.Now().UnixNano())
 		return 0
 	}
 
@@ -516,7 +539,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	// Success: count bytes/packets and timestamp
 	vnet.Stats.RXPackets.Add(1)
 	vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
-	vnet.Stats.LastRXUnixNano.Store(time.Now().UnixNano())
+	vnet.Stats.LastRXUnixNano.Store(h.clock.Now().UnixNano())
 
 	if h.opts.layer3 {
 		return len(ipPacket)
@@ -626,7 +649,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}()
 
 	*hdr = geneve.Header{
-		VNI:        uint32(vnet.VNI),
+		VNI:        uint32(vnet.ID),
 		NumOptions: 2,
 		Critical:   true,
 		Options: [geneve.MaxOptions]geneve.Option{
@@ -710,7 +733,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	// Success: count bytes/packets and timestamp
 	vnet.Stats.TXPackets.Add(1)
 	vnet.Stats.TXBytes.Add(uint64(len(ipPacket)))
-	vnet.Stats.LastTXUnixNano.Store(time.Now().UnixNano())
+	vnet.Stats.LastTXUnixNano.Store(h.clock.Now().UnixNano())
 
 	return frameLen, false
 }
@@ -723,7 +746,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 		return 0
 	}
 	interval := *h.opts.keepAliveInterval
-	now := time.Now()
+	now := h.clock.Now()
 
 	// Pick a virtual network that's due.
 	var vnet *VirtualNetwork
@@ -756,7 +779,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	defer h.hdrPool.Put(hdr)
 
 	*hdr = geneve.Header{
-		VNI:        uint32(vnet.VNI),
+		VNI:        uint32(vnet.ID),
 		NumOptions: 2,
 		Critical:   true,
 		Options: [geneve.MaxOptions]geneve.Option{
