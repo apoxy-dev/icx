@@ -17,3 +17,5 @@ sudo ln -sf /usr/include/$(uname -m)-linux-gnu/asm /usr/include/asm
 2 x [c7gn.2xlarge](https://aws.amazon.com/ec2/instance-types/c7g/) instances in the same us-west-2 availability zone with a cluster placement strategy.
 
 <img src="./assets/throughput.png" alt="ICX Throughput" width="800"/>
+
+<img src="./assets/latency.png" alt="ICX Round Trip Latency" width="800"/>
