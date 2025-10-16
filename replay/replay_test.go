@@ -9,11 +9,6 @@ import (
 	"testing"
 )
 
-/* Ported from the linux kernel implementation
- *
- *
- */
-
 func TestReplay(t *testing.T) {
 	var filter Filter
 

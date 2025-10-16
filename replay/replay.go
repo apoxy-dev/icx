@@ -6,9 +6,7 @@
 // Package replay implements an efficient anti-replay algorithm as specified in RFC 6479.
 package replay
 
-import (
-	"sync/atomic"
-)
+import "sync"
 
 const (
 	// RekeyAfterMessages is the maximum number of messages that can be sent before rekeying.
@@ -17,7 +15,7 @@ const (
 	RejectAfterMessages = (1 << 64) - (1 << 13) - 1
 )
 
-type block = atomic.Uint64
+type block uint64
 
 const (
 	blockBitLog = 6                // 1<<6 == 64 bits
@@ -28,52 +26,57 @@ const (
 	bitMask     = blockBits - 1
 )
 
+// Filter rejects replayed messages by checking if message counter value is
+// within a sliding window of previously received messages.
+// The zero value for Filter is an empty, ready-to-use, thread-safe filter.
 type Filter struct {
-	last atomic.Uint64
+	mu   sync.Mutex
+	last uint64
 	ring [ringBlocks]block
 }
 
+// Reset resets the filter to empty state.
 func (f *Filter) Reset() {
-	f.last.Store(0)
-	f.ring[0].Store(0)
+	f.mu.Lock()
+	f.last = 0
+	f.ring[0] = 0
+	// Optionally clear the rest to be thorough:
+	for i := 1; i < ringBlocks; i++ {
+		f.ring[i] = 0
+	}
+	f.mu.Unlock()
 }
 
 // ValidateCounter checks if the counter should be accepted.
+// Overlimit counters (>= limit) are always rejected.
 func (f *Filter) ValidateCounter(counter, limit uint64) bool {
 	if counter >= limit {
 		return false
 	}
 
-	indexBlock := counter >> blockBitLog
-	last := f.last.Load()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-	if counter > last {
-		current := last >> blockBitLog
+	indexBlock := counter >> blockBitLog
+	if counter > f.last { // move window forward
+		current := f.last >> blockBitLog
 		diff := indexBlock - current
 		if diff > ringBlocks {
-			diff = ringBlocks
+			diff = ringBlocks // cap diff to clear the whole ring
 		}
 		for i := current + 1; i <= current+diff; i++ {
-			f.ring[i&blockMask].Store(0)
+			f.ring[i&blockMask] = 0
 		}
-		f.last.Store(counter)
-	} else if last-counter > windowSize {
+		f.last = counter
+	} else if f.last-counter > windowSize { // behind current window
 		return false
 	}
 
-	indexBlock &= blockMask
+	// check and set bit
+	idx := indexBlock & blockMask
 	indexBit := counter & bitMask
-
-	ptr := &f.ring[indexBlock]
-	mask := uint64(1) << indexBit
-
-	for {
-		old := ptr.Load()
-		if old&mask != 0 {
-			return false
-		}
-		if ptr.CompareAndSwap(old, old|mask) {
-			return true
-		}
-	}
+	old := f.ring[idx]
+	new := old | 1<<indexBit
+	f.ring[idx] = new
+	return old != new
 }
