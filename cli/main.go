@@ -204,7 +204,7 @@ func run(c *cli.Context) error {
 	}
 
 	port := c.Int("port")
-	ingressFilter, err := filter.Bind(&net.UDPAddr{
+	ingressFilter, err := filter.Geneve(&net.UDPAddr{
 		IP:   net.IPv4zero,
 		Port: port,
 	},

@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	// The size of the GENEVE header with icx options.
+	// The size of the Geneve header with icx options.
 	HeaderSize = 32
 	// How long to continue accepting packets with an old key after a new key is set.
 	keyGracePeriod = 30 * time.Second
@@ -202,7 +202,7 @@ func WithClock(c Clock) HandlerOption {
 	}
 }
 
-// Handler processes encapsulated GENEVE traffic for one or more virtual
+// Handler processes encapsulated Geneve traffic for one or more virtual
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
 type Handler struct {
@@ -424,7 +424,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 	hdrLen, err := hdr.UnmarshalBinary(payload)
 	if err != nil {
-		slog.Warn("Failed to unmarshal GENEVE header", slog.Any("error", err))
+		slog.Warn("Failed to unmarshal Geneve header", slog.Any("error", err))
 		return 0
 	}
 
@@ -450,7 +450,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		}
 	}
 	if len(nonce) == 0 {
-		slog.Warn("Expected TX counter in GENEVE header options")
+		slog.Warn("Expected TX counter in Geneve header options")
 		return 0
 	}
 
@@ -717,7 +717,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	hdrLen, err := hdr.MarshalBinary(payload)
 	if err != nil {
-		slog.Warn("Failed to marshal GENEVE header", slog.Any("error", err))
+		slog.Warn("Failed to marshal Geneve header", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
 		return 0, false
 	}
@@ -815,7 +815,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	nonce := hdr.Options[1].Value[:12]
 	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
-	// Place GENEVE payload inside outer UDP frame.
+	// Place Geneve payload inside outer UDP frame.
 	var payload []byte
 	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
 		payload = phyFrame[udp.PayloadOffsetIPv4:]
@@ -823,10 +823,10 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 		payload = phyFrame[udp.PayloadOffsetIPv6:]
 	}
 
-	// Marshal GENEVE header.
+	// Marshal Geneve header.
 	hdrLen, err := hdr.MarshalBinary(payload)
 	if err != nil {
-		slog.Warn("keep-alive: marshal GENEVE header failed", slog.Any("error", err))
+		slog.Warn("keep-alive: marshal Geneve header failed", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}

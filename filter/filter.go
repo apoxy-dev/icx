@@ -13,7 +13,7 @@ import (
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go all ebpf/all.c
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go bind ebpf/bind.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go geneve ebpf/geneve.c
 
 // All creates an eBPF program that intercepts all incoming packets
 // and redirects them to the XDP socket.
@@ -35,10 +35,10 @@ func All() (*xdp.Program, error) {
 	}, nil
 }
 
-// Bind creates an eBPF program that binds to the specified addresses and
-// redirects all GENEVE packets to the XDP socket.
-func Bind(addrs ...net.Addr) (*xdp.Program, error) {
-	spec, err := loadBind()
+// Geneve creates an eBPF program that binds to the specified addresses and
+// redirects all Geneve packets to the XDP socket.
+func Geneve(addrs ...net.Addr) (*xdp.Program, error) {
+	spec, err := loadGeneve()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF program: %w", err)
 	}
@@ -51,7 +51,7 @@ func Bind(addrs ...net.Addr) (*xdp.Program, error) {
 	bindMap := col.Maps["bind_map"]
 
 	for _, addr := range addrs {
-		var bk bindBindKey
+		var bk geneveBindKey
 		switch addr := addr.(type) {
 		case *net.UDPAddr:
 			if addr.IP.To4() != nil {

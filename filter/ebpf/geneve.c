@@ -35,7 +35,7 @@ parse_genevehdr(struct hdr_cursor *nh, void *data_end, struct genevehdr **ghdr)
 		return -1;
 
 	*ghdr = gh;
-	nh->pos = gh + 1; // Advance cursor past GENEVE header
+	nh->pos = gh + 1; // Advance cursor past Geneve header
 	return 0;
 }
 

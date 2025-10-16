@@ -81,7 +81,7 @@ func WithPcapWriter(writer *pcapgo.Writer) TunnelOption {
 }
 
 // WithPhyFilter sets a custom XDP filter program to use on the physical interface.
-// If nil, a default filter is created that accepts all GENEVE packets addressed
+// If nil, a default filter is created that accepts all Geneve packets addressed
 // to the default port (6081).
 func WithPhyFilter(filter *xdp.Program) TunnelOption {
 	return func(o *tunnelOptions) error {
@@ -153,11 +153,11 @@ func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
 	}
 
 	// If no filter was provided, create a default one that filters on the physical interface and
-	// accepts all GENEVE packets addressed to the default port.
+	// accepts all Geneve packets addressed to the default port.
 	if options.phyFilter == nil {
 		const defaultPort = 6081
 
-		options.phyFilter, err = filter.Bind(
+		options.phyFilter, err = filter.Geneve(
 			&net.UDPAddr{
 				IP:   net.IPv4zero,
 				Port: defaultPort,
