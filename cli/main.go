@@ -15,6 +15,8 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/gopacket/layers"
@@ -29,6 +31,8 @@ import (
 	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/tunnel"
 	"github.com/apoxy-dev/icx/veth"
+
+	ini "gopkg.in/ini.v1"
 )
 
 func main() {
@@ -51,16 +55,11 @@ func main() {
 				Name:    "vni",
 				Aliases: []string{"v"},
 				Usage:   "Virtual Network Identifier (VNI) for the tunnel (24-bit value)",
-				Value:   0x1,
+				Value:   1,
 			},
 			&cli.StringFlag{
-				Name:     "rx-key",
-				Usage:    "Ephemeral AES key for receiving (16-byte hex, DO NOT REUSE)",
-				Required: true,
-			},
-			&cli.StringFlag{
-				Name:     "tx-key",
-				Usage:    "Ephemeral AES key for transmitting (16-byte hex, DO NOT REUSE)",
+				Name:     "key-file",
+				Usage:    "Path to INI file containing keys (rx, tx, optional expires)",
 				Required: true,
 			},
 			&cli.IntFlag{
@@ -125,9 +124,7 @@ func run(c *cli.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to create CPU profile file: %w", err)
 		}
-		defer func() {
-			_ = f.Close()
-		}()
+		defer func() { _ = f.Close() }()
 
 		if err := pprof.StartCPUProfile(f); err != nil {
 			return fmt.Errorf("failed to start CPU profiling: %w", err)
@@ -154,9 +151,7 @@ func run(c *cli.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to create pcap file: %w", err)
 		}
-		defer func() {
-			_ = f.Close()
-		}()
+		defer func() { _ = f.Close() }()
 
 		pcapWriter = pcapgo.NewWriter(f)
 		if err := pcapWriter.WriteFileHeader(uint32(math.MaxUint16), layers.LinkTypeEthernet); err != nil {
@@ -240,6 +235,7 @@ func run(c *cli.Context) error {
 	opts := []icx.HandlerOption{
 		icx.WithLocalAddr(localAddr),
 		icx.WithVirtMAC(virtMAC),
+		icx.WithKeepAliveInterval(25 * time.Second),
 	}
 	if c.Bool("source-port-hash") {
 		opts = append(opts, icx.WithSourcePortHashing())
@@ -259,23 +255,67 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 
-	var epoch uint32 = 1
-	var rxKey, txKey [16]byte
-	// Hex decode the keys provided by the user
-	if len(c.String("rx-key")) != 32 || len(c.String("tx-key")) != 32 {
-		return errors.New("keys must be 32 hexadecimal characters (16 bytes)")
+	var (
+		epoch        uint32 = 1 // initial epoch
+		rxKey, txKey [16]byte
+		expiresAt    time.Time
+	)
+
+	keyFile := c.String("key-file")
+	rxKey, txKey, expiresAt, err = loadKeysFromINI(keyFile)
+	if err != nil {
+		return err
 	}
-	if _, err := hex.Decode(rxKey[:], []byte(c.String("rx-key"))); err != nil {
-		return fmt.Errorf("failed to decode rx-key: %w", err)
-	}
-	if _, err := hex.Decode(txKey[:], []byte(c.String("tx-key"))); err != nil {
-		return fmt.Errorf("failed to decode tx-key: %w", err)
-	}
-	expiresAt := time.Now().Add(24 * time.Hour)
 
 	if err := h.UpdateVirtualNetworkKeys(c.Uint("vni"), epoch, rxKey, txKey, expiresAt); err != nil {
 		return fmt.Errorf("failed to update virtual network key: %w", err)
 	}
+
+	var keyMu sync.Mutex
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGHUP)
+
+	// SIGHUP reload handler.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+				newRX, newTX, newExpires, loadErr := loadKeysFromINI(keyFile)
+				if loadErr != nil {
+					slog.Error("Key reload failed", slog.Any("error", loadErr))
+					continue
+				}
+
+				keyMu.Lock()
+				// Refuse reload if keys are identical to current ones.
+				if rxKey == newRX && txKey == newTX {
+					slog.Warn("Refusing key reload: rx/tx unchanged; keeping current epoch",
+						slog.Uint64("epoch", uint64(epoch)),
+					)
+					keyMu.Unlock()
+					continue
+				}
+
+				// Keys changed: commit and bump epoch.
+				rxKey = newRX
+				txKey = newTX
+				expiresAt = newExpires
+				epoch++
+
+				if err := h.UpdateVirtualNetworkKeys(c.Uint("vni"), epoch, rxKey, txKey, expiresAt); err != nil {
+					slog.Error("Failed to apply reloaded keys", slog.Any("error", err))
+				} else {
+					slog.Info("Reloaded keys",
+						slog.Uint64("epoch", uint64(epoch)),
+						slog.Time("expiresAt", expiresAt),
+					)
+				}
+				keyMu.Unlock()
+			}
+		}
+	}()
 
 	tun, err := tunnel.NewTunnel(
 		h,
@@ -295,6 +335,69 @@ func run(c *cli.Context) error {
 	return nil
 }
 
+// loadKeysFromINI loads rx/tx (hex, 16-byte each) and optional expires from an INI file.
+//
+// Required layout:
+//
+//	[keys]
+//	rx=0123... (32 hex chars -> 16 bytes)
+//	tx=abcd... (32 hex chars -> 16 bytes)
+//	expires=24h            // OR RFC3339 like 2025-10-16T12:34:56Z
+//
+// "expires" may be either a Go duration (e.g., "24h", "90m") or RFC3339 timestamp.
+// If omitted, a default of 24h from now is applied.
+func loadKeysFromINI(path string) (rxKey, txKey [16]byte, expiresAt time.Time, err error) {
+	cfg, err := ini.Load(path)
+	if err != nil {
+		return rxKey, txKey, time.Time{}, fmt.Errorf("open INI: %w", err)
+	}
+
+	sec, err := cfg.GetSection("keys")
+	if err != nil {
+		return rxKey, txKey, time.Time{}, errors.New("INI must contain a [keys] section")
+	}
+
+	get := func(k string) string { return strings.TrimSpace(sec.Key(k).String()) }
+
+	rxHex := get("rx")
+	txHex := get("tx")
+	expStr := get("expires")
+
+	if rxHex == "" || txHex == "" {
+		return rxKey, txKey, time.Time{}, errors.New("INI [keys] missing required keys: rx and tx")
+	}
+	if len(rxHex) != 32 || len(txHex) != 32 {
+		return rxKey, txKey, time.Time{}, errors.New("INI [keys] rx/tx must be 32 hex characters (16 bytes)")
+	}
+
+	rxBytes, err := hex.DecodeString(rxHex)
+	if err != nil {
+		return rxKey, txKey, time.Time{}, fmt.Errorf("decode INI [keys].rx: %w", err)
+	}
+	txBytes, err := hex.DecodeString(txHex)
+	if err != nil {
+		return rxKey, txKey, time.Time{}, fmt.Errorf("decode INI [keys].tx: %w", err)
+	}
+	copy(rxKey[:], rxBytes)
+	copy(txKey[:], txBytes)
+
+	// Expiry handling: optional; default to 24h if absent.
+	if expStr != "" {
+		// Prefer duration, fall back to RFC3339.
+		if d, derr := time.ParseDuration(expStr); derr == nil {
+			expiresAt = time.Now().Add(d)
+		} else if t, terr := time.Parse(time.RFC3339, expStr); terr == nil {
+			expiresAt = t
+		} else {
+			return rxKey, txKey, time.Time{}, fmt.Errorf("expires must be duration (e.g. 24h) or RFC3339 timestamp: %q", expStr)
+		}
+	} else {
+		expiresAt = time.Now().Add(24 * time.Hour)
+	}
+
+	return rxKey, txKey, expiresAt, nil
+}
+
 func selectSourceAddr(link netlink.Link, dstAddr *tcpip.FullAddress) (*tcpip.FullAddress, error) {
 	var network string
 	ip := net.IP(dstAddr.Addr.AsSlice())
@@ -312,9 +415,7 @@ func selectSourceAddr(link netlink.Link, dstAddr *tcpip.FullAddress) (*tcpip.Ful
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine best source address for %s: %w", ip.String(), err)
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
+	defer func() { _ = conn.Close() }()
 
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 

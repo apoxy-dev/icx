@@ -9,6 +9,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/urfave/cli/v2 v2.27.7
 	github.com/vishvananda/netlink v1.3.1
+	gopkg.in/ini.v1 v1.67.0
 	gvisor.dev/gvisor v0.0.0-20250606001031-fa4c4dd86b43
 )
 
