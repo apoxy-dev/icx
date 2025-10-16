@@ -4,6 +4,15 @@
 
 ICX is a high-performance, kernel-bypass VPN solution for cloud environments.
 
+## Features
+
+* UDP/Geneve based.
+* Layer 3 tunneling (IPv4 and IPv6).
+* Kernel-bypass using [AF_XDP](https://docs.kernel.org/networking/af_xdp.html).
+* AES-GCM-128 crypto with [replay protection](https://datatracker.ietf.org/doc/html/rfc6479).
+* Cryptokey routing (a la. WireGuard's allowed_ips).
+* Control/data-plane separation (like IPsec, allows for pluggable auth).
+
 ## Notes
 
 On Debian you might need to create this symlink to fix bpf compilation issues:

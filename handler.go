@@ -206,13 +206,14 @@ func WithClock(c Clock) HandlerOption {
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
 type Handler struct {
-	opts             *handlerOptions
-	networkByID      sync.Map     // Maps VNI to network
-	networkByAddress *iptrie.Trie // Maps tunnel destination address to virtual network
-	proxyARP         *proxyarp.ProxyARP
-	ndProxy          *ndproxy.NDProxy
-	hdrPool          *sync.Pool
-	clock            Clock
+	opts               *handlerOptions
+	networkByID        sync.Map     // Maps VNI to network
+	networkByAddressMu sync.RWMutex // Protects networkByAddress
+	networkByAddress   *iptrie.Trie // Maps tunnel destination address to virtual network
+	proxyARP           *proxyarp.ProxyARP
+	ndProxy            *ndproxy.NDProxy
+	hdrPool            *sync.Pool
+	clock              Clock
 }
 
 // NewHandler returns a new Handler configured with the given options.
@@ -263,9 +264,11 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, add
 	}
 
 	h.networkByID.Store(vni, vnet)
+	h.networkByAddressMu.Lock()
 	for _, addr := range addrs {
 		h.networkByAddress.Insert(addr, vnet)
 	}
+	h.networkByAddressMu.Unlock()
 
 	return nil
 }
@@ -281,9 +284,11 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 	h.networkByID.Delete(vni)
 
 	// Remove all address mappings for this vnet.
+	h.networkByAddressMu.Lock()
 	for _, addr := range vnet.Addrs {
 		h.networkByAddress.Remove(addr)
 	}
+	h.networkByAddressMu.Unlock()
 
 	return nil
 }
@@ -297,6 +302,7 @@ func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) erro
 	vnet := v.(*VirtualNetwork)
 
 	// Remove all old mappings for this vnet, then insert the new ones.
+	h.networkByAddressMu.Lock()
 	for _, addr := range vnet.Addrs {
 		h.networkByAddress.Remove(addr)
 	}
@@ -306,13 +312,14 @@ func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) erro
 	for _, a := range addrs {
 		h.networkByAddress.Insert(a, vnet)
 	}
+	h.networkByAddressMu.Unlock()
 
 	return nil
 }
 
 // UpdateVirtualNetworkKeys sets/rotates the encryption keys for a virtual network.
 // This must be called atleast once every 24 hours or after `replay.RekeyAfterMessages`
-// messages.
+// messages. The epoch must be a monotonically increasing value.
 func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
@@ -326,7 +333,11 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 		if prevEpoch != epoch {
 			if prevCipherAny, ok := vnet.rxCiphers.Load(prevEpoch); ok {
 				if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
-					prevCipher.expiresAt = h.clock.Now().Add(keyGracePeriod)
+					graceExpiry := h.clock.Now().Add(keyGracePeriod)
+					// Clamp the expiry to now+gracePeriod now that we have rotated.
+					if prevCipher.expiresAt.After(graceExpiry) {
+						prevCipher.expiresAt = graceExpiry
+					}
 				}
 			}
 		}
@@ -570,8 +581,8 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		eth := header.Ethernet(virtFrame)
 		ethType := eth.Type()
 
+		// Handle ARP requests with an immediate local reply.
 		if ethType == header.ARPProtocolNumber {
-			// Immediately reply to the ARP request with a loopback response.
 			frameLen, err := h.proxyARP.Reply(virtFrame, phyFrame)
 			if err != nil {
 				slog.Warn("Failed to handle ARP request", slog.Any("error", err))
@@ -636,7 +647,9 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 
 	// Find the virtual network by the destination address.
+	h.networkByAddressMu.RLock()
 	value := h.networkByAddress.Find(dstAddr)
+	h.networkByAddressMu.RUnlock()
 	if value == nil {
 		slog.Debug("Dropping frame with unknown tunnel destination address", slog.String("dstAddr", dstAddr.String()))
 		return 0, false
