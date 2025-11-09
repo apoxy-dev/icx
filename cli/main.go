@@ -246,12 +246,12 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to create handler: %w", err)
 	}
 
-	allPrefixes := []netip.Prefix{
-		netip.MustParsePrefix("0.0.0.0/0"),
-		netip.MustParsePrefix("::/0"),
+	allRoutes := []icx.AllowedRoute{
+		{Src: netip.MustParsePrefix("0.0.0.0/0"), Dst: netip.MustParsePrefix("0.0.0.0/0")},
+		{Src: netip.MustParsePrefix("::/0"), Dst: netip.MustParsePrefix("::/0")},
 	}
 
-	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, allPrefixes); err != nil {
+	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, allRoutes); err != nil {
 		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 
