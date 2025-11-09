@@ -312,8 +312,8 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 	return nil
 }
 
-// UpdateVirtualNetworkAddrs updates the allowed address prefixes for a virtual network.
-func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) error {
+// UpdateVirtualNetworkRoutes updates the allowed routes for a virtual network.
+func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []AllowedRoute) error {
 	v, ok := h.networkByID.Load(vni)
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)
@@ -332,16 +332,19 @@ func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) erro
 	}
 
 	// Insert all new allowed routes for this vnet
-	for _, addr := range addrs {
-		value := h.networksByAddress.Find(addr.Addr())
+	for _, route := range allowedRoutes {
+		value := h.networksByAddress.Find(route.Dst.Addr())
 		if value == nil {
 			value = iptrie.NewTrie()
-			h.networksByAddress.Insert(addr, value)
+			h.networksByAddress.Insert(route.Dst, value)
 		}
 		srcTrie := value.(*iptrie.Trie)
-		srcTrie.Insert(addr, vnet)
+		srcTrie.Insert(route.Src, vnet)
 	}
 	h.networksByAddressMu.Unlock()
+
+	// Update vnet state
+	vnet.AllowedRoutes = allowedRoutes
 
 	return nil
 }
@@ -562,7 +565,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
 	var validSrcAddr bool
 	for _, route := range vnet.AllowedRoutes {
-		if route.Src.Contains(srcAddr) {
+		if route.Dst.Contains(srcAddr) {
 			validSrcAddr = true
 			break
 		}

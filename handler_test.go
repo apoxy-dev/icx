@@ -166,7 +166,7 @@ func TestHandler_Layer3_IPv6(t *testing.T) {
 	require.Equal(t, ip6, out[:m])
 }
 
-func TestUpdateVirtualNetworkAddrs(t *testing.T) {
+func TestUpdateVirtualNetworkRoutes(t *testing.T) {
 	localAddr := &tcpip.FullAddress{
 		Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()),
 		Port: 1234,
@@ -200,7 +200,8 @@ func TestUpdateVirtualNetworkAddrs(t *testing.T) {
 	require.False(t, loop)
 
 	// Now change allowed addresses to *not* include 192.168.1.2.
-	err = h.UpdateVirtualNetworkAddrs(0x23456, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+	privatePrefix = netip.MustParsePrefix("10.0.0.0/8")
+	err = h.UpdateVirtualNetworkRoutes(0x23456, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
 	// Mapping removed -> VirtToPhy should drop as unknown tunnel destination address.
@@ -209,7 +210,8 @@ func TestUpdateVirtualNetworkAddrs(t *testing.T) {
 	require.False(t, loop)
 
 	// Add back a prefix which matches the destination again.
-	err = h.UpdateVirtualNetworkAddrs(0x23456, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	privatePrefix = netip.MustParsePrefix("192.168.1.0/24")
+	err = h.UpdateVirtualNetworkRoutes(0x23456, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
 	n, loop = h.VirtToPhy(virt, phy)
