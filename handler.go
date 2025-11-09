@@ -824,12 +824,12 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
-		slog.Warn("keep-alive: TX cipher not available")
-		vnet.Stats.TXErrors.Add(1)
+		// No key yet, not really an error for keep-alives.
 		return 0
 	}
+
 	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
-		slog.Warn("keep-alive: TX counter overflow, rotate the key")
+		slog.Warn("TX counter overflow, rotate the key")
 		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
@@ -872,7 +872,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	// Marshal Geneve header.
 	hdrLen, err := hdr.MarshalBinary(payload)
 	if err != nil {
-		slog.Warn("keep-alive: marshal Geneve header failed", slog.Any("error", err))
+		slog.Warn("Marshal Geneve header failed", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
@@ -885,7 +885,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	// Underlay source selection.
 	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
 	if best == nil {
-		slog.Warn("keep-alive: no local underlay addresses configured")
+		slog.Warn("No local underlay addresses configured")
 		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
@@ -895,7 +895,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	totalGeneveLen := hdrLen + encLen
 	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, totalGeneveLen, false)
 	if err != nil {
-		slog.Warn("keep-alive: UDP encode failed", slog.Any("error", err))
+		slog.Warn("UDP encode failed", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
