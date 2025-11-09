@@ -246,7 +246,7 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to create handler: %w", err)
 	}
 
-	allRoutes := []icx.AllowedRoute{
+	allRoutes := []icx.Route{
 		{Src: netip.MustParsePrefix("0.0.0.0/0"), Dst: netip.MustParsePrefix("0.0.0.0/0")},
 		{Src: netip.MustParsePrefix("::/0"), Dst: netip.MustParsePrefix("::/0")},
 	}

@@ -77,8 +77,8 @@ type Statistics struct {
 	LastKeepAliveUnixNano atomic.Int64
 }
 
-// AllowedRoute represents a source/destination address prefix pair allowed for a virtual network.
-type AllowedRoute struct {
+// Route represents a source/destination address prefix pair allowed for a virtual network.
+type Route struct {
 	// Src is the source address prefix.
 	Src netip.Prefix
 	// Dst is the destination address prefix.
@@ -92,7 +92,7 @@ type VirtualNetwork struct {
 	// RemoteAddr is the address of the remote endpoint.
 	RemoteAddr *tcpip.FullAddress
 	// AllowedRoutes is the list of allowed source/destination address prefix pairs for this virtual network.
-	AllowedRoutes []AllowedRoute
+	AllowedRoutes []Route
 	// Statistics associated with this virtual network.
 	Stats Statistics
 	// Internal state (not exposed)
@@ -258,7 +258,7 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
-func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, allowedRoutes []AllowedRoute) error {
+func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, allowedRoutes []Route) error {
 	if _, exists := h.networkByID.Load(vni); exists {
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
@@ -313,7 +313,7 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 }
 
 // UpdateVirtualNetworkRoutes updates the allowed routes for a virtual network.
-func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []AllowedRoute) error {
+func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) error {
 	v, ok := h.networkByID.Load(vni)
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)

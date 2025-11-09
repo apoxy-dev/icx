@@ -44,7 +44,7 @@ func TestHandler(t *testing.T) {
 
 	wildcardPrefix := netip.MustParsePrefix("0.0.0.0/0")
 
-	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.AllowedRoute{{Src: wildcardPrefix, Dst: wildcardPrefix}})
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.Route{{Src: wildcardPrefix, Dst: wildcardPrefix}})
 	require.NoError(t, err)
 
 	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
@@ -107,7 +107,7 @@ func TestHandler_Layer3(t *testing.T) {
 	require.NoError(t, err)
 
 	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
-	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
 	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
@@ -150,7 +150,7 @@ func TestHandler_Layer3_IPv6(t *testing.T) {
 
 	// Prefix contains src 2001:db8::1
 	privatePrefix := netip.MustParsePrefix("2001:db8::/64")
-	require.NoError(t, h.AddVirtualNetwork(0x45678, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}}))
+	require.NoError(t, h.AddVirtualNetwork(0x45678, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}}))
 	require.NoError(t, h.UpdateVirtualNetworkKeys(0x45678, 1, key, key, time.Now().Add(time.Hour)))
 
 	ip6 := makeIPv6UDPPacket()
@@ -187,7 +187,7 @@ func TestUpdateVirtualNetworkRoutes(t *testing.T) {
 
 	// Start with a prefix that contains 192.168.1.2 (dst of our inner packet)
 	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
-	err = h.AddVirtualNetwork(0x23456, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
+	err = h.AddVirtualNetwork(0x23456, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 	require.NoError(t, h.UpdateVirtualNetworkKeys(0x23456, 1, key, key, time.Now().Add(time.Hour)))
 
@@ -201,7 +201,7 @@ func TestUpdateVirtualNetworkRoutes(t *testing.T) {
 
 	// Now change allowed addresses to *not* include 192.168.1.2.
 	privatePrefix = netip.MustParsePrefix("10.0.0.0/8")
-	err = h.UpdateVirtualNetworkRoutes(0x23456, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
+	err = h.UpdateVirtualNetworkRoutes(0x23456, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
 	// Mapping removed -> VirtToPhy should drop as unknown tunnel destination address.
@@ -211,7 +211,7 @@ func TestUpdateVirtualNetworkRoutes(t *testing.T) {
 
 	// Add back a prefix which matches the destination again.
 	privatePrefix = netip.MustParsePrefix("192.168.1.0/24")
-	err = h.UpdateVirtualNetworkRoutes(0x23456, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
+	err = h.UpdateVirtualNetworkRoutes(0x23456, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
 	n, loop = h.VirtToPhy(virt, phy)
@@ -246,7 +246,7 @@ func TestKeyRotation(t *testing.T) {
 
 	const vni = 0x4242
 	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
-	require.NoError(t, h.AddVirtualNetwork(vni, peer, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}}))
+	require.NoError(t, h.AddVirtualNetwork(vni, peer, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}}))
 
 	// Epoch 1
 	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k1, clk.Now().Add(time.Hour)))
@@ -377,7 +377,7 @@ func TestNeighborSolicitation_Loopback(t *testing.T) {
 	require.NoError(t, err)
 
 	privatePrefix := netip.MustParsePrefix("2001:db8::/64")
-	require.NoError(t, h.AddVirtualNetwork(0x56789, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}}))
+	require.NoError(t, h.AddVirtualNetwork(0x56789, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}}))
 	require.NoError(t, h.UpdateVirtualNetworkKeys(0x56789, 1, key, key, time.Now().Add(time.Hour)))
 
 	nsFrame := makeIPv6NeighborSolicitationEthernetFrame()
@@ -411,8 +411,8 @@ func TestGetAndListVirtualNetworks(t *testing.T) {
 
 	prefixA := netip.MustParsePrefix("192.0.2.0/24")
 	prefixB := netip.MustParsePrefix("203.0.113.0/24")
-	require.NoError(t, h.AddVirtualNetwork(10, peerA, []icx.AllowedRoute{{Src: prefixA, Dst: prefixA}}))
-	require.NoError(t, h.AddVirtualNetwork(5, peerB, []icx.AllowedRoute{{Src: prefixB, Dst: prefixB}}))
+	require.NoError(t, h.AddVirtualNetwork(10, peerA, []icx.Route{{Src: prefixA, Dst: prefixA}}))
+	require.NoError(t, h.AddVirtualNetwork(5, peerB, []icx.Route{{Src: prefixB, Dst: prefixB}}))
 
 	// GetVirtualNetwork
 	v, ok := h.GetVirtualNetwork(10)
@@ -447,7 +447,7 @@ func BenchmarkHandler(b *testing.B) {
 	const vni = 0x12345
 
 	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
-	err = h.AddVirtualNetwork(vni, remoteAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
+	err = h.AddVirtualNetwork(vni, remoteAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(b, err)
 
 	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
