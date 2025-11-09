@@ -42,7 +42,9 @@ func TestHandler(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	wildcardPrefix := netip.MustParsePrefix("0.0.0.0/0")
+
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.AllowedRoute{{Src: wildcardPrefix, Dst: wildcardPrefix}})
 	require.NoError(t, err)
 
 	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
@@ -104,7 +106,8 @@ func TestHandler_Layer3(t *testing.T) {
 		icx.WithSourcePortHashing())
 	require.NoError(t, err)
 
-	err = h.AddVirtualNetwork(0x12345, peerAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
+	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
 	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
@@ -146,7 +149,8 @@ func TestHandler_Layer3_IPv6(t *testing.T) {
 	require.NoError(t, err)
 
 	// Prefix contains src 2001:db8::1
-	require.NoError(t, h.AddVirtualNetwork(0x45678, peerAddr, []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}))
+	privatePrefix := netip.MustParsePrefix("2001:db8::/64")
+	require.NoError(t, h.AddVirtualNetwork(0x45678, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}}))
 	require.NoError(t, h.UpdateVirtualNetworkKeys(0x45678, 1, key, key, time.Now().Add(time.Hour)))
 
 	ip6 := makeIPv6UDPPacket()
@@ -182,7 +186,8 @@ func TestUpdateVirtualNetworkAddrs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start with a prefix that contains 192.168.1.2 (dst of our inner packet)
-	err = h.AddVirtualNetwork(0x23456, peerAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
+	err = h.AddVirtualNetwork(0x23456, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 	require.NoError(t, h.UpdateVirtualNetworkKeys(0x23456, 1, key, key, time.Now().Add(time.Hour)))
 
@@ -238,9 +243,8 @@ func TestKeyRotation(t *testing.T) {
 	require.NoError(t, err)
 
 	const vni = 0x4242
-	require.NoError(t, h.AddVirtualNetwork(vni, peer, []netip.Prefix{
-		netip.MustParsePrefix("192.168.1.0/24"),
-	}))
+	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
+	require.NoError(t, h.AddVirtualNetwork(vni, peer, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}}))
 
 	// Epoch 1
 	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k1, clk.Now().Add(time.Hour)))
@@ -370,7 +374,8 @@ func TestNeighborSolicitation_Loopback(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, h.AddVirtualNetwork(0x56789, peerAddr, []netip.Prefix{netip.MustParsePrefix("2001:db8::/64")}))
+	privatePrefix := netip.MustParsePrefix("2001:db8::/64")
+	require.NoError(t, h.AddVirtualNetwork(0x56789, peerAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}}))
 	require.NoError(t, h.UpdateVirtualNetworkKeys(0x56789, 1, key, key, time.Now().Add(time.Hour)))
 
 	nsFrame := makeIPv6NeighborSolicitationEthernetFrame()
@@ -402,8 +407,10 @@ func TestGetAndListVirtualNetworks(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	require.NoError(t, h.AddVirtualNetwork(10, peerA, []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}))
-	require.NoError(t, h.AddVirtualNetwork(5, peerB, []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}))
+	prefixA := netip.MustParsePrefix("192.0.2.0/24")
+	prefixB := netip.MustParsePrefix("203.0.113.0/24")
+	require.NoError(t, h.AddVirtualNetwork(10, peerA, []icx.AllowedRoute{{Src: prefixA, Dst: prefixA}}))
+	require.NoError(t, h.AddVirtualNetwork(5, peerB, []icx.AllowedRoute{{Src: prefixB, Dst: prefixB}}))
 
 	// GetVirtualNetwork
 	v, ok := h.GetVirtualNetwork(10)
@@ -437,7 +444,8 @@ func BenchmarkHandler(b *testing.B) {
 
 	const vni = 0x12345
 
-	err = h.AddVirtualNetwork(vni, remoteAddr, []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")})
+	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
+	err = h.AddVirtualNetwork(vni, remoteAddr, []icx.AllowedRoute{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(b, err)
 
 	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))

@@ -49,8 +49,6 @@ type transmitCipher struct {
 
 // Statistics for a virtual network.
 type Statistics struct {
-	KeyEpoch     atomic.Uint32
-	KeyRotations atomic.Uint32
 	// RXPackets is the number of received packets.
 	RXPackets atomic.Uint64
 	// RXBytes is the number of bytes received.
@@ -79,14 +77,22 @@ type Statistics struct {
 	LastKeepAliveUnixNano atomic.Int64
 }
 
+// AllowedRoute represents a source/destination address prefix pair allowed for a virtual network.
+type AllowedRoute struct {
+	// Src is the source address prefix.
+	Src netip.Prefix
+	// Dst is the destination address prefix.
+	Dst netip.Prefix
+}
+
 // The state associated with each virtual network.
 type VirtualNetwork struct {
 	// ID is the virtual network identifier.
 	ID uint
 	// RemoteAddr is the address of the remote endpoint.
 	RemoteAddr *tcpip.FullAddress
-	// Addrs is the list of local IP prefixes.
-	Addrs []netip.Prefix
+	// AllowedRoutes is the list of allowed source/destination address prefix pairs for this virtual network.
+	AllowedRoutes []AllowedRoute
 	// Statistics associated with this virtual network.
 	Stats Statistics
 	// Internal state (not exposed)
@@ -206,14 +212,14 @@ func WithClock(c Clock) HandlerOption {
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
 type Handler struct {
-	opts               *handlerOptions
-	networkByID        sync.Map     // Maps VNI to network
-	networkByAddressMu sync.RWMutex // Protects networkByAddress
-	networkByAddress   *iptrie.Trie // Maps tunnel destination address to virtual network
-	proxyARP           *proxyarp.ProxyARP
-	ndProxy            *ndproxy.NDProxy
-	hdrPool            *sync.Pool
-	clock              Clock
+	opts                *handlerOptions
+	networkByID         sync.Map     // Maps VNI to network
+	networksByAddressMu sync.RWMutex // Protects networksByAddress
+	networksByAddress   *iptrie.Trie // Two tier trie: dstAddr -> srcAddr -> network
+	proxyARP            *proxyarp.ProxyARP
+	ndProxy             *ndproxy.NDProxy
+	hdrPool             *sync.Pool
+	clock               Clock
 }
 
 // NewHandler returns a new Handler configured with the given options.
@@ -242,33 +248,41 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 	}
 
 	return &Handler{
-		opts:             &options,
-		networkByAddress: iptrie.NewTrie(),
-		proxyARP:         proxyarp.NewProxyARP(options.srcMAC),
-		ndProxy:          ndproxy.NewNDProxy(options.srcMAC),
-		hdrPool:          hdrPool,
-		clock:            options.clock,
+		opts:              &options,
+		networksByAddress: iptrie.NewTrie(),
+		proxyARP:          proxyarp.NewProxyARP(options.srcMAC),
+		ndProxy:           ndproxy.NewNDProxy(options.srcMAC),
+		hdrPool:           hdrPool,
+		clock:             options.clock,
 	}, nil
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
-func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, addrs []netip.Prefix) error {
+func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, allowedRoutes []AllowedRoute) error {
 	if _, exists := h.networkByID.Load(vni); exists {
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
 
 	vnet := &VirtualNetwork{
-		ID:         vni,
-		RemoteAddr: remoteAddr,
-		Addrs:      addrs,
+		ID:            vni,
+		RemoteAddr:    remoteAddr,
+		AllowedRoutes: allowedRoutes,
 	}
 
 	h.networkByID.Store(vni, vnet)
-	h.networkByAddressMu.Lock()
-	for _, addr := range addrs {
-		h.networkByAddress.Insert(addr, vnet)
+
+	// Insert all allowed routes for this vnet
+	h.networksByAddressMu.Lock()
+	for _, route := range allowedRoutes {
+		value := h.networksByAddress.Find(route.Dst.Addr())
+		if value == nil {
+			value = iptrie.NewTrie()
+			h.networksByAddress.Insert(route.Dst, value)
+		}
+		srcTrie := value.(*iptrie.Trie)
+		srcTrie.Insert(route.Src, vnet)
 	}
-	h.networkByAddressMu.Unlock()
+	h.networksByAddressMu.Unlock()
 
 	return nil
 }
@@ -283,12 +297,17 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 
 	h.networkByID.Delete(vni)
 
-	// Remove all address mappings for this vnet.
-	h.networkByAddressMu.Lock()
-	for _, addr := range vnet.Addrs {
-		h.networkByAddress.Remove(addr)
+	// Remove all allowed routes for this vnet
+	h.networksByAddressMu.Lock()
+	for _, route := range vnet.AllowedRoutes {
+		value := h.networksByAddress.Find(route.Dst.Addr())
+		if value != nil {
+			srcTrie := value.(*iptrie.Trie)
+			srcTrie.Remove(route.Src)
+			// Library doesn't expose a way to easily check if the trie is empty.
+		}
 	}
-	h.networkByAddressMu.Unlock()
+	h.networksByAddressMu.Unlock()
 
 	return nil
 }
@@ -301,18 +320,28 @@ func (h *Handler) UpdateVirtualNetworkAddrs(vni uint, addrs []netip.Prefix) erro
 	}
 	vnet := v.(*VirtualNetwork)
 
-	// Remove all old mappings for this vnet, then insert the new ones.
-	h.networkByAddressMu.Lock()
-	for _, addr := range vnet.Addrs {
-		h.networkByAddress.Remove(addr)
+	// Remove all old allowed routes for this vnet, then insert the new ones.
+	h.networksByAddressMu.Lock()
+	for _, route := range vnet.AllowedRoutes {
+		value := h.networksByAddress.Find(route.Dst.Addr())
+		if value != nil {
+			srcTrie := value.(*iptrie.Trie)
+			srcTrie.Remove(route.Src)
+			// Library doesn't expose a way to easily check if the trie is empty.
+		}
 	}
 
-	// Update the vnet and re-insert the new mappings.
-	vnet.Addrs = addrs
-	for _, a := range addrs {
-		h.networkByAddress.Insert(a, vnet)
+	// Insert all new allowed routes for this vnet
+	for _, addr := range addrs {
+		value := h.networksByAddress.Find(addr.Addr())
+		if value == nil {
+			value = iptrie.NewTrie()
+			h.networksByAddress.Insert(addr, value)
+		}
+		srcTrie := value.(*iptrie.Trie)
+		srcTrie.Insert(addr, vnet)
 	}
-	h.networkByAddressMu.Unlock()
+	h.networksByAddressMu.Unlock()
 
 	return nil
 }
@@ -380,9 +409,6 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 		AEAD:  txCipher,
 		epoch: epoch,
 	})
-
-	vnet.Stats.KeyEpoch.Store(epoch)
-	vnet.Stats.KeyRotations.Add(1)
 
 	return nil
 }
@@ -535,8 +561,8 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
 	var validSrcAddr bool
-	for _, prefix := range vnet.Addrs {
-		if prefix.Contains(srcAddr) {
+	for _, route := range vnet.AllowedRoutes {
+		if route.Src.Contains(srcAddr) {
 			validSrcAddr = true
 			break
 		}
@@ -626,32 +652,49 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	ipVersion := ipPacket[0] >> 4
 
 	// Get the tunnel destination address for the IP packet.
-	var dstAddr netip.Addr
+	var srcAddr, dstAddr netip.Addr
 	switch ipVersion {
 	case header.IPv4Version:
 		var ok bool
 		ipHdr := header.IPv4(ipPacket)
+		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv4 source address in frame")
+			return 0, false
+		}
 		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
 		if !ok {
-			slog.Warn("Invalid IPv4 address in frame")
+			slog.Warn("Invalid IPv4 destination address in frame")
 			return 0, false
 		}
 	case header.IPv6Version:
 		var ok bool
 		ipHdr := header.IPv6(ipPacket)
+		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv6 source address in frame")
+			return 0, false
+		}
 		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
 		if !ok {
-			slog.Warn("Invalid IPv6 address in frame")
+			slog.Warn("Invalid IPv6 destination address in frame")
 			return 0, false
 		}
 	}
 
-	// Find the virtual network by the destination address.
-	h.networkByAddressMu.RLock()
-	value := h.networkByAddress.Find(dstAddr)
-	h.networkByAddressMu.RUnlock()
+	// Find the virtual network by the destination and source addresses.
+	h.networksByAddressMu.RLock()
+	value := h.networksByAddress.Find(dstAddr)
+	h.networksByAddressMu.RUnlock()
 	if value == nil {
-		slog.Debug("Dropping frame with unknown tunnel destination address", slog.String("dstAddr", dstAddr.String()))
+		slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
+		return 0, false
+	}
+	srcTrie := value.(*iptrie.Trie)
+
+	value = srcTrie.Find(srcAddr)
+	if value == nil {
+		slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
 		return 0, false
 	}
 	vnet := value.(*VirtualNetwork)
