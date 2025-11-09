@@ -21,6 +21,12 @@ On Debian you might need to create this symlink to fix bpf compilation issues:
 sudo ln -sf /usr/include/$(uname -m)-linux-gnu/asm /usr/include/asm
 ```
 
+## Security
+
+ICX is experimental and has **not** yet undergone a formal security audit or external review. While the design draws from established patterns, the implementation may contain bugs, vulnerabilities, or cryptographic weaknesses.
+
+Use ICX at your own risk.
+
 ## Performance
 
 2 x [c7gn.2xlarge](https://aws.amazon.com/ec2/instance-types/c7g/) instances in the same us-west-2 availability zone with a cluster placement strategy.
