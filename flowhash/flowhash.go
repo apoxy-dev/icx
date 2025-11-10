@@ -81,3 +81,14 @@ func Hash(ipPacket []byte) uint16 {
 
 	return uint16(crc & 0xFFFF)
 }
+
+// MapToEphemeralPort maps a given hash value to the ephemeral port range (49152-65535).
+func MapToEphemeralPort(hash uint16) uint16 {
+	const (
+		ephemeralMin = 49152
+		ephemeralMax = 65535
+	)
+
+	span := uint32(ephemeralMax-ephemeralMin) + 1
+	return uint16(uint32(ephemeralMin) + (uint32(hash) % span))
+}

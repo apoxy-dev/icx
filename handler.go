@@ -27,25 +27,9 @@ import (
 )
 
 const (
-	// The size of the Geneve header with icx options.
-	HeaderSize = 32
 	// How long to continue accepting packets with an old key after a new key is set.
 	keyGracePeriod = 30 * time.Second
 )
-
-// Receiver cipher state.
-type receiveCipher struct {
-	cipher.AEAD
-	expiresAt    time.Time
-	replayFilter replay.Filter
-}
-
-// Transmit cipher state.
-type transmitCipher struct {
-	cipher.AEAD
-	epoch   uint32
-	counter atomic.Uint64
-}
 
 // Statistics for a virtual network.
 type Statistics struct {
@@ -83,6 +67,20 @@ type Route struct {
 	Src netip.Prefix
 	// Dst is the destination address prefix.
 	Dst netip.Prefix
+}
+
+// Receiver cipher state.
+type receiveCipher struct {
+	cipher.AEAD
+	expiresAt    time.Time
+	replayFilter replay.Filter
+}
+
+// Transmit cipher state.
+type transmitCipher struct {
+	cipher.AEAD
+	epoch   uint32
+	counter atomic.Uint64
 }
 
 // The state associated with each virtual network.
@@ -562,7 +560,9 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
-	// Confirm that the source address is valid for the virtual network (ala allowed_ips).
+	// Confirm that the source address is valid for the virtual network.
+	// From our perspective, the source address must be within one of the
+	// allowed destination prefixes for this vnet.
 	var validSrcAddr bool
 	for _, route := range vnet.AllowedRoutes {
 		if route.Dst.Contains(srcAddr) {
@@ -770,6 +770,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
+	// Underlay source selection.
 	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
 	if best == nil {
 		slog.Warn("No local underlay addresses configured")
@@ -779,7 +780,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	localAddr := *best
 	if h.opts.sourcePortHashing {
-		localAddr.Port = flowhash.Hash(ipPacket)
+		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(ipPacket))
 	}
 
 	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, false)
@@ -889,7 +890,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 		vnet.Stats.TXErrors.Add(1)
 		return 0
 	}
-	localAddr := *best // keep configured source port for stability
+	localAddr := *best
 
 	// Finish outer UDP/IP/Ethernet
 	totalGeneveLen := hdrLen + encLen

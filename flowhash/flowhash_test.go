@@ -137,3 +137,10 @@ func BenchmarkFlowHash_IPv6(b *testing.B) {
 		_ = flowhash.Hash(pkt)
 	}
 }
+
+func TestMapToEphemeralPort(t *testing.T) {
+	port := flowhash.MapToEphemeralPort(12345)
+
+	require.GreaterOrEqual(t, port, uint16(49152))
+	require.LessOrEqual(t, port, uint16(65535))
+}
