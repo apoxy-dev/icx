@@ -1,6 +1,6 @@
 //go:build linux
 
-package tunnel
+package queues
 
 import (
 	"errors"

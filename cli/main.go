@@ -27,9 +27,10 @@ import (
 
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/filter"
+	"github.com/apoxy-dev/icx/forwarder"
 	"github.com/apoxy-dev/icx/mac"
 	"github.com/apoxy-dev/icx/permissions"
-	"github.com/apoxy-dev/icx/tunnel"
+	"github.com/apoxy-dev/icx/queues"
 	"github.com/apoxy-dev/icx/veth"
 
 	ini "gopkg.in/ini.v1"
@@ -176,7 +177,7 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to find interface %s: %w", phyName, err)
 	}
 
-	numQueues, err := tunnel.NumQueues(link)
+	numQueues, err := queues.NumQueues(link)
 	if err != nil {
 		return fmt.Errorf("failed to get number of TX queues for interface %s: %w", phyName, err)
 	}
@@ -317,19 +318,19 @@ func run(c *cli.Context) error {
 		}
 	}()
 
-	tun, err := tunnel.NewTunnel(
+	fwd, err := forwarder.NewForwarder(
 		h,
-		tunnel.WithPhyName(phyName),
-		tunnel.WithVirtName(vethDev.Peer.Attrs().Name),
-		tunnel.WithPhyFilter(ingressFilter),
-		tunnel.WithPcapWriter(pcapWriter),
+		forwarder.WithPhyName(phyName),
+		forwarder.WithVirtName(vethDev.Peer.Attrs().Name),
+		forwarder.WithPhyFilter(ingressFilter),
+		forwarder.WithPcapWriter(pcapWriter),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to create tunnel: %w", err)
+		return fmt.Errorf("failed to create forwarder: %w", err)
 	}
 
-	if err := tun.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("failed to start tunnel: %w", err)
+	if err := fwd.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("failed to start forwarder: %w", err)
 	}
 
 	return nil

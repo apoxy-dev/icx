@@ -1,6 +1,6 @@
 //go:build linux
 
-package tunnel
+package forwarder
 
 import (
 	"context"
@@ -21,6 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/apoxy-dev/icx/filter"
+	"github.com/apoxy-dev/icx/queues"
 )
 
 // Decapsulate and encapsulate frames between physical and virtual interfaces.
@@ -37,17 +38,17 @@ type Handler interface {
 	ToPhy(phyFrame []byte) int
 }
 
-type TunnelOption func(*tunnelOptions) error
+type ForwarderOption func(*forwarderOptions) error
 
-type tunnelOptions struct {
+type forwarderOptions struct {
 	phyName    string
 	virtName   string
 	phyFilter  *xdp.Program
 	pcapWriter *pcapgo.Writer
 }
 
-func defaultTunnelOptions() tunnelOptions {
-	return tunnelOptions{
+func defaultForwarderOptions() forwarderOptions {
+	return forwarderOptions{
 		phyName:  "eth0",
 		virtName: "tun0",
 	}
@@ -55,8 +56,8 @@ func defaultTunnelOptions() tunnelOptions {
 
 // WithPhyName sets the name of the physical interface to use.
 // Defaults to "eth0".
-func WithPhyName(name string) TunnelOption {
-	return func(o *tunnelOptions) error {
+func WithPhyName(name string) ForwarderOption {
+	return func(o *forwarderOptions) error {
 		o.phyName = name
 		return nil
 	}
@@ -64,8 +65,8 @@ func WithPhyName(name string) TunnelOption {
 
 // WithVirtName sets the name of the virtual interface to use.
 // Defaults to "tun0".
-func WithVirtName(name string) TunnelOption {
-	return func(o *tunnelOptions) error {
+func WithVirtName(name string) ForwarderOption {
+	return func(o *forwarderOptions) error {
 		o.virtName = name
 		return nil
 	}
@@ -73,8 +74,8 @@ func WithVirtName(name string) TunnelOption {
 
 // WithPcapWriter sets a pcap writer to log all frames sent and received on both
 // interfaces. If nil, no pcap logging is performed.
-func WithPcapWriter(writer *pcapgo.Writer) TunnelOption {
-	return func(o *tunnelOptions) error {
+func WithPcapWriter(writer *pcapgo.Writer) ForwarderOption {
+	return func(o *forwarderOptions) error {
 		o.pcapWriter = writer
 		return nil
 	}
@@ -83,16 +84,16 @@ func WithPcapWriter(writer *pcapgo.Writer) TunnelOption {
 // WithPhyFilter sets a custom XDP filter program to use on the physical interface.
 // If nil, a default filter is created that accepts all Geneve packets addressed
 // to the default port (6081).
-func WithPhyFilter(filter *xdp.Program) TunnelOption {
-	return func(o *tunnelOptions) error {
+func WithPhyFilter(filter *xdp.Program) ForwarderOption {
+	return func(o *forwarderOptions) error {
 		o.phyFilter = filter
 		return nil
 	}
 }
 
-// Tunnel splices frames between a physical and a virtual interface using XDP sockets.
+// Forwarder splices frames between a physical and a virtual interface using XDP sockets.
 // It uses a handler to convert frames between the two interfaces.
-type Tunnel struct {
+type Forwarder struct {
 	handler      Handler
 	phyFilter    *xdp.Program
 	pcapWriterMu sync.Mutex
@@ -104,16 +105,16 @@ type Tunnel struct {
 	closeOnce    sync.Once
 }
 
-// NewTunnel creates a new Tunnel with the given handler and options.
-func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
-	options := defaultTunnelOptions()
+// NewForwarder creates a new Forwarder with the given handler and options.
+func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) {
+	options := defaultForwarderOptions()
 	for _, opt := range opts {
 		if err := opt(&options); err != nil {
 			return nil, err
 		}
 	}
 
-	slog.Debug("Creating tunnel",
+	slog.Debug("Creating forwarder",
 		slog.String("phyName", options.phyName),
 		slog.String("virtName", options.virtName))
 
@@ -127,12 +128,12 @@ func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
 		return nil, fmt.Errorf("failed to find virtual interface %s: %w", options.virtName, err)
 	}
 
-	phyNumQueues, err := NumQueues(phyLink)
+	phyNumQueues, err := queues.NumQueues(phyLink)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get number of queues for physical device %s: %w", options.phyName, err)
 	}
 
-	virtNumQueues, err := NumQueues(virtLink)
+	virtNumQueues, err := queues.NumQueues(virtLink)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get number of queues for virtual device %s: %w", options.virtName, err)
 	}
@@ -241,7 +242,7 @@ func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
 		}
 	}
 
-	return &Tunnel{
+	return &Forwarder{
 		handler:    handler,
 		phyFilter:  options.phyFilter,
 		pcapWriter: options.pcapWriter,
@@ -252,21 +253,21 @@ func NewTunnel(handler Handler, opts ...TunnelOption) (*Tunnel, error) {
 	}, nil
 }
 
-func (t *Tunnel) Close() (err error) {
-	t.closeOnce.Do(func() {
-		if err = t.phyFilter.Detach(t.link.Attrs().Index); err != nil {
+func (f *Forwarder) Close() (err error) {
+	f.closeOnce.Do(func() {
+		if err = f.phyFilter.Detach(f.link.Attrs().Index); err != nil {
 			err = fmt.Errorf("failed to detach phy XDP filter: %w", err)
 			return
 		}
 
-		if err = t.virtFilter.Detach(t.link.Attrs().Index); err != nil {
+		if err = f.virtFilter.Detach(f.link.Attrs().Index); err != nil {
 			err = fmt.Errorf("failed to detach virt XDP filter: %w", err)
 			return
 		}
 
 		slog.Debug("Closing physical XDP sockets")
 
-		for _, xsk := range t.phy {
+		for _, xsk := range f.phy {
 			if err = xsk.Close(); err != nil {
 				err = fmt.Errorf("failed to close XDP socket: %w", err)
 				return
@@ -275,7 +276,7 @@ func (t *Tunnel) Close() (err error) {
 
 		slog.Debug("Closing virtual XDP sockets")
 
-		for _, xsk := range t.virt {
+		for _, xsk := range f.virt {
 			if err = xsk.Close(); err != nil {
 				err = fmt.Errorf("failed to close XDP socket: %w", err)
 				return
@@ -286,12 +287,12 @@ func (t *Tunnel) Close() (err error) {
 	return nil
 }
 
-func (t *Tunnel) Start(ctx context.Context) error {
+func (f *Forwarder) Start(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
-	for queueID := range t.phy {
+	for queueID := range f.phy {
 		g.Go(func() error {
-			return t.processFrames(ctx, queueID)
+			return f.processFrames(ctx, queueID)
 		})
 	}
 
@@ -299,7 +300,7 @@ func (t *Tunnel) Start(ctx context.Context) error {
 	err := g.Wait()
 
 	// Now it is safe to close sockets/filters; workers have stopped touching them.
-	if closeErr := t.Close(); err == nil && closeErr != nil {
+	if closeErr := f.Close(); err == nil && closeErr != nil {
 		err = closeErr
 	}
 
@@ -310,7 +311,7 @@ func (t *Tunnel) Start(ctx context.Context) error {
 	return nil
 }
 
-func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
+func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -323,20 +324,20 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 		}
 
 		// Reserve space in the physical rx queue
-		if n := min(t.phy[queueID].NumFilled()+t.phy[queueID].NumFreeFillSlots(), t.virt[queueID].NumFreeTxSlots()); n > 0 {
-			if t.phy[queueID].NumFilled() < n {
-				t.phy[queueID].Fill(t.phy[queueID].GetDescs(n-t.phy[queueID].NumFilled(), true))
+		if n := min(f.phy[queueID].NumFilled()+f.phy[queueID].NumFreeFillSlots(), f.virt[queueID].NumFreeTxSlots()); n > 0 {
+			if f.phy[queueID].NumFilled() < n {
+				f.phy[queueID].Fill(f.phy[queueID].GetDescs(n-f.phy[queueID].NumFilled(), true))
 			}
 		}
 
 		// Reserve space in the virt rx queue
-		if n := min(t.virt[queueID].NumFilled()+t.virt[queueID].NumFreeFillSlots(), t.phy[queueID].NumFreeTxSlots()); n > 0 {
-			if t.virt[queueID].NumFilled() < n {
-				t.virt[queueID].Fill(t.virt[queueID].GetDescs(n-t.virt[queueID].NumFilled(), true))
+		if n := min(f.virt[queueID].NumFilled()+f.virt[queueID].NumFreeFillSlots(), f.phy[queueID].NumFreeTxSlots()); n > 0 {
+			if f.virt[queueID].NumFilled() < n {
+				f.virt[queueID].Fill(f.virt[queueID].GetDescs(n-f.virt[queueID].NumFilled(), true))
 			}
 		}
 
-		if err := poll(t.phy[queueID], t.virt[queueID], 100*time.Millisecond); err != nil {
+		if err := poll(f.phy[queueID], f.virt[queueID], 100*time.Millisecond); err != nil {
 			if errors.Is(err, os.ErrClosed) {
 				return err
 			}
@@ -344,12 +345,12 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 			return fmt.Errorf("failed to poll XSKs: %w", err)
 		}
 
-		if numCompleted := t.phy[queueID].NumCompleted(); numCompleted > 0 {
-			t.phy[queueID].Complete(numCompleted)
+		if numCompleted := f.phy[queueID].NumCompleted(); numCompleted > 0 {
+			f.phy[queueID].Complete(numCompleted)
 		}
 
-		if numCompleted := t.virt[queueID].NumCompleted(); numCompleted > 0 {
-			t.virt[queueID].Complete(numCompleted)
+		if numCompleted := f.virt[queueID].NumCompleted(); numCompleted > 0 {
+			f.virt[queueID].Complete(numCompleted)
 		}
 
 		// Try to emit any scheduled frames.
@@ -357,12 +358,12 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 		// and only if there are available TX descriptors.
 
 		// Scheduled to PHY (produce a frame that should go out on the physical iface).
-		if t.phy[queueID].NumFreeTxSlots() > 0 {
-			if txDescs := t.phy[queueID].GetDescs(1, false); len(txDescs) == 1 {
-				txFrame := t.phy[queueID].GetFrame(txDescs[0])
-				if frameLen := t.handler.ToPhy(txFrame); frameLen > 0 {
+		if f.phy[queueID].NumFreeTxSlots() > 0 {
+			if txDescs := f.phy[queueID].GetDescs(1, false); len(txDescs) == 1 {
+				txFrame := f.phy[queueID].GetFrame(txDescs[0])
+				if frameLen := f.handler.ToPhy(txFrame); frameLen > 0 {
 					txDescs[0].Len = uint32(frameLen)
-					if transmitted := t.phy[queueID].Transmit(txDescs); transmitted < 1 {
+					if transmitted := f.phy[queueID].Transmit(txDescs); transmitted < 1 {
 						slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
 					}
 				}
@@ -370,9 +371,9 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 		}
 
 		// Did we receive any frames from the physical device?
-		if numReceived := t.phy[queueID].NumReceived(); numReceived > 0 {
-			rxDescs := t.phy[queueID].Receive(numReceived)
-			txDescs := t.virt[queueID].GetDescs(numReceived, false)
+		if numReceived := f.phy[queueID].NumReceived(); numReceived > 0 {
+			rxDescs := f.phy[queueID].Receive(numReceived)
+			txDescs := f.virt[queueID].GetDescs(numReceived, false)
 
 			slog.Debug("Received frames from physical device",
 				slog.Int("queueID", queueID),
@@ -380,10 +381,10 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 
 			var populatedDescs int
 			for i := range rxDescs {
-				rxFrame := t.phy[queueID].GetFrame(rxDescs[i])
-				txFrame := t.virt[queueID].GetFrame(txDescs[populatedDescs])
+				rxFrame := f.phy[queueID].GetFrame(rxDescs[i])
+				txFrame := f.virt[queueID].GetFrame(txDescs[populatedDescs])
 
-				frameLen := t.handler.PhyToVirt(rxFrame, txFrame)
+				frameLen := f.handler.PhyToVirt(rxFrame, txFrame)
 				if frameLen <= 0 {
 					continue
 				}
@@ -391,19 +392,19 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 				txDescs[populatedDescs].Len = uint32(frameLen)
 				populatedDescs++
 
-				if t.pcapWriter != nil {
-					t.pcapWriterMu.Lock()
+				if f.pcapWriter != nil {
+					f.pcapWriterMu.Lock()
 					ci := gopacket.CaptureInfo{
 						Timestamp:     time.Now(),
 						CaptureLength: frameLen,
 						Length:        frameLen,
 					}
-					_ = t.pcapWriter.WritePacket(ci, txFrame[:frameLen])
-					t.pcapWriterMu.Unlock()
+					_ = f.pcapWriter.WritePacket(ci, txFrame[:frameLen])
+					f.pcapWriterMu.Unlock()
 				}
 			}
 			if populatedDescs > 0 {
-				if numTransmitted := t.virt[queueID].Transmit(txDescs[:populatedDescs]); numTransmitted < populatedDescs {
+				if numTransmitted := f.virt[queueID].Transmit(txDescs[:populatedDescs]); numTransmitted < populatedDescs {
 					slog.Debug("Failed to transmit all frames to virtual device",
 						slog.Int("queueID", queueID),
 						slog.Int("numReceived", numReceived),
@@ -413,9 +414,9 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 		}
 
 		// Did we receive any frames from the virtual device?
-		if numReceived := t.virt[queueID].NumReceived(); numReceived > 0 {
-			rxDescs := t.virt[queueID].Receive(numReceived)
-			txDescs := t.phy[queueID].GetDescs(numReceived, false)
+		if numReceived := f.virt[queueID].NumReceived(); numReceived > 0 {
+			rxDescs := f.virt[queueID].Receive(numReceived)
+			txDescs := f.phy[queueID].GetDescs(numReceived, false)
 
 			slog.Debug("Received frames from virtual device",
 				slog.Int("queueID", queueID),
@@ -423,10 +424,10 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 
 			var populatedDescs int
 			for i := range rxDescs {
-				rxFrame := t.virt[queueID].GetFrame(rxDescs[i])
-				txFrame := t.phy[queueID].GetFrame(txDescs[populatedDescs])
+				rxFrame := f.virt[queueID].GetFrame(rxDescs[i])
+				txFrame := f.phy[queueID].GetFrame(txDescs[populatedDescs])
 
-				frameLen, loopback := t.handler.VirtToPhy(rxFrame, txFrame)
+				frameLen, loopback := f.handler.VirtToPhy(rxFrame, txFrame)
 
 				if !loopback {
 					if frameLen <= 0 {
@@ -438,10 +439,10 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 					populatedDescs++
 				} else {
 					// Write back to the virt socket for loopback.
-					if loopDescs := t.virt[queueID].GetDescs(1, false); len(loopDescs) == 1 {
-						loopFrame := t.virt[queueID].GetFrame(loopDescs[0])
+					if loopDescs := f.virt[queueID].GetDescs(1, false); len(loopDescs) == 1 {
+						loopFrame := f.virt[queueID].GetFrame(loopDescs[0])
 						loopDescs[0].Len = uint32(copy(loopFrame, txFrame[:frameLen]))
-						if transmitted := t.virt[queueID].Transmit(loopDescs); transmitted < 1 {
+						if transmitted := f.virt[queueID].Transmit(loopDescs); transmitted < 1 {
 							slog.Debug("Dropped loopback frame", slog.Int("queueID", queueID))
 						}
 					} else {
@@ -450,7 +451,7 @@ func (t *Tunnel) processFrames(ctx context.Context, queueID int) error {
 				}
 			}
 			if populatedDescs > 0 {
-				if numTransmitted := t.phy[queueID].Transmit(txDescs[:populatedDescs]); numTransmitted < populatedDescs {
+				if numTransmitted := f.phy[queueID].Transmit(txDescs[:populatedDescs]); numTransmitted < populatedDescs {
 					slog.Debug("Failed to transmit all frames to physical device",
 						slog.Int("queueID", queueID),
 						slog.Int("numReceived", numReceived),

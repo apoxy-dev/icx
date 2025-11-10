@@ -1,6 +1,6 @@
 //go:build linux
 
-package tunnel_test
+package forwarder_test
 
 import (
 	"bytes"
@@ -20,15 +20,15 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 
 	"github.com/apoxy-dev/icx/filter"
+	"github.com/apoxy-dev/icx/forwarder"
 	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/proxyarp"
-	"github.com/apoxy-dev/icx/tunnel"
 	"github.com/apoxy-dev/icx/veth"
 )
 
 const nsName = "icx-test-ns"
 
-func TestTunnel(t *testing.T) {
+func TestForwarder(t *testing.T) {
 	netAdmin, _ := permissions.IsNetAdmin()
 	if !netAdmin {
 		t.Skip("Skipping test because it requires NET_ADMIN capabilities")
@@ -59,7 +59,7 @@ func TestTunnel(t *testing.T) {
 		require.NoError(t, phyFilter.Close())
 	})
 
-	pcapFile, err := os.Create("tunnel_test.pcap")
+	pcapFile, err := os.Create("forwarder_test.pcap")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, pcapFile.Close())
@@ -75,21 +75,21 @@ func TestTunnel(t *testing.T) {
 		proxyARP: proxyarp.NewProxyARP(phyMAC),
 	}
 
-	// Create the tunnel.
-	tun, err := tunnel.NewTunnel(h,
-		tunnel.WithPhyName(phyDev.Peer.Attrs().Name),
-		tunnel.WithPhyFilter(phyFilter),
-		tunnel.WithVirtName(virtDev.Peer.Attrs().Name),
-		tunnel.WithPcapWriter(pcapWriter),
+	// Create the forwarder.
+	fwd, err := forwarder.NewForwarder(h,
+		forwarder.WithPhyName(phyDev.Peer.Attrs().Name),
+		forwarder.WithPhyFilter(phyFilter),
+		forwarder.WithVirtName(virtDev.Peer.Attrs().Name),
+		forwarder.WithPcapWriter(pcapWriter),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		require.NoError(t, tun.Close())
+		require.NoError(t, fwd.Close())
 	})
 
-	// Start the tunnel.
+	// Start the forwarder.
 	go func() {
-		require.NoError(t, tun.Start(t.Context()))
+		require.NoError(t, fwd.Start(t.Context()))
 	}()
 
 	// Create a network namespace.
@@ -138,7 +138,7 @@ func TestTunnel(t *testing.T) {
 		Timeout: 20 * time.Second,
 	}
 
-	// Make an HTTP request to the server via the tunnel.
+	// Make an HTTP request to the server via the forwarder.
 	resp, err := httpClient.Get("http://10.200.0.1:8080/")
 	require.NoError(t, err)
 	t.Cleanup(func() {

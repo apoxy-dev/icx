@@ -9,7 +9,7 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"github.com/apoxy-dev/icx/permissions"
-	"github.com/apoxy-dev/icx/tunnel"
+	"github.com/apoxy-dev/icx/queues"
 	"github.com/apoxy-dev/icx/veth"
 )
 
@@ -38,7 +38,7 @@ func TestVeth(t *testing.T) {
 
 	require.Equal(t, mtu, link.Attrs().MTU)
 
-	actualNumQueues, err := tunnel.NumQueues(link)
+	actualNumQueues, err := queues.NumQueues(link)
 	require.NoError(t, err, "Failed to get number of queues for link %s", name)
 	require.Equal(t, numQueues, actualNumQueues)
 

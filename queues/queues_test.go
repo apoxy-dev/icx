@@ -1,13 +1,14 @@
 //go:build linux
 
-package tunnel_test
+package queues_test
 
 import (
 	"testing"
 
-	"github.com/apoxy-dev/icx/tunnel"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
+
+	"github.com/apoxy-dev/icx/queues"
 )
 
 func TestNumQueues(t *testing.T) {
@@ -23,7 +24,7 @@ func TestNumQueues(t *testing.T) {
 		}
 	}
 
-	numQueues, err := tunnel.NumQueues(defaultLink)
+	numQueues, err := queues.NumQueues(defaultLink)
 	require.NoError(t, err)
 
 	require.Greater(t, numQueues, 0, "number of queues should be greater than 0")
