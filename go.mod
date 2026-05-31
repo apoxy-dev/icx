@@ -8,7 +8,6 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/phemmer/go-iptrie v0.0.0-20240326174613-ba542f5282c9
 	github.com/safchain/ethtool v0.6.1
-	github.com/slavc/xdp v0.3.4
 	github.com/stretchr/testify v1.10.0
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sync v0.15.0

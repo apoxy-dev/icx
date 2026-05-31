@@ -175,6 +175,16 @@ func (s *Socket) NumFreeTxSlots() int { return int(s.txRing.freeSlots()) }
 // NumFreeFillSlots reports how many FILL-ring slots are free to produce into.
 func (s *Socket) NumFreeFillSlots() int { return int(s.fillRing.freeSlots()) }
 
+// NumFilled reports how many frames are queued on the FILL ring that the kernel
+// has not yet consumed (i.e. outstanding RX buffers handed to the kernel). It is
+// the FILL-ring analogue of NumTransmitted: derived from the ring indices
+// (size - free), so it cannot drift the way slavc/xdp's hand-maintained
+// numFilled counter did. The forwarder uses it to decide how many more frames to
+// hand the kernel via Fill and whether to arm POLLIN.
+func (s *Socket) NumFilled() int {
+	return int(s.fillRing.size - s.fillRing.freeSlots())
+}
+
 // NumCompleted reports how many frames are waiting on the COMPLETION ring to be
 // reclaimed via Complete.
 func (s *Socket) NumCompleted() int { return int(s.compRing.available()) }
