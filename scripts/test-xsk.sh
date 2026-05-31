@@ -28,6 +28,20 @@ else
   esac
 fi
 
+# The forwarder integration test sets up veth pairs + a network namespace and
+# drives an HTTP request through the tunnel, so it needs `ip` (iproute2) and
+# `curl` in the container. The bare golang image has neither; without `ip` the
+# test t.Fatalf's during setup and the early teardown trips the race detector
+# (an environment artifact, not a real data race). The internal/xsk tests need
+# nothing extra, so only install when a package other than internal/xsk is
+# requested, keeping the common xsk-only run fast.
+script='exec go test -race -count=1 -v "$@"'
+case "${extra_args[*]}" in
+  *forwarder* | *"./..."*)
+    script='apt-get update -qq && apt-get install -y -qq iproute2 curl >/dev/null && '"$script"
+    ;;
+esac
+
 exec docker run --rm \
   --privileged \
   --network host \
@@ -37,4 +51,4 @@ exec docker run --rm \
   -e GOFLAGS=-mod=mod \
   -e GOCACHE=/tmp/gocache \
   "$img" \
-  go test -race -count=1 -v "${extra_args[@]}"
+  bash -c "$script" bash "${extra_args[@]}"
