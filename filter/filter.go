@@ -8,7 +8,6 @@ import (
 	"net"
 
 	"github.com/cilium/ebpf"
-	"github.com/slavc/xdp"
 	"golang.org/x/sys/unix"
 )
 
@@ -17,7 +16,7 @@ import (
 
 // All creates an eBPF program that intercepts all incoming packets
 // and redirects them to the XDP socket.
-func All() (*xdp.Program, error) {
+func All() (*Program, error) {
 	spec, err := loadAll()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF program: %w", err)
@@ -28,7 +27,7 @@ func All() (*xdp.Program, error) {
 		return nil, fmt.Errorf("failed to create eBPF collection: %w", err)
 	}
 
-	return &xdp.Program{
+	return &Program{
 		Program: col.Programs["xdp_sock_prog"],
 		Queues:  col.Maps["qidconf_map"],
 		Sockets: col.Maps["xsks_map"],
@@ -37,7 +36,7 @@ func All() (*xdp.Program, error) {
 
 // Geneve creates an eBPF program that binds to the specified addresses and
 // redirects all Geneve packets to the XDP socket.
-func Geneve(addrs ...net.Addr) (*xdp.Program, error) {
+func Geneve(addrs ...net.Addr) (*Program, error) {
 	spec, err := loadGeneve()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF program: %w", err)
@@ -75,7 +74,7 @@ func Geneve(addrs ...net.Addr) (*xdp.Program, error) {
 		}
 	}
 
-	return &xdp.Program{
+	return &Program{
 		Program: col.Programs["xdp_sock_prog"],
 		Queues:  col.Maps["qidconf_map"],
 		Sockets: col.Maps["xsks_map"],

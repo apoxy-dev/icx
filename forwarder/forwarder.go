@@ -43,7 +43,7 @@ type ForwarderOption func(*forwarderOptions) error
 type forwarderOptions struct {
 	phyName    string
 	virtName   string
-	phyFilter  *xdp.Program
+	phyFilter  *filter.Program
 	pcapWriter *pcapgo.Writer
 }
 
@@ -84,9 +84,9 @@ func WithPcapWriter(writer *pcapgo.Writer) ForwarderOption {
 // WithPhyFilter sets a custom XDP filter program to use on the physical interface.
 // If nil, a default filter is created that accepts all Geneve packets addressed
 // to the default port (6081).
-func WithPhyFilter(filter *xdp.Program) ForwarderOption {
+func WithPhyFilter(prog *filter.Program) ForwarderOption {
 	return func(o *forwarderOptions) error {
-		o.phyFilter = filter
+		o.phyFilter = prog
 		return nil
 	}
 }
@@ -95,12 +95,12 @@ func WithPhyFilter(filter *xdp.Program) ForwarderOption {
 // It uses a handler to convert frames between the two interfaces.
 type Forwarder struct {
 	handler      Handler
-	phyFilter    *xdp.Program
+	phyFilter    *filter.Program
 	pcapWriterMu sync.Mutex
 	pcapWriter   *pcapgo.Writer
 	link         netlink.Link
 	phy          []*xdp.Socket
-	virtFilter   *xdp.Program
+	virtFilter   *filter.Program
 	virt         []*xdp.Socket
 	closeOnce    sync.Once
 }
