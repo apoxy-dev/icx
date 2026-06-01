@@ -9,6 +9,7 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/urfave/cli/v2 v2.27.7
 	github.com/vishvananda/netlink v1.3.1
+	golang.org/x/sync v0.16.0
 	gopkg.in/ini.v1 v1.67.0
 	gvisor.dev/gvisor v0.0.0-20250606001031-fa4c4dd86b43
 )
@@ -19,12 +20,13 @@ require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/phemmer/go-iptrie v0.0.0-20240326174613-ba542f5282c9 // indirect
+	github.com/quic-go/quic-go v0.59.1 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/safchain/ethtool v0.6.1 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/xrash/smetrics v0.0.0-20240521201337-686a1a2994c1 // indirect
-	golang.org/x/net v0.39.0 // indirect
-	golang.org/x/sync v0.15.0 // indirect
-	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
+	golang.org/x/net v0.43.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 )

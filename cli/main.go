@@ -4,9 +4,12 @@ package main
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/fips140"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math"
 	"net"
@@ -23,9 +26,11 @@ import (
 	"github.com/google/gopacket/pcapgo"
 	"github.com/urfave/cli/v2"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sync/errgroup"
 	"gvisor.dev/gvisor/pkg/tcpip"
 
 	"github.com/apoxy-dev/icx"
+	"github.com/apoxy-dev/icx/control"
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
 	"github.com/apoxy-dev/icx/mac"
@@ -38,7 +43,12 @@ import (
 
 func main() {
 	app := &cli.App{
-		Name: "icx",
+		Name:  "icx",
+		Usage: "InterCloud eXpress — an AF_XDP Geneve L3 tunnel",
+		Commands: []*cli.Command{
+			genkeyCommand(),
+			pubkeyCommand(),
+		},
 		Flags: []cli.Flag{
 			&cli.StringFlag{
 				Name:    "log-level",
@@ -46,11 +56,14 @@ func main() {
 				Usage:   "Set the logging level (debug, info, warn, error, fatal, panic)",
 				Value:   "info",
 			},
+			// NOTE: --interface and --key-file are intentionally NOT marked Required.
+			// urfave/cli enforces required root flags before dispatching to a
+			// subcommand, which would make `icx genkey`/`icx pubkey` unrunnable. They
+			// are validated inside run() instead.
 			&cli.StringFlag{
-				Name:     "interface",
-				Aliases:  []string{"i"},
-				Usage:    "Physical network interface to use",
-				Required: true,
+				Name:    "interface",
+				Aliases: []string{"i"},
+				Usage:   "Physical network interface to use (required for the tunnel)",
 			},
 			&cli.UintFlag{
 				Name:    "vni",
@@ -59,9 +72,34 @@ func main() {
 				Value:   1,
 			},
 			&cli.StringFlag{
-				Name:     "key-file",
-				Usage:    "Path to INI file containing keys (rx, tx, optional expires)",
-				Required: true,
+				Name:  "key-file",
+				Usage: "Path to INI file with static keys (rx, tx, optional expires). Legacy/static mode; prefer the control plane (--identity-key/--peer-key)",
+			},
+			&cli.StringFlag{
+				Name:  "identity-key",
+				Usage: "Path to this node's identity private key (PKCS#8 PEM from `icx genkey`). Enables the control plane",
+			},
+			&cli.StringFlag{
+				Name:  "peer-key",
+				Usage: "Peer's identity public key (base64 SPKI from `icx pubkey`, or a path to a file containing it). Enables the control plane",
+			},
+			&cli.IntFlag{
+				Name:  "control-port",
+				Usage: "UDP port for the QUIC/mTLS control plane (must match on both peers)",
+				Value: 6082,
+			},
+			&cli.IntFlag{
+				Name:  "peer-control-port",
+				Usage: "Peer's control-plane UDP port (defaults to --control-port)",
+			},
+			&cli.DurationFlag{
+				Name:  "rekey-interval",
+				Usage: "How often the control plane negotiates a fresh security association",
+				Value: 2 * time.Minute,
+			},
+			&cli.BoolFlag{
+				Name:  "require-fips",
+				Usage: "Refuse to start unless the Go FIPS 140-3 module is active (GODEBUG=fips140=on)",
 			},
 			&cli.IntFlag{
 				Name:    "port",
@@ -105,6 +143,101 @@ func main() {
 
 	if err := app.Run(os.Args); err != nil {
 		slog.Error("Error running app", slog.Any("error", err))
+		os.Exit(1)
+	}
+}
+
+// genkeyCommand generates a fresh ECDSA P-256 identity private key.
+func genkeyCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "genkey",
+		Usage: "Generate a new ECDSA P-256 identity private key (PKCS#8 PEM)",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "identity-key",
+				Aliases: []string{"o"},
+				Usage:   "Path to write the private key (default: stdout)",
+			},
+			&cli.BoolFlag{
+				Name:  "force",
+				Usage: "Overwrite an existing key file",
+			},
+		},
+		Action: func(c *cli.Context) error {
+			id, err := control.GenerateIdentity()
+			if err != nil {
+				return err
+			}
+			pemBytes, err := id.MarshalPrivatePEM()
+			if err != nil {
+				return err
+			}
+
+			path := c.String("identity-key")
+			if path == "" {
+				_, err = os.Stdout.Write(pemBytes)
+				return err
+			}
+
+			// Refuse to clobber an existing private key unless explicitly forced.
+			flags := os.O_CREATE | os.O_EXCL | os.O_WRONLY
+			if c.Bool("force") {
+				flags = os.O_CREATE | os.O_TRUNC | os.O_WRONLY
+			}
+			f, err := os.OpenFile(path, flags, 0o600)
+			if err != nil {
+				return fmt.Errorf("create identity key %q (use --force to overwrite): %w", path, err)
+			}
+			defer func() { _ = f.Close() }()
+			if _, err := f.Write(pemBytes); err != nil {
+				return err
+			}
+			pub, err := id.PublicKeyString()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "wrote identity key to %s\npublic key (share as the peer's --peer-key):\n%s\n", path, pub)
+			return nil
+		},
+	}
+}
+
+// pubkeyCommand derives the base64(SPKI) public key from an identity private key.
+func pubkeyCommand() *cli.Command {
+	return &cli.Command{
+		Name:  "pubkey",
+		Usage: "Print the public key (base64 SPKI) for an identity private key (from --identity-key or stdin)",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:    "identity-key",
+				Aliases: []string{"i"},
+				Usage:   "Path to the identity private key (default: read PEM from stdin)",
+			},
+		},
+		Action: func(c *cli.Context) error {
+			var (
+				data []byte
+				err  error
+			)
+			if path := c.String("identity-key"); path != "" {
+				data, err = os.ReadFile(path)
+			} else {
+				data, err = io.ReadAll(os.Stdin)
+			}
+			if err != nil {
+				return err
+			}
+			id, err := control.LoadIdentityPEM(data)
+			if err != nil {
+				return err
+			}
+			pub, err := id.PublicKeyString()
+			if err != nil {
+				return err
+			}
+			fmt.Println(pub)
+			return nil
+		},
 	}
 }
 
@@ -119,6 +252,23 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("invalid log level %q: %w", logLevel, err)
 	}
 	slog.SetLogLoggerLevel(level)
+
+	// Resolve the keying mode (static INI vs control plane) up front, fail-closed:
+	// exactly one must be configured, and there is no silent fallback between them.
+	keyFile := c.String("key-file")
+	identityKey := c.String("identity-key")
+	peerKey := c.String("peer-key")
+	mode, err := control.SelectMode(keyFile != "", identityKey != "", peerKey != "")
+	if err != nil {
+		return err
+	}
+
+	if c.String("interface") == "" {
+		return errors.New("--interface is required")
+	}
+	if c.Bool("require-fips") && !fips140.Enabled() {
+		return errors.New("--require-fips set but the Go FIPS 140-3 module is not active; build and run with GODEBUG=fips140=on")
+	}
 
 	if cpuProfilePath := c.String("cpu-profile"); cpuProfilePath != "" {
 		f, err := os.Create(cpuProfilePath)
@@ -160,7 +310,9 @@ func run(c *cli.Context) error {
 		}
 	}
 
-	ctx, cancel := signal.NotifyContext(c.Context, os.Interrupt, os.Kill)
+	// SIGINT for interactive use, SIGTERM for systemd/container stop. (os.Kill /
+	// SIGKILL cannot be caught, so registering it would be a no-op.)
+	ctx, cancel := signal.NotifyContext(c.Context, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	isNetAdmin, err := permissions.IsNetAdmin()
@@ -252,31 +404,88 @@ func run(c *cli.Context) error {
 		{Src: netip.MustParsePrefix("::/0"), Dst: netip.MustParsePrefix("::/0")},
 	}
 
-	if err := h.AddVirtualNetwork(c.Uint("vni"), peerAddr, allRoutes); err != nil {
+	vni := c.Uint("vni")
+	if err := h.AddVirtualNetwork(vni, peerAddr, allRoutes); err != nil {
 		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 
-	var (
-		epoch        uint32 = 1 // initial epoch
-		rxKey, txKey [16]byte
-		expiresAt    time.Time
-	)
+	// Keying: install the data-plane keys (and arrange ongoing rotation) according to
+	// the selected mode. tun is non-nil only in control-plane mode.
+	var tun *control.Tunnel
+	switch mode {
+	case control.ModeStatic:
+		if err := runStaticKeying(ctx, c, h, vni); err != nil {
+			return err
+		}
+	case control.ModeControlPlane:
+		var ctrlConn *net.UDPConn
+		tun, ctrlConn, err = startControlPlane(ctx, c, h, vni, peerUDPAddr)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tun.Close() }()
+		// The Tunnel only borrows the control socket; own its lifetime here.
+		defer func() { _ = ctrlConn.Close() }()
+	}
 
+	fwd, err := forwarder.NewForwarder(
+		h,
+		forwarder.WithPhyName(phyName),
+		forwarder.WithVirtName(vethDev.Peer.Attrs().Name),
+		forwarder.WithPhyFilter(ingressFilter),
+		forwarder.WithPcapWriter(pcapWriter),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create forwarder: %w", err)
+	}
+
+	// In control-plane mode, run the rekey loop and the forwarder under one errgroup
+	// sharing a cancel: a signal (ctx) or a forwarder error stops both. The control
+	// plane reconnects indefinitely on its own (Tunnel.Run does not return on CP
+	// failures), so it does not abort the forwarder; if it cannot re-establish, the
+	// data plane fails closed when the installed keys expire (see key lifetime below).
+	if tun != nil {
+		g, gctx := errgroup.WithContext(ctx)
+		g.Go(func() error { return tun.Run(gctx) })
+		g.Go(func() error {
+			if err := fwd.Start(gctx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("forwarder: %w", err)
+			}
+			return nil
+		})
+		if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+		return nil
+	}
+
+	if err := fwd.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("failed to start forwarder: %w", err)
+	}
+
+	return nil
+}
+
+// runStaticKeying installs the static INI keys and starts the SIGHUP reload loop.
+// This is the legacy path; it is gated to ModeStatic so a control-plane deployment
+// never has a competing installer touching the same VNI.
+func runStaticKeying(ctx context.Context, c *cli.Context, h *icx.Handler, vni uint) error {
 	keyFile := c.String("key-file")
-	rxKey, txKey, expiresAt, err = loadKeysFromINI(keyFile)
+	epoch := uint32(1) // initial epoch
+	rxKey, txKey, expiresAt, err := loadKeysFromINI(keyFile)
 	if err != nil {
 		return err
 	}
-
-	if err := h.UpdateVirtualNetworkKeys(c.Uint("vni"), epoch, rxKey, txKey, expiresAt); err != nil {
+	if err := h.UpdateVirtualNetworkKeys(vni, epoch, rxKey, txKey, expiresAt); err != nil {
 		return fmt.Errorf("failed to update virtual network key: %w", err)
 	}
+	slog.Warn("using static INI keys (legacy mode); prefer the control plane (--identity-key/--peer-key). " +
+		"A restart re-reads the INI at epoch 1 with the TX counter reset, so do not restart against an unchanged key file")
 
 	var keyMu sync.Mutex
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGHUP)
 
-	// SIGHUP reload handler.
 	go func() {
 		for {
 			select {
@@ -305,7 +514,7 @@ func run(c *cli.Context) error {
 				expiresAt = newExpires
 				epoch++
 
-				if err := h.UpdateVirtualNetworkKeys(c.Uint("vni"), epoch, rxKey, txKey, expiresAt); err != nil {
+				if err := h.UpdateVirtualNetworkKeys(vni, epoch, rxKey, txKey, expiresAt); err != nil {
 					slog.Error("Failed to apply reloaded keys", slog.Any("error", err))
 				} else {
 					slog.Info("Reloaded keys",
@@ -317,23 +526,100 @@ func run(c *cli.Context) error {
 			}
 		}
 	}()
-
-	fwd, err := forwarder.NewForwarder(
-		h,
-		forwarder.WithPhyName(phyName),
-		forwarder.WithVirtName(vethDev.Peer.Attrs().Name),
-		forwarder.WithPhyFilter(ingressFilter),
-		forwarder.WithPcapWriter(pcapWriter),
-	)
-	if err != nil {
-		return fmt.Errorf("failed to create forwarder: %w", err)
-	}
-
-	if err := fwd.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("failed to start forwarder: %w", err)
-	}
-
 	return nil
+}
+
+// startControlPlane builds the QUIC/mTLS control-plane tunnel and performs the
+// initial, fail-closed SA negotiation and install. The returned Tunnel's Run drives
+// ongoing rekeys; the caller is responsible for running it and closing the Tunnel.
+func startControlPlane(ctx context.Context, c *cli.Context, h *icx.Handler, vni uint, peerUDPAddr *net.UDPAddr) (*control.Tunnel, *net.UDPConn, error) {
+	controlPort := c.Int("control-port")
+	if controlPort == c.Int("port") {
+		return nil, nil, errors.New("--control-port must differ from the Geneve data port (--port); the XDP filter redirects the data port to AF_XDP and would blackhole the control plane")
+	}
+
+	ident, err := loadIdentity(c.String("identity-key"))
+	if err != nil {
+		return nil, nil, err
+	}
+	peerPub, err := readPeerKey(c.String("peer-key"))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ctrlNet := "udp4"
+	if peerUDPAddr.IP.To4() == nil {
+		ctrlNet = "udp6"
+	}
+	pconn, err := net.ListenUDP(ctrlNet, &net.UDPAddr{Port: controlPort})
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind control socket on port %d: %w", controlPort, err)
+	}
+
+	peerControlPort := c.Int("peer-control-port")
+	if peerControlPort == 0 {
+		peerControlPort = controlPort
+	}
+	peerControlAddr := &net.UDPAddr{IP: peerUDPAddr.IP, Port: peerControlPort}
+
+	rekeyIvl := c.Duration("rekey-interval")
+	// Bound the installed-key lifetime: long enough that a few missed rekeys do not
+	// drop traffic, short enough to fail closed if rotation stops, capped at the
+	// handler's recommended 24h rekey ceiling.
+	keyLifetime := 4 * rekeyIvl
+	if keyLifetime < time.Hour {
+		keyLifetime = time.Hour
+	}
+	if keyLifetime > 24*time.Hour {
+		keyLifetime = 24 * time.Hour
+	}
+
+	installer := func(epoch uint32, rxKey, txKey [16]byte) error {
+		return h.UpdateVirtualNetworkKeys(vni, epoch, rxKey, txKey, time.Now().Add(keyLifetime))
+	}
+
+	tun, err := control.NewTunnel(control.TunnelConfig{
+		Local:         ident,
+		PeerPub:       peerPub,
+		Conn:          pconn,
+		PeerAddr:      peerControlAddr,
+		RekeyInterval: rekeyIvl,
+	}, installer)
+	if err != nil {
+		_ = pconn.Close()
+		return nil, nil, err
+	}
+
+	slog.Info("establishing control plane",
+		slog.String("peer-control", peerControlAddr.String()),
+		slog.Bool("initiator", tun.Initiator()),
+		slog.Duration("rekey-interval", rekeyIvl),
+	)
+	if err := tun.Bringup(ctx); err != nil {
+		_ = tun.Close()
+		_ = pconn.Close()
+		return nil, nil, fmt.Errorf("control plane bring-up failed: %w", err)
+	}
+	return tun, pconn, nil
+}
+
+// loadIdentity reads and parses this node's identity private key from a PEM file.
+func loadIdentity(path string) (*control.Identity, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read identity key %q: %w", path, err)
+	}
+	return control.LoadIdentityPEM(data)
+}
+
+// readPeerKey resolves a --peer-key value, which may be the base64(SPKI) string
+// directly or a path to a file containing it.
+func readPeerKey(val string) (*ecdsa.PublicKey, error) {
+	s := strings.TrimSpace(val)
+	if data, err := os.ReadFile(val); err == nil {
+		s = strings.TrimSpace(string(data))
+	}
+	return control.ParsePublicKey(s)
 }
 
 // loadKeysFromINI loads rx/tx (hex, 16-byte each) and optional expires from an INI file.
