@@ -73,9 +73,10 @@
 //
 // Linux-only. The ring atomics (ring.go), the allocator (umem.go), and the
 // setup/bind wiring (setup_linux.go) are validated on a real aarch64 kernel by
-// afxdp_linux_test.go (run via scripts/test-xsk.sh): NewUMEM/NewSocket, the
-// shared cross-device bind, Fill, and Transmit->Complete all pass. NOT YET DONE:
-// the RX path needs an XDP redirect program (xsks_map) to steer packets into a
-// socket — covered when the forwarder is ported and filter absorbs the program
-// glue (dropping xdp.Program). Then the forwarder moves onto this package.
+// afxdp_linux_test.go (run via `dagger call test`): NewUMEM/NewSocket, the
+// shared cross-device bind, Fill, and Transmit->Complete all pass. The RX path
+// (an XDP redirect program — xsks_map — steering packets into a socket) is wired
+// via the filter package and exercised end-to-end by the forwarder over veth
+// (forwarder RX-headroom and crypto round-trip tests), which now runs entirely
+// on this package.
 package xsk

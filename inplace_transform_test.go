@@ -425,11 +425,10 @@ func TestInPlaceToPhyByteEquivalence(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			tc := inplaceTestCase{underlayV6: underlayV6, innerV6: false, layer3: true, payloadLen: 1}
-			env := newInplaceEnv(t, tc)
 			interval := 10 * time.Second
-			// Reconfigure the handler with a keep-alive interval. newInplaceEnv
-			// did not set one, so build a dedicated handler here.
-			env = newInplaceEnvKeepAlive(t, tc, interval)
+			// newInplaceEnv does not set a keep-alive interval, so build a
+			// dedicated handler that has one.
+			env := newInplaceEnvKeepAlive(t, tc, interval)
 
 			// Reference: two-buffer ToPhy with the counter pinned to 0.
 			env.pinCounter(0)

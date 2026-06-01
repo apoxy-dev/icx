@@ -15,7 +15,7 @@ import (
 // Real-kernel integration tests for the AF_XDP setup path (NewUMEM/NewSocket,
 // ring mmaps, shared-UMEM bind, Fill/Transmit/Complete). They require
 // CAP_NET_ADMIN and a kernel with CONFIG_XDP_SOCKETS; run them in a privileged
-// Linux container (scripts/test-xsk.sh) — skipped otherwise.
+// container via `dagger call test` — skipped otherwise.
 //
 // They exercise the syscall/mmap/bind wiring directly, on ARM64 under
 // OrbStack/colima — the weak-memory arch the old slavc/xdp failed on. The RX

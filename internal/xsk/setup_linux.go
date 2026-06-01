@@ -11,9 +11,10 @@ import (
 )
 
 // AF_XDP/XSK syscall + mmap + bind wiring, validated on a real Linux kernel by
-// the integration tests in afxdp_linux_test.go (run via scripts/test-xsk.sh,
-// which uses a privileged aarch64 Linux container — the weak-memory arch the old
-// slavc/xdp failed on).
+// the integration tests in afxdp_linux_test.go (run via `dagger call test`,
+// which runs the suite in a privileged container on a real kernel — and in CI on
+// both amd64 and arm64, the latter being the weak-memory arch the old slavc/xdp
+// failed on).
 //
 // Model (libbpf, confirmed empirically): the UMEM is registered on an AF_XDP fd
 // (regFD). The FIRST Socket reuses regFD and binds normally; every later Socket

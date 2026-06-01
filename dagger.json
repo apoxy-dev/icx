@@ -1,0 +1,9 @@
+{
+  "name": "icx",
+  "engineVersion": "v0.19.10",
+  "sdk": {
+    "source": "go"
+  },
+  "source": "ci",
+  "disableDefaultFunctionCaching": true
+}

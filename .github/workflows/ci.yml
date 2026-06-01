@@ -10,7 +10,10 @@ on:
 jobs:
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    # Depot runner with the Dagger engine pinned to the dagger.json engineVersion
+    # (same convention as apoxy-cli / apoxy-cloud). The CLI is pre-installed by the
+    # ,dagger=<ver> label suffix; no install step is needed.
+    runs-on: depot-ubuntu-22.04-16,dagger=0.19.10
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -21,16 +24,28 @@ jobs:
           go-version: '1.25.x'
           check-latest: true
 
-      - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: latest
-          args: --timeout=5m
+      - name: Run golangci-lint via Dagger
+        env:
+          SHUTUP: 1
+        run: dagger call -v lint --src=.
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.arch }})
     needs: lint
+    # Run the full suite — including the AF_XDP/XSK and forwarder integration
+    # tests that need a real kernel + NET_ADMIN — on BOTH amd64 and arm64. The
+    # arm64 leg covers the weak-memory aarch64 datapath the old slavc/xdp binding
+    # broke on, which previously was only ever exercised by a developer running
+    # scripts/test-xsk.sh locally.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: depot-ubuntu-22.04-16,dagger=0.19.10
+            arch: amd64
+          - runner: depot-ubuntu-22.04-arm-16,dagger=0.19.10
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -41,22 +56,14 @@ jobs:
           go-version: '1.25.x'
           check-latest: true
 
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Build
-        run: go build ./...
-
-      - name: Test
-        # Run tests with sudo for NET_ADMIN capability
-        run: sudo -E go test -v -race -cover ./...
+      - name: Run tests via Dagger
+        env:
+          SHUTUP: 1
+        timeout-minutes: 20
+        # The Test function runs `go test -race ./...` with InsecureRootCapabilities
+        # so it can create veth pairs, load the XDP redirect program and bind AF_XDP
+        # sockets on the runner's real kernel.
+        run: dagger call -v test --src=.
 
   build-cli:
     name: Build icx (${{ matrix.goarch }})
