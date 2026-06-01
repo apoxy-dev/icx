@@ -124,6 +124,22 @@ var socketOpts = xsk.Options{
 	TxRingNumDescs:         4096,
 }
 
+// minInPlaceHeadroom is the largest outer-header prepend the in-place encap
+// performs: udp.PayloadOffsetIPv6 (62) + the fixed 32-byte Geneve header = 94
+// bytes. The zero-copy datapath rests on the kernel leaving at least this many
+// bytes of in-frame headroom before RX data; in aligned mode with
+// UmemReg.Headroom == 0 that reserve is XDP_PACKET_HEADROOM (256), asserted by
+// TestForwarderRXHeadroom. VirtToPhyInPlace's own phyStart < 0 guard keeps a
+// short headroom from corrupting memory, but it would degrade SILENTLY into a
+// 100% encap drop. forwardInPlace asserts the real, kernel-produced offset
+// against this floor so that ABI violation is loud once instead of invisible.
+const minInPlaceHeadroom = 94
+
+// headroomWarnOnce ensures the headroom-floor violation is logged at most once
+// per process: if the kernel ever grants too little headroom it does so for
+// every frame, and a per-packet log would flood.
+var headroomWarnOnce sync.Once
+
 // Forwarder splices frames between a physical and a virtual interface using XDP sockets.
 // It uses a handler to convert frames between the two interfaces.
 type Forwarder struct {
@@ -525,6 +541,19 @@ func (f *Forwarder) forwardInPlace(
 	fwd, back, free = fwd[:0], back[:0], free[:0]
 	for _, d := range rxDescs {
 		base, off := frameBaseOff(d.Addr)
+		if off < minInPlaceHeadroom {
+			// The kernel granted less RX headroom than the in-place encap needs
+			// to prepend the outer Eth/IP/UDP + Geneve headers. The encap path's
+			// phyStart < 0 guard keeps this memory-safe, but every outbound packet
+			// would then drop silently. Make the ABI violation loud (once) rather
+			// than fail invisibly forever; the decap direction does not depend on
+			// this floor, so keep forwarding.
+			headroomWarnOnce.Do(func() {
+				slog.Error("RX headroom below in-place encap floor; check UMEM registration / XDP mode",
+					slog.Int("inFrameOffset", off),
+					slog.Int("required", minInPlaceHeadroom))
+			})
+		}
 		buf := umem.FrameFull(d)
 		if buf == nil {
 			// Foreign/malformed descriptor; return it to the pool.

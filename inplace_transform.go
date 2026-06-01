@@ -47,6 +47,15 @@ import (
 // dropWindow is the sentinel returned on every drop path: a zero-length window.
 const dropWindowOffset = 0
 
+// geneveHdrLen is the fixed marshalled size of the handler's 2-option Geneve
+// header (8 base + 8 epoch option + 16 txcounter option = 32 bytes). The
+// in-place encap reserves exactly this much headroom before the inner IP packet
+// (geneveStart = ipStart - geneveHdrLen) BEFORE it marshals the header, then
+// verifies the real marshal length matches at runtime in VirtToPhyInPlace.
+// TestGeneveHdrLenMatchesConstant pins it against the geneve package so a change
+// to the option encoding fails the build instead of silently dropping frames.
+const geneveHdrLen = 32
+
 // PhyToVirtInPlace performs decapsulation IN PLACE within buf.
 //
 // On entry, buf[off:off+length] holds the physical frame
@@ -238,6 +247,15 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// 42 (IPv4) / 62 (IPv6) bytes plus the 32-byte Geneve header, far exceeding
 	// the 14-byte Ethernet header.
 	ethStart := ctStart - header.EthernetMinimumSize
+	if ethStart < 0 {
+		// Defensive: mirrors the encap path's phyStart < 0 guard. The consumed
+		// outer + Geneve headers (>= 42 + 32 bytes) always exceed the 14-byte
+		// Ethernet header, so for a well-formed frame this is unreachable — but
+		// guard rather than index out of bounds on a malformed one.
+		slog.Warn("Insufficient headroom for in-place L2 prepend")
+		vnet.Stats.RXInvalidSrc.Add(1)
+		return dropWindowOffset, 0
+	}
 	eth := header.Ethernet(buf[ethStart : ethStart+header.EthernetMinimumSize])
 	eth.Encode(&header.EthernetFields{
 		SrcAddr: h.opts.srcMAC,
@@ -476,7 +494,6 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	// Geneve header sits at [geneveStart, geneveStart+hdrLen) == buf region
 	// immediately before ipStart. Marshal it there; the AAD for Seal is exactly
 	// that region.
-	const geneveHdrLen = 32 // fixed for the handler's 2-option (epoch+txcounter) header
 	geneveStart := ipStart - geneveHdrLen
 	phyStart := geneveStart - payloadOffset
 	if phyStart < 0 {
