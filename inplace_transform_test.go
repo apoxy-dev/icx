@@ -185,10 +185,13 @@ func newInplaceEnv(t *testing.T, tc inplaceTestCase) *inplaceEnv {
 
 	// Use a single key for both RX and TX so that frames encrypted with the TX
 	// cipher can be decrypted with the RX cipher (the round-trip and decap
-	// equivalence tests run encap then decap on the same handler).
+	// equivalence tests run encap then decap on the same handler). This loopback
+	// shape requires the unguarded InstallKeysForTest seam: the production
+	// UpdateVirtualNetworkKeys rejects equal rx/tx keys (real peers use distinct
+	// per-direction keys).
 	key := generateKey(t)
 	require.NoError(t, h.AddVirtualNetwork(vni, remoteAddr, routes))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, key, key, time.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(vni, 1, key, key, time.Now().Add(time.Hour)))
 
 	vnet, ok := h.GetVirtualNetwork(vni)
 	require.True(t, ok)
@@ -482,7 +485,7 @@ func newInplaceEnvKeepAlive(t *testing.T, tc inplaceTestCase, interval time.Dura
 	}}
 	key := generateKey(t)
 	require.NoError(t, h.AddVirtualNetwork(vni, remoteAddr, routes))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, key, key, time.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(vni, 1, key, key, time.Now().Add(time.Hour)))
 	vnet, ok := h.GetVirtualNetwork(vni)
 	require.True(t, ok)
 

@@ -30,16 +30,17 @@ import (
 // forwarder decapsulates it in place and emits the recovered inner packet on the
 // virt interface, byte-for-byte.
 //
-// Construction (single self-keyed handler, option (b1) from the test plan):
-//   - One *icx.Handler with a single shared key and one route whose Src and Dst
-//     both cover the inner addresses, so a frame its two-buffer VirtToPhy encaps
-//     can be decapped by its in-place PhyToVirtInPlace (decap looks the vnet up
-//     by VNI and validates the inner source against route.Dst; it does NOT check
-//     the outer underlay source, so a self-encap/decap loop is valid).
-//   - The encap is done OFFLINE with VirtToPhy to mint a real encrypted frame;
-//     the frame is injected via a raw AF_PACKET socket on the phy peer (the same
-//     XDP-redirect primitive TestForwarderRXHeadroom uses), and the decapped
-//     inner frame is read with a second raw socket on the virt peer.
+// Construction (two peer handlers — the production model, since
+// UpdateVirtualNetworkKeys rejects equal rx/tx keys):
+//   - encapH mints genuinely-encrypted frames OFFLINE with VirtToPhy using
+//     txKey == abKey; the forwarder's handler h decapsulates them in place with
+//     rxKey == abKey. Both share one VNI and a route whose Src and Dst cover the
+//     inner addresses, so encap routing and decap source validation both pass
+//     (decap looks the vnet up by VNI and validates the inner source against
+//     route.Dst; it does NOT check the outer underlay source).
+//   - The minted frame is injected via a raw AF_PACKET socket on the phy peer
+//     (the same XDP-redirect primitive TestForwarderRXHeadroom uses), and the
+//     decapped inner frame is read with a second raw socket on the virt peer.
 func TestForwarderCryptoRoundTrip(t *testing.T) {
 	netAdmin, _ := permissions.IsNetAdmin()
 	if !netAdmin {
@@ -78,20 +79,38 @@ func TestForwarderCryptoRoundTrip(t *testing.T) {
 		LinkAddr: tcpip.LinkAddress("\x02\x00\x00\x00\x0a\x02"),
 	}
 
+	const vni uint = 0x1234
+	prefix := netip.MustParsePrefix("10.99.0.0/24")
+	routes := []icx.Route{{Src: prefix, Dst: prefix}}
+
+	// Two handlers model the two real peers. The A->B direction key (abKey) is
+	// shared, but each peer's own rx/tx keys differ — UpdateVirtualNetworkKeys
+	// rejects equal rx/tx keys, since in the shared-epoch nonce layout the key is
+	// the only thing separating the two directions' nonce spaces.
+	var abKey, encapRx, hTx [16]byte
+	copy(abKey[:], []byte("icx-roundtrip-k!"))
+	copy(encapRx[:], []byte("icx-encap-rxkey!"))
+	copy(hTx[:], []byte("icx-decap-txkey!"))
+	expires := time.Now().Add(time.Hour)
+
+	// h: the forwarder's handler. It decapsulates inbound frames with rxKey=abKey.
 	h, err := icx.NewHandler(
 		icx.WithLocalAddr(localUnderlay),
 		icx.WithVirtMAC(virtMAC),
 	)
 	require.NoError(t, err)
+	require.NoError(t, h.AddVirtualNetwork(vni, remoteUnderlay, routes))
+	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, abKey, hTx, expires))
 
-	const vni uint = 0x1234
-	prefix := netip.MustParsePrefix("10.99.0.0/24")
-	require.NoError(t, h.AddVirtualNetwork(vni, remoteUnderlay,
-		[]icx.Route{{Src: prefix, Dst: prefix}}))
-
-	var key [16]byte
-	copy(key[:], []byte("icx-roundtrip-k!"))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, key, key, time.Now().Add(time.Hour)))
+	// encapH: an offline peer used only to mint genuinely-encrypted frames with
+	// txKey=abKey (so h can decrypt them); it is never wired to the forwarder.
+	encapH, err := icx.NewHandler(
+		icx.WithLocalAddr(localUnderlay),
+		icx.WithVirtMAC(virtMAC),
+	)
+	require.NoError(t, err)
+	require.NoError(t, encapH.AddVirtualNetwork(vni, remoteUnderlay, routes))
+	require.NoError(t, encapH.UpdateVirtualNetworkKeys(vni, 1, encapRx, abKey, expires))
 
 	// Build the forwarder with the REAL handler (not the identity pipe).
 	fwd, err := forwarder.NewForwarder(h,
@@ -162,7 +181,7 @@ func TestForwarderCryptoRoundTrip(t *testing.T) {
 		// counter, so every injected frame carries a unique nonce and clears the
 		// replay filter.
 		phyBuf := make([]byte, 2048)
-		n, handled := h.VirtToPhy(virtFrame, phyBuf)
+		n, handled := encapH.VirtToPhy(virtFrame, phyBuf)
 		require.Greater(t, n, 0, "offline encap produced no frame")
 		require.False(t, handled)
 		enc := phyBuf[:n]

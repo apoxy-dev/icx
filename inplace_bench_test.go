@@ -55,8 +55,8 @@ func newBenchEnv(b *testing.B, tc inplaceTestCase) *inplaceEnv {
 	if err := h.AddVirtualNetwork(vni, remoteAddr, routes); err != nil {
 		b.Fatalf("AddVirtualNetwork: %v", err)
 	}
-	if err := h.UpdateVirtualNetworkKeys(vni, 1, key, key, time.Now().Add(time.Hour)); err != nil {
-		b.Fatalf("UpdateVirtualNetworkKeys: %v", err)
+	if err := h.InstallKeysForTest(vni, 1, key, key, time.Now().Add(time.Hour)); err != nil {
+		b.Fatalf("InstallKeysForTest: %v", err)
 	}
 	vnet, ok := h.GetVirtualNetwork(vni)
 	if !ok {

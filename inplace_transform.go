@@ -109,7 +109,14 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		if opt.Class == geneve.ClassExperimental {
 			switch opt.Type {
 			case geneve.OptionTypeTxCounter:
-				nonce = opt.Value[:12]
+				// Require the declared 12-byte (Length=3) value so nonce[:4] (the
+				// SPI) and the counter are provably sender-written, not stale pooled
+				// bytes from a short/malformed option — keeps the SPI-mismatch drop
+				// attribution honest. A wrong length leaves nonce nil → the
+				// "Expected TX counter" drop below. Mirrors PhyToVirt exactly.
+				if opt.Length == 3 {
+					nonce = opt.Value[:12]
+				}
 			case geneve.OptionTypeKeyEpoch:
 				epoch = binary.BigEndian.Uint32(opt.Value[:4])
 			}
@@ -134,6 +141,19 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		vnet.Stats.RXDropsExpiredKey.Add(1)
 		// Delete expired key (to free key material from memory)
 		vnet.rxCiphers.Delete(epoch)
+		return dropWindowOffset, 0
+	}
+
+	// Verify the SPI bound into the nonce matches the epoch that selected this
+	// SA (nonce = SPI‖counter). A conformant sender always sets nonce[:4] to the
+	// key epoch; a mismatch is a malformed or tampered frame. GCM would also
+	// reject it at Open (the nonce and the header both feed the tag), but the
+	// explicit check makes the binding auditable and gives a precise drop reason.
+	// (APO-644). Mirrors PhyToVirt exactly to preserve byte-equivalence.
+	if spi := binary.BigEndian.Uint32(nonce[:4]); spi != epoch {
+		slog.Debug("Dropping frame: nonce SPI does not match key epoch",
+			slog.Uint64("epoch", uint64(epoch)), slog.Uint64("nonceSPI", uint64(spi)))
+		vnet.Stats.RXDropsSPIMismatch.Add(1)
 		return dropWindowOffset, 0
 	}
 
@@ -471,7 +491,14 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		return dropWindowOffset, 0, false
 	}
 
+	// nonce = epoch‖counter: bind the 32-bit SPI (key epoch) into the high 4
+	// bytes. Under the shared-epoch model this prefix is identical for both
+	// directions, so it does not separate them (the distinct rx/tx keys do); its
+	// value here is letting RX reject a tampered/mismatched SPI and forward-compat
+	// with per-direction SPIs. The low 8 bytes are the per-SA monotonic counter.
+	// Must match the cross-buffer VirtToPhy/ToPhy nonce layout exactly.
 	nonce := hdr.Options[1].Value[:12]
+	binary.BigEndian.PutUint32(nonce[:4], txCipher.epoch)
 	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
 	switch ipVersion {
@@ -690,7 +717,14 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 
 	// Fill options: epoch + nonce/counter
 	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], txCipher.epoch)
+	// nonce = epoch‖counter: bind the 32-bit SPI (key epoch) into the high 4
+	// bytes. Under the shared-epoch model this prefix is identical for both
+	// directions, so it does not separate them (the distinct rx/tx keys do); its
+	// value here is letting RX reject a tampered/mismatched SPI and forward-compat
+	// with per-direction SPIs. The low 8 bytes are the per-SA monotonic counter.
+	// Must match the cross-buffer VirtToPhy/ToPhy nonce layout exactly.
 	nonce := hdr.Options[1].Value[:12]
+	binary.BigEndian.PutUint32(nonce[:4], txCipher.epoch)
 	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
 	// Place Geneve payload inside outer UDP frame.

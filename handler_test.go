@@ -13,6 +13,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 
 	"github.com/apoxy-dev/icx"
+	"github.com/apoxy-dev/icx/udp"
 )
 
 func TestHandler(t *testing.T) {
@@ -47,7 +48,7 @@ func TestHandler(t *testing.T) {
 	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.Route{{Src: wildcardPrefix, Dst: wildcardPrefix}})
 	require.NoError(t, err)
 
-	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
+	err = h.InstallKeysForTest(0x12345, 1, key, key, time.Now().Add(time.Hour))
 	require.NoError(t, err)
 
 	virtFrame := makeIPv4UDPEthernetFrame(virtMAC)
@@ -110,7 +111,7 @@ func TestHandler_Layer3(t *testing.T) {
 	err = h.AddVirtualNetwork(0x12345, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
 
-	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
+	err = h.InstallKeysForTest(0x12345, 1, key, key, time.Now().Add(time.Hour))
 	require.NoError(t, err)
 
 	ipPacket := makeIPv4UDPPacket()
@@ -151,7 +152,7 @@ func TestHandler_Layer3_IPv6(t *testing.T) {
 	// Prefix contains src 2001:db8::1
 	privatePrefix := netip.MustParsePrefix("2001:db8::/64")
 	require.NoError(t, h.AddVirtualNetwork(0x45678, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}}))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(0x45678, 1, key, key, time.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(0x45678, 1, key, key, time.Now().Add(time.Hour)))
 
 	ip6 := makeIPv6UDPPacket()
 	phy := make([]byte, 1500)
@@ -189,7 +190,7 @@ func TestUpdateVirtualNetworkRoutes(t *testing.T) {
 	privatePrefix := netip.MustParsePrefix("192.168.1.0/24")
 	err = h.AddVirtualNetwork(0x23456, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(t, err)
-	require.NoError(t, h.UpdateVirtualNetworkKeys(0x23456, 1, key, key, time.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(0x23456, 1, key, key, time.Now().Add(time.Hour)))
 
 	virt := makeIPv4UDPEthernetFrame(tcpip.GetRandMacAddr())
 	phy := make([]byte, 1500)
@@ -249,7 +250,7 @@ func TestKeyRotation(t *testing.T) {
 	require.NoError(t, h.AddVirtualNetwork(vni, peer, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}}))
 
 	// Epoch 1
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k1, clk.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(vni, 1, k1, k1, clk.Now().Add(time.Hour)))
 
 	ip := makeIPv4UDPPacket()
 	phy := make([]byte, 2000)
@@ -267,7 +268,7 @@ func TestKeyRotation(t *testing.T) {
 	epoch1B := append([]byte(nil), phy[:n]...)
 
 	// Rotate to epoch 2; epoch 1 gets grace
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 2, k2, k2, clk.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(vni, 2, k2, k2, clk.Now().Add(time.Hour)))
 
 	// Within grace: one of the saved epoch-1 frames must decrypt.
 	m := h.PhyToVirt(epoch1A, out)
@@ -286,13 +287,13 @@ func TestKeyRotation(t *testing.T) {
 	epoch2A := append([]byte(nil), phy[:n]...)
 
 	// Rotate to epoch 3 (starts grace for epoch 2)
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 3, k3, k3, clk.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(vni, 3, k3, k3, clk.Now().Add(time.Hour)))
 
 	// Let epoch-2 grace expire.
 	clk.Advance(31 * time.Second)
 
 	// Rotate to epoch 4; expired RX keys should be swept here
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 4, k4, k4, clk.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(vni, 4, k4, k4, clk.Now().Add(time.Hour)))
 
 	// The saved epoch-2 frame should now be rejected (no matching key after cleanup).
 	m = h.PhyToVirt(epoch2A, out[:cap(out)])
@@ -305,6 +306,114 @@ func TestKeyRotation(t *testing.T) {
 	m = h.PhyToVirt(phy[:n], out[:cap(out)])
 	require.Equal(t, len(ip), m)
 	require.Equal(t, ip, out[:m])
+}
+
+// TestUpdateVirtualNetworkKeysGuards exercises the two fail-closed guards on the
+// production key-install seam: the epoch (SPI) must strictly increase, and the
+// rx/tx keys must differ.
+func TestUpdateVirtualNetworkKeysGuards(t *testing.T) {
+	localAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()), Port: 1234}
+	peerAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()), Port: 4321}
+
+	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr), icx.WithLayer3VirtFrames())
+	require.NoError(t, err)
+
+	const vni = 0x9999
+	prefix := netip.MustParsePrefix("192.168.1.0/24")
+	require.NoError(t, h.AddVirtualNetwork(vni, peerAddr, []icx.Route{{Src: prefix, Dst: prefix}}))
+
+	var k1, k2 [16]byte
+	copy(k1[:], []byte("aaaaaaaaaaaaaaaa"))
+	copy(k2[:], []byte("bbbbbbbbbbbbbbbb"))
+	exp := time.Now().Add(time.Hour)
+
+	// Equal rx/tx keys are rejected even on the first install.
+	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k1, exp),
+		"equal rx/tx keys must be rejected")
+
+	// epoch 0 (reserved SPI) is rejected.
+	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 0, k1, k2, exp),
+		"epoch 0 (reserved SPI) must be rejected")
+
+	// Distinct keys with a fresh, non-zero epoch succeed.
+	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k2, exp))
+
+	// Reinstalling the same epoch is rejected (must strictly increase).
+	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 1, k2, k1, exp),
+		"same epoch must be rejected (monotonicity)")
+
+	// A higher epoch with distinct keys succeeds.
+	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 3, k2, k1, exp))
+
+	// A non-zero epoch lower than the current one is rejected (monotonicity).
+	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 2, k1, k2, exp),
+		"lower epoch must be rejected (monotonicity)")
+}
+
+// TestRXRejectsSPINonceMismatch proves the RX side rejects a frame whose nonce
+// SPI (nonce[:4]) does not match the key epoch it selected, on BOTH the
+// cross-buffer and in-place decap paths, and that TX binds the SPI into the
+// nonce in the first place (the offset sanity checks below).
+func TestRXRejectsSPINonceMismatch(t *testing.T) {
+	localAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()), Port: 1234}
+	peerAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()), Port: 4321}
+
+	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr), icx.WithLayer3VirtFrames())
+	require.NoError(t, err)
+
+	const vni = 0x1234
+	prefix := netip.MustParsePrefix("192.168.1.0/24")
+	require.NoError(t, h.AddVirtualNetwork(vni, peerAddr, []icx.Route{{Src: prefix, Dst: prefix}}))
+
+	var key [16]byte
+	copy(key[:], []byte("0123456789abcdef"))
+	// Loopback (single shared key) so this one handler both encaps and decaps;
+	// the production seam would reject equal rx/tx keys.
+	require.NoError(t, h.InstallKeysForTest(vni, 1, key, key, time.Now().Add(time.Hour)))
+
+	// Mint a real encrypted frame; TX binds epoch 1 into nonce[:4].
+	ip := makeIPv4UDPPacket()
+	phy := make([]byte, 1500)
+	n, loop := h.VirtToPhy(ip, phy)
+	require.NotZero(t, n)
+	require.False(t, loop)
+
+	// The Geneve header sits at the UDP payload offset; its layout is
+	// base(8) + KeyEpoch option(hdr 4 + value 4) + TxCounter option(hdr 4 + value 12).
+	// So the key-epoch value and the nonce (= TxCounter value, nonce[:4] = SPI)
+	// live at these absolute offsets within the IPv4-underlay physical frame.
+	const geneveBase, optHdr, epochValLen = 8, 4, 4
+	keyEpochOff := udp.PayloadOffsetIPv4 + geneveBase + optHdr
+	nonceOff := keyEpochOff + epochValLen + optHdr
+	require.Equal(t, uint32(1), binary.BigEndian.Uint32(phy[keyEpochOff:keyEpochOff+4]),
+		"sanity: key-epoch option should carry epoch 1")
+	require.Equal(t, uint32(1), binary.BigEndian.Uint32(phy[nonceOff:nonceOff+4]),
+		"TX must bind the SPI (epoch 1) into nonce[:4]")
+
+	// Tamper nonce[:4] so it no longer matches the key epoch (which stays 1, so
+	// the RX side still selects the installed cipher and reaches the SPI check).
+	tampered := append([]byte(nil), phy[:n]...)
+	tampered[nonceOff] = 0xFF
+	require.NotEqual(t, uint32(1), binary.BigEndian.Uint32(tampered[nonceOff:nonceOff+4]))
+	require.Equal(t, uint32(1), binary.BigEndian.Uint32(tampered[keyEpochOff:keyEpochOff+4]),
+		"key epoch must remain 1 so the SPI check, not the key lookup, rejects the frame")
+
+	vnet, ok := h.GetVirtualNetwork(vni)
+	require.True(t, ok)
+
+	// Cross-buffer decap drops it and counts an SPI mismatch.
+	out := make([]byte, 1500)
+	require.Zero(t, h.PhyToVirt(append([]byte(nil), tampered...), out))
+	require.Equal(t, uint64(1), vnet.Stats.RXDropsSPIMismatch.Load())
+
+	// In-place decap drops it identically (placed at a non-zero offset).
+	buf := make([]byte, len(tampered)+256)
+	const off = 64
+	copy(buf[off:off+len(tampered)], tampered)
+	gotOff, gotLen := h.PhyToVirtInPlace(buf, off, len(tampered))
+	require.Zero(t, gotLen)
+	require.Zero(t, gotOff)
+	require.Equal(t, uint64(2), vnet.Stats.RXDropsSPIMismatch.Load())
 }
 
 func TestARPRequest_Loopback(t *testing.T) {
@@ -378,7 +487,7 @@ func TestNeighborSolicitation_Loopback(t *testing.T) {
 
 	privatePrefix := netip.MustParsePrefix("2001:db8::/64")
 	require.NoError(t, h.AddVirtualNetwork(0x56789, peerAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}}))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(0x56789, 1, key, key, time.Now().Add(time.Hour)))
+	require.NoError(t, h.InstallKeysForTest(0x56789, 1, key, key, time.Now().Add(time.Hour)))
 
 	nsFrame := makeIPv6NeighborSolicitationEthernetFrame()
 	phy := make([]byte, 2000)
@@ -450,7 +559,7 @@ func BenchmarkHandler(b *testing.B) {
 	err = h.AddVirtualNetwork(vni, remoteAddr, []icx.Route{{Src: privatePrefix, Dst: privatePrefix}})
 	require.NoError(b, err)
 
-	err = h.UpdateVirtualNetworkKeys(0x12345, 1, key, key, time.Now().Add(time.Hour))
+	err = h.InstallKeysForTest(0x12345, 1, key, key, time.Now().Add(time.Hour))
 	require.NoError(b, err)
 
 	virtMAC := tcpip.GetRandMacAddr()

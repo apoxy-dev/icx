@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -45,6 +46,10 @@ type Statistics struct {
 	RXReplayDrops atomic.Uint64
 	// RXDecryptErrors is the number of received packets that failed decryption.
 	RXDecryptErrors atomic.Uint64
+	// RXDropsSPIMismatch is the number of received packets dropped because the
+	// SPI bound into the AEAD nonce (nonce[:4]) did not match the key epoch the
+	// frame selected — a malformed or tampered frame (APO-644).
+	RXDropsSPIMismatch atomic.Uint64
 	// RXInvalidSrc is the number of received packets with an invalid source address.
 	RXInvalidSrc atomic.Uint64
 	// TXPackets is the number of transmitted packets.
@@ -347,9 +352,27 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 	return nil
 }
 
-// UpdateVirtualNetworkKeys sets/rotates the encryption keys for a virtual network.
-// This must be called atleast once every 24 hours or after `replay.RekeyAfterMessages`
-// messages. The epoch must be a monotonically increasing value.
+// UpdateVirtualNetworkKeys sets/rotates the encryption keys for a virtual
+// network. It must be called at least once every 24 hours or after
+// replay.RekeyAfterMessages messages.
+//
+// epoch is the 32-bit SPI that selects this security association: it is carried
+// in the Geneve key-epoch option and bound into the high 4 bytes of the AES-GCM
+// nonce (nonce = epoch‖counter). Under the current shared-epoch model the same
+// epoch is used for both simplex directions, so the SPI prefix does NOT separate
+// them — the distinct rx/tx keys do (see the guards below). The SPI binding's
+// value is RX tamper-rejection/auditability and forward-compatibility with
+// per-direction SPIs.
+//
+// Three fail-closed guards require a non-zero epoch, a strictly increasing
+// epoch, and rxKey != txKey. IMPORTANT: the monotonicity guard compares against
+// in-memory state, so it holds only within a single process lifetime — it cannot
+// detect an epoch reused across a restart. Restart safety therefore depends on
+// the caller never reusing an (epoch, key) pair: with ephemeral per-session keys
+// (the control plane, Phase 4) a restart yields fresh keys and is safe; with
+// static persisted keys it is NOT safe absent durable epoch/counter state (the
+// residual APO-644 case). Callers must also serialize installs per VNI; the
+// guard→install sequence is not internally locked.
 func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
@@ -357,6 +380,41 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 	}
 	vnet := value.(*VirtualNetwork)
 
+	// Reserved-SPI guard: epoch 0 is reserved. Rejecting it keeps the data
+	// plane's accepted SPI space aligned with the control plane, which never
+	// emits an SPI whose low 31 bits are zero (control/sa.go), and refuses to
+	// write the all-zero nonce prefix that predated the SPI binding.
+	if epoch == 0 {
+		return errors.New("epoch (SPI) must be non-zero")
+	}
+
+	// Monotonicity guard: within this process the epoch (SPI) must strictly
+	// increase. Reinstalling under a live or older SPI would reset that SA's TX
+	// counter and replay window while its key — and thus its nonce space — has
+	// already been used (a GCM nonce-reuse hazard). This covers in-process
+	// re-install/rotation only; cross-restart safety is discussed in the doc above.
+	if cur := vnet.txCipher.Load(); cur != nil && epoch <= cur.epoch {
+		return fmt.Errorf("epoch must be monotonically increasing: new %d <= current %d", epoch, cur.epoch)
+	}
+
+	// Distinct-key guard: both simplex directions share the epoch, so the SPI in
+	// the nonce is identical inbound and outbound. The only thing separating the
+	// two directions' (key, nonce) spaces is then the key itself; equal rx/tx
+	// keys would collide nonces under one key — catastrophic for AES-GCM. Real
+	// peers always derive distinct per-direction keys (control.DeriveSA over
+	// role-partitioned SPIs).
+	if rxKey == txKey {
+		return errors.New("rx and tx keys must differ: each direction requires its own key")
+	}
+
+	return h.installKeys(vnet, epoch, rxKey, txKey, expiresAt)
+}
+
+// installKeys builds and installs the RX/TX ciphers for epoch, applies the 30s
+// grace period to the previous RX key, and sweeps expired RX keys. It is the
+// unguarded mechanism behind UpdateVirtualNetworkKeys; the monotonicity and
+// distinct-key guards live in that caller.
+func (h *Handler) installKeys(vnet *VirtualNetwork, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	// Set grace period (30s) on the previous RX key, if it exists
 	if txCipher := vnet.txCipher.Load(); txCipher != nil {
 		prevEpoch := txCipher.epoch
@@ -470,7 +528,14 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		if opt.Class == geneve.ClassExperimental {
 			switch opt.Type {
 			case geneve.OptionTypeTxCounter:
-				nonce = opt.Value[:12]
+				// Require the declared 12-byte (Length=3) value so nonce[:4] (the
+				// SPI) and the counter are provably sender-written, not stale pooled
+				// bytes from a short/malformed option — keeps the SPI-mismatch drop
+				// attribution honest. A wrong length leaves nonce nil → the
+				// "Expected TX counter" drop below.
+				if opt.Length == 3 {
+					nonce = opt.Value[:12]
+				}
 			case geneve.OptionTypeKeyEpoch:
 				epoch = binary.BigEndian.Uint32(opt.Value[:4])
 			}
@@ -495,6 +560,19 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		vnet.Stats.RXDropsExpiredKey.Add(1)
 		// Delete expired key (to free key material from memory)
 		vnet.rxCiphers.Delete(epoch)
+		return 0
+	}
+
+	// Verify the SPI bound into the nonce matches the epoch that selected this
+	// SA (nonce = SPI‖counter). A conformant sender always sets nonce[:4] to the
+	// key epoch; a mismatch is a malformed or tampered frame. GCM would also
+	// reject it at Open (the nonce and the header both feed the tag), but the
+	// explicit check makes the binding auditable and gives a precise drop reason.
+	// (APO-644)
+	if spi := binary.BigEndian.Uint32(nonce[:4]); spi != epoch {
+		slog.Debug("Dropping frame: nonce SPI does not match key epoch",
+			slog.Uint64("epoch", uint64(epoch)), slog.Uint64("nonceSPI", uint64(spi)))
+		vnet.Stats.RXDropsSPIMismatch.Add(1)
 		return 0
 	}
 
@@ -792,7 +870,15 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
+	// nonce = epoch‖counter: bind the 32-bit SPI (key epoch) into the high 4
+	// bytes. Under the shared-epoch model this prefix is identical for both
+	// directions, so it does not separate them (the distinct rx/tx keys do); its
+	// value here is letting RX reject a tampered/mismatched SPI and forward-compat
+	// with per-direction SPIs. The low 8 bytes are the per-SA monotonic counter.
+	// TODO(phase4): carry the control plane's distinct tx/rx SPIs, which a single
+	// shared epoch cannot represent. Both halves must be written before Seal.
 	nonce := hdr.Options[1].Value[:12]
+	binary.BigEndian.PutUint32(nonce[:4], txCipher.epoch)
 	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
 	switch ipVersion {
@@ -911,7 +997,15 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 
 	// Fill options: epoch + nonce/counter
 	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], txCipher.epoch)
+	// nonce = epoch‖counter: bind the 32-bit SPI (key epoch) into the high 4
+	// bytes. Under the shared-epoch model this prefix is identical for both
+	// directions, so it does not separate them (the distinct rx/tx keys do); its
+	// value here is letting RX reject a tampered/mismatched SPI and forward-compat
+	// with per-direction SPIs. The low 8 bytes are the per-SA monotonic counter.
+	// TODO(phase4): carry the control plane's distinct tx/rx SPIs, which a single
+	// shared epoch cannot represent. Both halves must be written before Seal.
 	nonce := hdr.Options[1].Value[:12]
+	binary.BigEndian.PutUint32(nonce[:4], txCipher.epoch)
 	binary.BigEndian.PutUint64(nonce[4:], txCipher.counter.Add(1))
 
 	// Place Geneve payload inside outer UDP frame.
