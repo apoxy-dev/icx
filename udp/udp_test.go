@@ -164,3 +164,31 @@ func BenchmarkEncode_IPv6(b *testing.B) {
 		}
 	}
 }
+
+// TestDecodeMalformedNoPanic pins the fix for a remote-triggerable panic: a
+// frame whose IP header is valid but declares a UDP payload shorter than the
+// 8-byte UDP header made header.UDP accessors index past the slice and panic
+// ([8:4]). Decode must return an error, never panic. (Found by the in-place
+// transform differential fuzzer.)
+func TestDecodeMalformedNoPanic(t *testing.T) {
+	cases := map[string][]byte{
+		// EtherType IPv6, next-header UDP (0x11), IP payloadLength = 4 (< 8),
+		// followed by only 4 bytes — the exact frame the fuzzer minimized to.
+		"ipv6 udp payload len 4": []byte("000000000000\x86\xdda000\x00\x04\x110000000000000000000000000000000000000"),
+		// Truncated to just under an Ethernet header.
+		"runt": make([]byte, 8),
+		// Ethernet header only, IPv4 ethertype, no IP header.
+		"eth only ipv4": append(make([]byte, 12), 0x08, 0x00),
+		// Ethernet header only, IPv6 ethertype, no IP header.
+		"eth only ipv6": append(make([]byte, 12), 0x86, 0xdd),
+		"empty":         {},
+	}
+	for name, frame := range cases {
+		t.Run(name, func(t *testing.T) {
+			require.NotPanics(t, func() {
+				_, err := udp.Decode(frame, nil, true)
+				require.Error(t, err)
+			})
+		})
+	}
+}

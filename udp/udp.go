@@ -53,6 +53,15 @@ func Decode(frame []byte, addr *tcpip.FullAddress, skipChecksumValidation bool) 
 		return nil, errors.New("unsupported ethertype")
 	}
 
+	// The IP header is valid but its declared payload may be shorter than a UDP
+	// header. header.UDP accessors (SourcePort/Payload/...) index fixed offsets
+	// up to UDPMinimumSize and panic on a short slice, so reject here. Without
+	// this a single crafted frame (IP payloadLength < 8) is a remote-triggerable
+	// panic on the decap path — found by the in-place differential fuzzer.
+	if len(udp) < header.UDPMinimumSize {
+		return nil, errors.New("UDP header truncated")
+	}
+
 	lengthValid, csumValid := header.UDPValid(
 		udp,
 		func() uint16 { return checksum.Checksum(udp.Payload(), 0) },

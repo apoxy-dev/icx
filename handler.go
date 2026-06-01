@@ -537,6 +537,13 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	var srcAddr netip.Addr
 	switch ipVersion {
 	case header.IPv4Version:
+		// SourceAddressSlice indexes up to IPv4MinimumSize; a decrypted packet
+		// shorter than that (a peer with valid keys can send one) would panic.
+		if len(ipPacket) < header.IPv4MinimumSize {
+			slog.Warn("Truncated IPv4 packet after decryption")
+			vnet.Stats.RXInvalidSrc.Add(1)
+			return 0
+		}
 		var ok bool
 		ipHdr := header.IPv4(ipPacket)
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
@@ -546,6 +553,11 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 			return 0
 		}
 	case header.IPv6Version:
+		if len(ipPacket) < header.IPv6MinimumSize {
+			slog.Warn("Truncated IPv6 packet after decryption")
+			vnet.Stats.RXInvalidSrc.Add(1)
+			return 0
+		}
 		var ok bool
 		ipHdr := header.IPv6(ipPacket)
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
@@ -607,6 +619,14 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	ipPacket := virtFrame
 
 	if !h.opts.layer3 {
+		// A virtual frame shorter than an Ethernet header cannot be parsed;
+		// eth.Type() would index past the slice and panic. Drop it (the datapath
+		// must never panic on a malformed frame).
+		if len(virtFrame) < header.EthernetMinimumSize {
+			slog.Debug("Dropping runt virtual frame", slog.Int("frameSize", len(virtFrame)))
+			return 0, false
+		}
+
 		eth := header.Ethernet(virtFrame)
 		ethType := eth.Type()
 
@@ -652,12 +672,26 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		ipPacket = virtFrame[header.EthernetMinimumSize:]
 	}
 
+	// An empty IP packet (e.g. a frame that is exactly an Ethernet header, or a
+	// zero-length layer3 frame) has no version nibble to read; ipPacket[0] would
+	// panic. Drop it.
+	if len(ipPacket) == 0 {
+		slog.Debug("Dropping empty virtual frame")
+		return 0, false
+	}
+
 	ipVersion := ipPacket[0] >> 4
 
 	// Get the tunnel destination address for the IP packet.
 	var srcAddr, dstAddr netip.Addr
 	switch ipVersion {
 	case header.IPv4Version:
+		// The src/dst accessors index up to IPv4MinimumSize; a shorter packet
+		// (the version nibble says IPv4 but the header is truncated) would panic.
+		if len(ipPacket) < header.IPv4MinimumSize {
+			slog.Debug("Dropping truncated IPv4 frame", slog.Int("frameSize", len(ipPacket)))
+			return 0, false
+		}
 		var ok bool
 		ipHdr := header.IPv4(ipPacket)
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
@@ -671,6 +705,11 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 			return 0, false
 		}
 	case header.IPv6Version:
+		// Likewise the IPv6 accessors index up to IPv6MinimumSize.
+		if len(ipPacket) < header.IPv6MinimumSize {
+			slog.Debug("Dropping truncated IPv6 frame", slog.Int("frameSize", len(ipPacket)))
+			return 0, false
+		}
 		var ok bool
 		ipHdr := header.IPv6(ipPacket)
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
