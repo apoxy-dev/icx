@@ -24,18 +24,32 @@ import (
 	"github.com/apoxy-dev/icx/queues"
 )
 
-// Decapsulate and encapsulate frames between physical and virtual interfaces.
+// Handler decapsulates and encapsulates frames between the physical and virtual
+// interfaces, operating IN PLACE on a single shared-UMEM frame: it is handed the
+// frame buffer and the (offset, length) window of the input packet within it,
+// and returns the (offset, length) window of the output packet within the SAME
+// buffer. The output overlaps the input — no copy between separate buffers — so a
+// frame received on one socket is transformed and transmitted on the other
+// without ever leaving the UMEM. *icx.Handler implements this; its in-place
+// transforms are byte-for-byte equivalent to the cross-buffer ones (kept for
+// non-zero-copy callers).
 type Handler interface {
-	// PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
-	// Returns the length of the resulting virtual frame.
-	PhyToVirt(phyFrame, virtFrame []byte) int
-	// VirtToPhy converts a virtual frame to a physical frame typically by performing encapsulation.
-	// Returns the length of the resulting physical frame.
-	VirtToPhy(virtFrame, phyFrame []byte) (length int, loopback bool)
-	// ToPhy is called periodically to allow the handler to send
-	// scheduled frames to the physical interface, e.g. keep-alive packets.
-	// Returns the length of the resulting physical frame.
-	ToPhy(phyFrame []byte) int
+	// PhyToVirtInPlace converts a physical frame to a virtual frame (typically
+	// decapsulation), in place within buf. The input physical frame is
+	// buf[off:off+length]; it returns the (offset, length) window of the
+	// resulting virtual frame within buf, or length 0 to drop.
+	PhyToVirtInPlace(buf []byte, off, length int) (outOff, outLen int)
+	// VirtToPhyInPlace converts a virtual frame to a physical frame (typically
+	// encapsulation), in place within buf. It returns the (offset, length) window
+	// of the resulting physical frame within buf, or length 0 to drop. handled
+	// reports an immediate local reply (ARP/ND) that must be transmitted back on
+	// the virtual interface rather than forwarded to the physical one.
+	VirtToPhyInPlace(buf []byte, off, length int) (outOff, outLen int, handled bool)
+	// ToPhyInPlace is called periodically to let the handler emit scheduled
+	// frames (e.g. keep-alives) to the physical interface, built in place within
+	// buf starting at off. It returns the (offset, length) window of the frame,
+	// or length 0 when there is nothing to send.
+	ToPhyInPlace(buf []byte, off int) (outOff, outLen int)
 }
 
 type ForwarderOption func(*forwarderOptions) error
@@ -91,14 +105,18 @@ func WithPhyFilter(prog *filter.Program) ForwarderOption {
 	}
 }
 
-// socketOpts are the per-socket UMEM/ring sizes. The defaults are far too small
-// for high-throughput NICs, so we size up. Each socket owns its own UMEM (the
-// copy datapath: a frame received on one interface is transformed into a frame
-// drawn from the other interface's pool). NumFrames must be >= Fill+Tx for
-// forward progress; we give the same 8192 frames the previous implementation
-// used, shared across all four rings rather than statically half-partitioned.
+// socketOpts are the per-socket ring sizes and the shared-UMEM frame-pool size.
+// One UMEM per queue now backs BOTH the phy and virt sockets (the zero-copy
+// datapath: a frame received on one interface is transformed in place and
+// transmitted on the other, never leaving the pool). That pool therefore feeds
+// eight rings — FILL/RX/TX/COMPLETION on each of the two sockets — so to never
+// stall for frames we size it to cover all of them at once:
+// 2 sockets x (Fill+Rx+Tx+Comp) = 2 x 16384 = 32768 frames (64 MiB at 2 KiB
+// frames). FrameSize 2048 leaves the kernel's 256-byte RX headroom plus room for
+// a full inner packet and the outer Eth/IP/UDP+Geneve headers and GCM tag the
+// encap path prepends/appends in place.
 var socketOpts = xsk.Options{
-	NumFrames:              8192,
+	NumFrames:              32768,
 	FrameSize:              2048,
 	FillRingNumDescs:       4096,
 	CompletionRingNumDescs: 4096,
@@ -118,7 +136,11 @@ type Forwarder struct {
 	phy          []*xsk.Socket
 	virtFilter   *filter.Program
 	virt         []*xsk.Socket
-	closeOnce    sync.Once
+	// umems[q] is the single UMEM shared by phy[q] and virt[q] — the frame pool
+	// both sockets draw from, which is what makes the zero-copy in-place handoff
+	// between them possible. Each is Closed exactly once, after both its sockets.
+	umems     []*xsk.UMEM
+	closeOnce sync.Once
 }
 
 // NewForwarder creates a new Forwarder with the given handler and options.
@@ -202,8 +224,19 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 		return nil, fmt.Errorf("failed to attach XDP ingress filter: %w", err)
 	}
 
+	// One shared UMEM per queue, bound FIRST by the phy socket (which reuses the
+	// UMEM registration fd and binds normally); the virt socket binds the same
+	// UMEM with XDP_SHARED_UMEM below. The UMEM is recorded in f.umems before the
+	// socket attempt so the deferred closeInternal releases it even if the bind
+	// fails.
 	for queueID := 0; queueID < phyNumQueues; queueID++ {
-		sk, err := newSocket(phyLink.Attrs().Index, queueID)
+		umem, err := xsk.NewUMEM(socketOpts)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create shared UMEM: %w", err)
+		}
+		f.umems = append(f.umems, umem)
+
+		sk, err := xsk.NewSocket(umem, phyLink.Attrs().Index, queueID, socketOpts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create physical XDP socket: %w", err)
 		}
@@ -223,8 +256,10 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 		return nil, fmt.Errorf("failed to attach virtual filter: %w", err)
 	}
 
+	// Each virt socket shares its queue's phy UMEM (already bound above), binding
+	// with XDP_SHARED_UMEM against the now-bound registration fd.
 	for queueID := 0; queueID < virtNumQueues; queueID++ {
-		sk, err := newSocket(virtLink.Attrs().Index, queueID)
+		sk, err := xsk.NewSocket(f.umems[queueID], virtLink.Attrs().Index, queueID, socketOpts)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create virtual XDP socket: %w", err)
 		}
@@ -237,22 +272,6 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 
 	success = true
 	return f, nil
-}
-
-// newSocket creates a UMEM and a socket bound to it on (ifindex, queueID). If the
-// socket fails to bind, the orphan UMEM is closed before returning so it does not
-// leak (it is not yet owned by the Forwarder).
-func newSocket(ifindex, queueID int) (*xsk.Socket, error) {
-	umem, err := xsk.NewUMEM(socketOpts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create UMEM: %w", err)
-	}
-	sk, err := xsk.NewSocket(umem, ifindex, queueID, socketOpts)
-	if err != nil {
-		_ = umem.Close()
-		return nil, fmt.Errorf("failed to create XDP socket: %w", err)
-	}
-	return sk, nil
 }
 
 // closeInternal tears down every resource the Forwarder owns, joining errors so
@@ -275,13 +294,14 @@ func (f *Forwarder) closeInternal() error {
 		}
 	}
 
+	// Close every socket before any UMEM: each UMEM is shared by a phy/virt pair
+	// and owns the registration fd the first (phy) socket reused, so it must
+	// outlive both its sockets. (The previous per-socket sk.UMEM().Close() would
+	// now double-close the shared UMEM.)
 	slog.Debug("Closing physical XDP sockets")
 	for _, sk := range f.phy {
 		if err := sk.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close phy XDP socket: %w", err))
-		}
-		if err := sk.UMEM().Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close phy UMEM: %w", err))
 		}
 	}
 
@@ -290,8 +310,12 @@ func (f *Forwarder) closeInternal() error {
 		if err := sk.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("failed to close virt XDP socket: %w", err))
 		}
-		if err := sk.UMEM().Close(); err != nil {
-			errs = append(errs, fmt.Errorf("failed to close virt UMEM: %w", err))
+	}
+
+	slog.Debug("Closing shared UMEMs")
+	for _, umem := range f.umems {
+		if err := umem.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to close shared UMEM: %w", err))
 		}
 	}
 
@@ -349,13 +373,18 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 
 	phy := f.phy[queueID]
 	virt := f.virt[queueID]
-	phyUMEM := phy.UMEM()
-	virtUMEM := virt.UMEM()
+	umem := f.umems[queueID] // shared by phy and virt; the in-place handoff pool
 
-	// Per-goroutine scratch slices, reused across iterations. processFrames owns
-	// queueID exclusively (one goroutine per queue, SPSC rings), so these are
-	// race-free without synchronization.
-	var rxScratch, txScratch []xsk.Desc
+	// Per-goroutine scratch, reused across iterations. processFrames owns queueID
+	// exclusively (one goroutine per queue, SPSC rings), so these are race-free
+	// without synchronization. The forward batches (fwd/back/free) are sized to
+	// the RX ring: every received descriptor is routed to exactly one of them, so
+	// no single batch can exceed the number received (<= RxRingNumDescs) and their
+	// appends never reallocate — keeping the backing arrays stable across calls.
+	var rxScratch, schedScratch []xsk.Desc
+	fwd := make([]xsk.Desc, 0, socketOpts.RxRingNumDescs)
+	back := make([]xsk.Desc, 0, socketOpts.RxRingNumDescs)
+	free := make([]xsk.Desc, 0, socketOpts.RxRingNumDescs)
 
 	for {
 		// Close() is racy so use context cancellation here.
@@ -386,7 +415,7 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 			return fmt.Errorf("failed to poll XSKs: %w", err)
 		}
 
-		// Reclaim completed TX frames back into each socket's pool.
+		// Reclaim completed TX frames back into the shared pool.
 		if numCompleted := phy.NumCompleted(); numCompleted > 0 {
 			phy.Complete(numCompleted)
 		}
@@ -394,22 +423,28 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 			virt.Complete(numCompleted)
 		}
 
-		// Try to emit any scheduled frames (e.g. keep-alives) once per loop.
+		// Emit any scheduled frame (e.g. keep-alive) once per loop, built in place
+		// in a freshly allocated frame and transmitted on phy.
 		if phy.NumFreeTxSlots() > 0 {
-			if txDescs := phyUMEM.Alloc(txScratch[:0], 1); len(txDescs) == 1 {
-				txFrame := phyUMEM.FrameFull(txDescs[0])
-				frameLen := f.handler.ToPhy(txFrame)
-				if frameLen > 0 {
-					txDescs[0].Len = uint32(frameLen)
-					if n, err := phy.Transmit(txDescs); err != nil {
+			if schedScratch = umem.Alloc(schedScratch[:0], 1); len(schedScratch) == 1 {
+				base, _ := frameBaseOff(schedScratch[0].Addr)
+				buf := umem.FrameFull(schedScratch[0])
+				outOff, outLen := f.handler.ToPhyInPlace(buf, 0)
+				if buf != nil && outLen > 0 {
+					schedScratch[0].Addr = base + uint64(outOff)
+					schedScratch[0].Len = uint32(outLen)
+					if f.pcapWriter != nil {
+						f.writePcap(umem.Frame(schedScratch[0]))
+					}
+					if n, err := phy.Transmit(schedScratch); err != nil {
 						return fmt.Errorf("failed to transmit scheduled frame: %w", err)
 					} else if n < 1 {
-						phyUMEM.Free(txDescs)
+						umem.Free(schedScratch)
 						slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
 					}
 				} else {
 					// Nothing to send; return the unused frame to the pool.
-					phyUMEM.Free(txDescs)
+					umem.Free(schedScratch)
 				}
 			}
 		}
@@ -423,14 +458,12 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 				slog.Int("queueID", queueID),
 				slog.Int("numReceived", len(rxDescs)))
 
-			if err := f.transform(queueID, phyUMEM, virtUMEM, virt, rxDescs, f.handlePhyToVirt); err != nil {
+			if err := f.forwardInPlace(queueID, umem, phy, virt, rxDescs, f.phyToVirt, fwd, back, free); err != nil {
 				return err
 			}
-			// RX frames are consumed; return them to the phy pool for refilling.
-			phyUMEM.Free(rxDescs)
 		}
 
-		// Virtual -> physical (encapsulation, with loopback).
+		// Virtual -> physical (encapsulation, with ARP/ND loopback).
 		if numReceived := virt.NumReceived(); numReceived > 0 {
 			rxDescs := virt.Receive(rxScratch[:0], numReceived)
 			rxScratch = rxDescs[:0]
@@ -439,130 +472,147 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 				slog.Int("queueID", queueID),
 				slog.Int("numReceived", len(rxDescs)))
 
-			if err := f.transform(queueID, virtUMEM, phyUMEM, phy, rxDescs, f.handleVirtToPhy); err != nil {
+			if err := f.forwardInPlace(queueID, umem, virt, phy, rxDescs, f.virtToPhy, fwd, back, free); err != nil {
 				return err
 			}
-			virtUMEM.Free(rxDescs)
 		}
 	}
 }
 
-// transformFn populates dst frame txFrame from source frame rxFrame and returns
-// the resulting length. A non-positive length means "drop" (no TX desc consumed).
-// A transformFn may itself emit frames (e.g. ARP/ND/loopback replies) and return
-// 0 to indicate it handled the frame without producing a forward-path TX frame.
-type transformFn func(queueID int, rxFrame, txFrame []byte) int
+// inPlaceFn transforms the packet at buf[off:off+length] in place and returns
+// the (offset, length) window of the output within buf, plus handled: true when
+// the handler produced an immediate local reply that must be transmitted back on
+// the SOURCE socket (ARP/ND) rather than forwarded to the destination. A
+// non-positive outLen means "drop" (the frame is returned to the pool).
+type inPlaceFn func(buf []byte, off, length int) (outOff, outLen int, handled bool)
 
-// transform runs the RX descriptors through fn, allocating one TX frame per
-// forwarded packet from dstUMEM, and transmits the populated frames on dstSock.
-// Ownership: every TX frame Alloc'd but not handed to the kernel (skips + the
-// untransmitted tail) is Freed back to dstUMEM. The loop is bounded by the number
-// of TX frames actually allocated, fixing the out-of-range panic the previous
-// implementation hit when the TX pool under-delivered relative to RX.
-func (f *Forwarder) transform(
+// phyToVirt adapts the handler's decapsulation transform (which never produces a
+// loopback reply) to inPlaceFn.
+func (f *Forwarder) phyToVirt(buf []byte, off, length int) (int, int, bool) {
+	outOff, outLen := f.handler.PhyToVirtInPlace(buf, off, length)
+	return outOff, outLen, false
+}
+
+// virtToPhy adapts the handler's encapsulation transform to inPlaceFn; its
+// handled flag routes ARP/ND replies back onto the source (virtual) socket.
+func (f *Forwarder) virtToPhy(buf []byte, off, length int) (int, int, bool) {
+	return f.handler.VirtToPhyInPlace(buf, off, length)
+}
+
+// forwardInPlace runs each received descriptor through fn in place on the shared
+// UMEM and transmits the transformed frame on dstSock — or back on srcSock when
+// fn reports handled (an ARP/ND reply). It is zero-copy: every TX descriptor
+// points at a retargeted window of its own RX frame, so no bytes are copied
+// between buffers and no second frame is allocated.
+//
+// Ownership: the received frames are owned by this goroutine until each is either
+// queued on a TX ring (then reclaimed via that socket's Complete) or returned to
+// the shared pool. Dropped frames and the untransmitted tail of a short Transmit
+// are Freed exactly once here. fwd/back/free are caller-owned scratch with
+// capacity >= len(rxDescs); they are reset and reused, never grown.
+func (f *Forwarder) forwardInPlace(
 	queueID int,
-	srcUMEM, dstUMEM *xsk.UMEM,
-	dstSock *xsk.Socket,
+	umem *xsk.UMEM,
+	srcSock, dstSock *xsk.Socket,
 	rxDescs []xsk.Desc,
-	fn transformFn,
+	fn inPlaceFn,
+	fwd, back, free []xsk.Desc,
 ) error {
 	if len(rxDescs) == 0 {
 		return nil
 	}
 
-	txDescs := dstUMEM.Alloc(nil, len(rxDescs))
-	populated := 0
-	for i := range rxDescs {
-		if populated >= len(txDescs) {
-			// TX pool exhausted; remaining RX frames are dropped this round.
-			break
-		}
-		rxFrame := srcUMEM.Frame(rxDescs[i])
-		txFrame := dstUMEM.FrameFull(txDescs[populated])
-		if rxFrame == nil || txFrame == nil {
+	fwd, back, free = fwd[:0], back[:0], free[:0]
+	for _, d := range rxDescs {
+		base, off := frameBaseOff(d.Addr)
+		buf := umem.FrameFull(d)
+		if buf == nil {
+			// Foreign/malformed descriptor; return it to the pool.
+			free = append(free, d)
 			continue
 		}
 
-		frameLen := fn(queueID, rxFrame, txFrame)
-		if frameLen <= 0 {
+		outOff, outLen, handled := fn(buf, off, int(d.Len))
+		if outLen <= 0 {
+			free = append(free, d)
 			continue
 		}
 
-		txDescs[populated].Len = uint32(frameLen)
-		populated++
+		// Retarget the SAME frame's descriptor to the output window.
+		d.Addr = base + uint64(outOff)
+		d.Len = uint32(outLen)
 
 		if f.pcapWriter != nil {
-			f.pcapWriterMu.Lock()
-			ci := gopacket.CaptureInfo{
-				Timestamp:     time.Now(),
-				CaptureLength: frameLen,
-				Length:        frameLen,
-			}
-			_ = f.pcapWriter.WritePacket(ci, txFrame[:frameLen])
-			f.pcapWriterMu.Unlock()
+			f.writePcap(umem.Frame(d))
+		}
+
+		if handled {
+			back = append(back, d)
+		} else {
+			fwd = append(fwd, d)
 		}
 	}
 
-	transmitted := 0
-	if populated > 0 {
-		n, err := dstSock.Transmit(txDescs[:populated])
+	// Forward batch to the destination socket.
+	if len(fwd) > 0 {
+		n, err := dstSock.Transmit(fwd)
+		if n < len(fwd) {
+			slog.Debug("Failed to transmit all forwarded frames",
+				slog.Int("queueID", queueID),
+				slog.Int("populated", len(fwd)),
+				slog.Int("numTransmitted", n))
+			umem.Free(fwd[n:])
+		}
 		if err != nil {
+			// Shutting down: return the not-yet-queued frames so nothing leaks.
+			umem.Free(back)
+			umem.Free(free)
 			return fmt.Errorf("failed to transmit frames: %w", err)
 		}
-		transmitted = n
-		if n < populated {
-			slog.Debug("Failed to transmit all frames",
+	}
+
+	// Loopback batch (ARP/ND replies) back to the source socket.
+	if len(back) > 0 {
+		n, err := srcSock.Transmit(back)
+		if n < len(back) {
+			slog.Debug("Failed to transmit all loopback frames",
 				slog.Int("queueID", queueID),
-				slog.Int("populated", populated),
+				slog.Int("populated", len(back)),
 				slog.Int("numTransmitted", n))
+			umem.Free(back[n:])
+		}
+		if err != nil {
+			umem.Free(free)
+			return fmt.Errorf("failed to transmit loopback frames: %w", err)
 		}
 	}
 
-	// Free every Alloc'd TX frame the kernel did not take: the untransmitted tail
-	// [transmitted:populated) and the unused slots [populated:len(txDescs)). These
-	// are contiguous as [transmitted:len(txDescs)).
-	if transmitted < len(txDescs) {
-		dstUMEM.Free(txDescs[transmitted:])
+	if len(free) > 0 {
+		umem.Free(free)
 	}
 	return nil
 }
 
-// handlePhyToVirt is the decapsulation transform.
-func (f *Forwarder) handlePhyToVirt(_ int, rxFrame, txFrame []byte) int {
-	return f.handler.PhyToVirt(rxFrame, txFrame)
+// writePcap records one frame to the pcap writer under the writer lock.
+func (f *Forwarder) writePcap(frame []byte) {
+	f.pcapWriterMu.Lock()
+	defer f.pcapWriterMu.Unlock()
+	ci := gopacket.CaptureInfo{
+		Timestamp:     time.Now(),
+		CaptureLength: len(frame),
+		Length:        len(frame),
+	}
+	_ = f.pcapWriter.WritePacket(ci, frame)
 }
 
-// handleVirtToPhy is the encapsulation transform. When the handler reports a
-// loopback frame, it is written back onto the virtual socket instead of being
-// forwarded to the physical socket, and 0 is returned so no phy TX frame is
-// consumed.
-func (f *Forwarder) handleVirtToPhy(queueID int, rxFrame, txFrame []byte) int {
-	frameLen, loopback := f.handler.VirtToPhy(rxFrame, txFrame)
-	if !loopback {
-		return frameLen
-	}
-	if frameLen <= 0 {
-		return 0
-	}
-
-	// Loopback: copy the produced frame back onto the virtual socket.
-	virt := f.virt[queueID]
-	virtUMEM := virt.UMEM()
-	loopDescs := virtUMEM.Alloc(nil, 1)
-	if len(loopDescs) != 1 {
-		slog.Debug("Dropped loopback frame (no free frame)", slog.Int("queueID", queueID))
-		return 0
-	}
-	loopFrame := virtUMEM.FrameFull(loopDescs[0])
-	loopDescs[0].Len = uint32(copy(loopFrame, txFrame[:frameLen]))
-	if n, err := virt.Transmit(loopDescs); err != nil {
-		slog.Warn("Loopback transmit failed", slog.Int("queueID", queueID), slog.Any("error", err))
-		virtUMEM.Free(loopDescs)
-	} else if n < 1 {
-		virtUMEM.Free(loopDescs)
-		slog.Debug("Dropped loopback frame", slog.Int("queueID", queueID))
-	}
-	return 0
+// frameBaseOff splits a UMEM descriptor address into its chunk-aligned frame base
+// and the in-frame offset of the packet (the RX headroom the kernel leaves, or
+// the start an in-place transform chose). FrameSize is a power of two, so the
+// base is a cheap mask. The base lets a retargeted descriptor address a new
+// window within the same frame: newAddr = base + newOffset.
+func frameBaseOff(addr uint64) (base uint64, off int) {
+	base = addr &^ uint64(socketOpts.FrameSize-1)
+	return base, int(addr - base)
 }
 
 func poll(phy, virt *xsk.Socket, timeout time.Duration) (err error) {

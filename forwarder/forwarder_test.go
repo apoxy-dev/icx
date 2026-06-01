@@ -187,14 +187,18 @@ type pipe struct {
 	proxyARP *proxyarp.ProxyARP
 }
 
-func (h *pipe) PhyToVirt(phyFrame, virtFrame []byte) int {
-	return copy(virtFrame, phyFrame)
+// The pipe is an identity transform: it forwards each frame unchanged, so the
+// in-place methods just return the input window. This exercises the shared-UMEM
+// datapath and descriptor-retargeting (the frame is transmitted on the sibling
+// socket without being moved) independently of any encap/decap.
+func (h *pipe) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
+	return off, length
 }
 
-func (h *pipe) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
-	return copy(phyFrame, virtFrame), false
+func (h *pipe) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool) {
+	return off, length, false
 }
 
-func (h *pipe) ToPhy(phyFrame []byte) int {
-	return 0
+func (h *pipe) ToPhyInPlace(buf []byte, off int) (int, int) {
+	return 0, 0
 }
