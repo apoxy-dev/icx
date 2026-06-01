@@ -152,6 +152,11 @@ func (s *Session) MasterKeys() *MasterKeys { return s.masterKeys }
 // peer certificate). Useful for logging and for asserting the FIPS suite.
 func (s *Session) TLSState() tls.ConnectionState { return s.conn.ConnectionState().TLS }
 
+// Context returns a context that is cancelled when the underlying QUIC connection
+// closes (peer close, idle timeout, or transport error). RunTunnel selects on it to
+// detect session loss promptly rather than waiting for the next rekey tick.
+func (s *Session) Context() context.Context { return s.conn.Context() }
+
 // Close cleanly shuts the session down.
 func (s *Session) Close() error { return s.conn.CloseWithError(appErrNormal, "") }
 
