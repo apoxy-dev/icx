@@ -5,6 +5,14 @@
 ICX uses a pair of **ephemeral, per-session** symmetric keys for encrypting traffic.
 **Do not reuse keys** across sessions (to avoid nonce reuse risks).
 
+ICX enforces two invariants when keys are installed and will refuse the
+key otherwise: `rx` and `tx` **must differ** (each direction needs its own key),
+and the key epoch must **strictly increase** within a running process. Note that
+a restart re-reads the INI starting again at epoch 1 with the TX counter reset to
+0, so **do not restart against an unchanged key file** — rotate to fresh keys
+(below) or use a key-exchange mechanism, otherwise the AES-GCM nonce sequence is
+reused under the same key.
+
 In production, use a secure key exchange mechanism (e.g., IKEv2) to
 generate and distribute keys.
 
