@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -495,6 +496,32 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 	}
 }
 
+// datapathPanicOnce bounds the recovered-panic log to a single emission so a
+// crafted frame that trips an unguarded path cannot also flood the logs. Each
+// such frame is still dropped and the queue keeps running.
+var datapathPanicOnce sync.Once
+
+// safeTransform runs an in-place transform but converts a panic into a frame
+// drop. The transforms are written to drop malformed frames rather than panic
+// (see the length/IsValid guards in handler.go), so this is a last-resort
+// backstop: the processFrames loop holds runtime.LockOSThread and has no other
+// recovery, so a single panicking packet would otherwise tear down the whole
+// queue goroutine (and, via errgroup, the forwarder). It also contains the GCM
+// inexact-overlap panic class that the in-place aliasing contract relies on.
+func safeTransform(fn inPlaceFn, buf []byte, off, length int) (outOff, outLen int, handled bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			datapathPanicOnce.Do(func() {
+				slog.Error("recovered panic in datapath transform; dropping frame and continuing",
+					slog.Any("panic", r),
+					slog.String("stack", string(debug.Stack())))
+			})
+			outOff, outLen, handled = 0, 0, false
+		}
+	}()
+	return fn(buf, off, length)
+}
+
 // inPlaceFn transforms the packet at buf[off:off+length] in place and returns
 // the (offset, length) window of the output within buf, plus handled: true when
 // the handler produced an immediate local reply that must be transmitted back on
@@ -561,7 +588,7 @@ func (f *Forwarder) forwardInPlace(
 			continue
 		}
 
-		outOff, outLen, handled := fn(buf, off, int(d.Len))
+		outOff, outLen, handled := safeTransform(fn, buf, off, int(d.Len))
 		if outLen <= 0 {
 			free = append(free, d)
 			continue
