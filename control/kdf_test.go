@@ -98,3 +98,10 @@ func TestDeriveSAKey_BadMasterKeyLen(t *testing.T) {
 		t.Fatal("expected error for 16-byte master key, got nil")
 	}
 }
+
+func TestDeriveSAKey_UnsupportedVersionFailsClosed(t *testing.T) {
+	mk := make([]byte, MasterKeyLen)
+	if _, err := DeriveSAKey(mk, 1, PSPVersion(7)); err == nil {
+		t.Fatal("expected error for unsupported PSP version, got nil (must fail closed, not default to 16 bytes)")
+	}
+}

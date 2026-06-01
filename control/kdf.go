@@ -30,7 +30,13 @@ func (v PSPVersion) label() [4]byte {
 	return [4]byte{0x50, 0x76, 0x30 | byte(v), 0x00}
 }
 
-// keyLen returns the derived SA key length in bytes for the version.
+// valid reports whether v is a supported PSP version. Callers must reject
+// unsupported versions before deriving keys (fail-closed), so keyLen/label are
+// never asked to map an unknown version.
+func (v PSPVersion) valid() bool { return v == PSPv0 || v == PSPv1 }
+
+// keyLen returns the derived SA key length in bytes for the version. Only valid
+// versions reach here (guarded by DeriveSAKey); v0 = 16, v1 = 32.
 func (v PSPVersion) keyLen() int {
 	if v == PSPv1 {
 		return 32
@@ -54,6 +60,9 @@ func (v PSPVersion) keyLen() int {
 func DeriveSAKey(masterKey []byte, spi uint32, v PSPVersion) ([]byte, error) {
 	if len(masterKey) != MasterKeyLen {
 		return nil, fmt.Errorf("control: master key must be %d bytes, got %d", MasterKeyLen, len(masterKey))
+	}
+	if !v.valid() {
+		return nil, fmt.Errorf("control: unsupported PSP version %d", v)
 	}
 
 	keyLen := v.keyLen()
