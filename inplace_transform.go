@@ -139,13 +139,6 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 
 	txCounter := binary.BigEndian.Uint64(nonce[4:])
 
-	if !rxCipher.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
-		// Delayed packets can cause some uneccesary noise here.
-		slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
-		vnet.Stats.RXReplayDrops.Add(1)
-		return dropWindowOffset, 0
-	}
-
 	// In-place decap: the ciphertext (payload[hdrLen:]) lives at ctStart within
 	// buf; we open it onto itself at the SAME start (exact overlap), so the
 	// plaintext is written over the ciphertext region. The AAD is the Geneve
@@ -162,6 +155,18 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		return dropWindowOffset, 0
 	}
 
+	// Anti-replay AFTER authentication (APO-645/S2): ValidateCounter both checks
+	// and advances the sliding window, so it must run only on a packet whose tag
+	// has verified. Running it before Open let an attacker who can spoof the
+	// outer 4-tuple advance the window with a forged high counter and wedge the
+	// real peer (whose in-window counters are then rejected as "behind window").
+	if !rxCipher.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
+		// Delayed packets can cause some unnecessary noise here.
+		slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
+		vnet.Stats.RXReplayDrops.Add(1)
+		return dropWindowOffset, 0
+	}
+
 	// Is it an authenticated out-of-band message?
 	if hdr.ProtocolType == 0 {
 		slog.Debug("Dropping out-of-band message")
@@ -169,6 +174,14 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		vnet.Stats.RXPackets.Add(1)
 		vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
 		vnet.Stats.LastRXUnixNano.Store(h.clock.Now().UnixNano())
+		return dropWindowOffset, 0
+	}
+
+	// A non-OOB frame whose authenticated payload is empty has no version nibble;
+	// ipPacket[0] would panic. An authenticated peer can craft one. (APO-647/S4)
+	if len(ipPacket) == 0 {
+		slog.Warn("Dropping empty decrypted payload")
+		vnet.Stats.RXInvalidSrc.Add(1)
 		return dropWindowOffset, 0
 	}
 
