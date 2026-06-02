@@ -142,6 +142,51 @@ func TestControlPlaneSharedEpochGeneveRoundTrip(t *testing.T) {
 	require.Equal(t, uint64(1), vnR.Stats.RXPackets.Load())
 }
 
+// TestInstallResetsTxCounterPerEpoch pins the nonce-uniqueness invariant the durable-
+// epoch seeding (control/epochstate.go) depends on: each new epoch install starts a
+// FRESH transmit counter, so the AES-GCM nonce (epoch‖counter) never repeats even as
+// epochs climb monotonically across rekeys/restarts. A refactor that carried the
+// counter across installs would reuse a (key, nonce) pair and trip this test.
+func TestInstallResetsTxCounterPerEpoch(t *testing.T) {
+	const vni = 0x334455
+	addrA := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4())
+	addrB := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4())
+	h := newPeerHandler(t, vni, addrA, addrB)
+
+	var rx, tx [16]byte
+	for i := range rx {
+		rx[i], tx[i] = byte(i), byte(255-i)
+	}
+	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 100, rx, tx, time.Now().Add(time.Hour)))
+	c, ok := h.TxCounterForTest(vni)
+	require.True(t, ok)
+	require.Zero(t, c, "fresh install starts at counter 0")
+
+	ip := makeIPv4UDPPacket()
+	phy := make([]byte, 1500)
+	n, loop := h.VirtToPhy(ip, phy)
+	require.NotZero(t, n)
+	require.False(t, loop)
+	c, _ = h.TxCounterForTest(vni)
+	require.Equal(t, uint64(1), c, "first frame uses counter 1")
+
+	// Install a NEW, higher epoch (as a rekey or a seeded post-restart generation
+	// would). The counter MUST reset to zero — no carryover.
+	var rx2, tx2 [16]byte
+	for i := range rx2 {
+		rx2[i], tx2[i] = byte(i+1), byte(254-i)
+	}
+	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 200, rx2, tx2, time.Now().Add(time.Hour)))
+	c, _ = h.TxCounterForTest(vni)
+	require.Zero(t, c, "a new epoch must start a fresh zero counter (no carryover → no nonce reuse)")
+
+	n, loop = h.VirtToPhy(ip, phy)
+	require.NotZero(t, n)
+	require.False(t, loop)
+	c, _ = h.TxCounterForTest(vni)
+	require.Equal(t, uint64(1), c, "first frame under the new epoch counts from 1 again")
+}
+
 func TestControlPlaneNaiveTxSPIEpochDropsTraffic(t *testing.T) {
 	iSAs, rSAs := negotiateLoopback(t)
 

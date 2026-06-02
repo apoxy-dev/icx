@@ -22,3 +22,19 @@ func (h *Handler) InstallKeysForTest(vni uint, epoch uint32, rxKey, txKey [16]by
 	}
 	return h.installKeys(value.(*VirtualNetwork), epoch, rxKey, txKey, expiresAt)
 }
+
+// TxCounterForTest returns the active SA's current TX nonce counter for the VNI (and
+// whether one is installed). It lets a test assert the per-epoch fresh-counter
+// invariant — each new epoch install resets the counter to zero — which is what keeps
+// the AES-GCM nonce (epoch‖counter) unique as epochs climb across rekeys/restarts.
+func (h *Handler) TxCounterForTest(vni uint) (uint64, bool) {
+	value, ok := h.networkByID.Load(vni)
+	if !ok {
+		return 0, false
+	}
+	tc := value.(*VirtualNetwork).txCipher.Load()
+	if tc == nil {
+		return 0, false
+	}
+	return tc.counter.Load(), true
+}

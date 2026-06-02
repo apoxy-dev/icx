@@ -464,6 +464,12 @@ func (h *Handler) installKeys(vnet *VirtualNetwork, epoch uint32, rxKey, txKey [
 		expiresAt: expiresAt,
 	})
 
+	// A fresh transmitCipher resets the TX counter to zero for the new epoch. This is
+	// load-bearing for nonce uniqueness: the AES-GCM nonce is epoch‖counter, so each
+	// epoch MUST begin its own counter at zero — the control plane's durable-epoch
+	// seeding makes epochs climb monotonically across rekeys/restarts, and the
+	// per-epoch counter reset is what keeps (key, nonce) pairs from ever repeating.
+	// A refactor that carried the counter across installs would reintroduce reuse.
 	vnet.txCipher.Store(&transmitCipher{
 		AEAD:  txCipher,
 		epoch: epoch,
