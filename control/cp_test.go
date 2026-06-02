@@ -143,6 +143,12 @@ func TestInstallSAsSwallowsRotationRejection(t *testing.T) {
 // twoTunnels wires an initiator and a responder Tunnel over loopback UDP, assigning
 // the canonical roles correctly, with tight timings for tests.
 func twoTunnels(t *testing.T, instInit, instResp SAInstaller, rekey time.Duration) (initT, respT *Tunnel, cleanup func()) {
+	return twoTunnelsWithStore(t, instInit, instResp, rekey, nil)
+}
+
+// twoTunnelsWithStore is twoTunnels with an optional durable EpochStore on the
+// INITIATOR (the only role for which durable state is load-bearing).
+func twoTunnelsWithStore(t *testing.T, instInit, instResp SAInstaller, rekey time.Duration, initStore EpochStore) (initT, respT *Tunnel, cleanup func()) {
 	t.Helper()
 	idA, err := GenerateIdentity()
 	require.NoError(t, err)
@@ -163,7 +169,7 @@ func twoTunnels(t *testing.T, instInit, instResp SAInstaller, rekey time.Duratio
 
 	initT, err = NewTunnel(TunnelConfig{
 		Local: initID, PeerPub: respID.PublicKey(), Conn: initConn,
-		PeerAddr: respConn.LocalAddr(), RekeyInterval: rekey,
+		PeerAddr: respConn.LocalAddr(), RekeyInterval: rekey, EpochStore: initStore,
 	}, instInit)
 	require.NoError(t, err)
 	require.True(t, initT.Initiator())
@@ -187,6 +193,36 @@ func twoTunnels(t *testing.T, instInit, instResp SAInstaller, rekey time.Duratio
 		_ = respConn.Close()
 	}
 	return initT, respT, cleanup
+}
+
+// guardInstaller is an SAInstaller that enforces the handler's strictly-increasing
+// epoch guard (handler.go), so tests can detect a regressed/rejected epoch rather
+// than the no-op epochRecorder which accepts everything.
+type guardInstaller struct {
+	mu        sync.Mutex
+	max       uint32
+	installed []uint32
+	rejects   int
+}
+
+func newGuardInstaller() *guardInstaller { return &guardInstaller{} }
+
+func (g *guardInstaller) install(epoch uint32, _, _ [16]byte) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if epoch <= g.max {
+		g.rejects++
+		return errors.New("epoch must be monotonically increasing")
+	}
+	g.max = epoch
+	g.installed = append(g.installed, epoch)
+	return nil
+}
+
+func (g *guardInstaller) snapshot() (installed []uint32, rejects int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]uint32(nil), g.installed...), g.rejects
 }
 
 // epochRecorder is a thread-safe SAInstaller that records the epochs it installs.
@@ -364,12 +400,295 @@ func TestTunnelReconnects(t *testing.T) {
 	// installing — so every epoch the initiator installed must also have been
 	// installed by the responder. (The reverse can differ by one: a negotiation torn
 	// by the forced loss after the responder committed but before the initiator
-	// finished leaves the responder with an extra generation. Per-session allocators
-	// also reset across the reconnect, so epochs are not globally monotonic — agreement
-	// in this direction, not monotonicity, is the invariant.)
+	// finished leaves the responder with an extra generation.)
 	ie, _ := initRec.snapshot()
 	_, rk := respRec.snapshot()
 	for _, e := range ie {
 		require.Contains(t, rk, e, "responder never installed initiator epoch %d", e)
 	}
+
+	// Monotonicity invariant (Phase 5): seeding the new session's allocator from the
+	// in-memory epoch high-water means the shared epoch no longer resets to 1 across
+	// the reconnect — the initiator's installed epochs are now globally strictly
+	// increasing, which is what lets the survivor's monotonicity guard accept the
+	// post-reconnect generation.
+	for i := 1; i < len(ie); i++ {
+		require.Greater(t, ie[i], ie[i-1], "initiator epochs must be globally monotonic across the reconnect")
+	}
+}
+
+// TestTunnelReconnectGuardNeverRejects is the recovery regression test the design
+// review demanded: with installers that ENFORCE the handler's strictly-increasing
+// epoch guard, a forced session loss must self-heal, keep installing generation after
+// generation, AND never make either guard reject a regressed epoch. Without the
+// epoch-floor seeding the post-reconnect epoch would reset to 1 and the guard would
+// reject every generation (installs would stall at the single bring-up generation);
+// without the seed MARGIN, a torn-after-responder-install exchange would re-offer an
+// already-installed epoch and the responder's guard would reject it. The seed margin
+// (>= the worst-case one-generation responder lead) is what makes zero rejections
+// hold; the deterministic proof of that margin is TestReconnectSeedCoversTornLead.
+func TestTunnelReconnectGuardNeverRejects(t *testing.T) {
+	initGuard, respGuard := newGuardInstaller(), newGuardInstaller()
+	initT, respT, cleanup := twoTunnels(t, initGuard.install, respGuard.install, 100*time.Millisecond)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	brCh := make(chan error, 1)
+	go func() { brCh <- respT.Bringup(ctx) }()
+	require.NoError(t, initT.Bringup(ctx))
+	require.NoError(t, <-brCh)
+
+	require.NoError(t, initT.sess.Close()) // force a session loss
+
+	runCh := make(chan error, 2)
+	go func() { runCh <- initT.Run(ctx) }()
+	go func() { runCh <- respT.Run(ctx) }()
+
+	// Progress well past the single bring-up generation on BOTH peers proves the guard
+	// keeps accepting because seeding keeps the epoch climbing across the reconnect.
+	require.Eventually(t, func() bool {
+		ig, _ := initGuard.snapshot()
+		rg, _ := respGuard.snapshot()
+		return len(ig) >= 5 && len(rg) >= 5
+	}, 18*time.Second, 25*time.Millisecond, "peers must self-heal and keep installing under the guard")
+
+	cancel()
+	require.NoError(t, <-runCh)
+	require.NoError(t, <-runCh)
+
+	ig, iRej := initGuard.snapshot()
+	_, rRej := respGuard.snapshot()
+	require.Zero(t, iRej, "initiator guard must never reject (seeding keeps epochs monotonic)")
+	require.Zero(t, rRej, "responder guard must never reject (the seed margin covers a torn-exchange lead)")
+	for i := 1; i < len(ig); i++ {
+		require.Greater(t, ig[i], ig[i-1], "accepted epochs are strictly increasing")
+	}
+}
+
+// TestReconnectSeedCoversTornLead is the deterministic guard for the in-memory
+// reconnect seed margin: it simulates the torn-exchange race — the responder committed
+// epoch E but the initiator failed to record it, so the initiator's high-water lags by
+// one — and proves the next session's seed still produces an epoch strictly greater
+// than E, so the responder's monotonicity guard accepts it (no black-hole).
+func TestReconnectSeedCoversTornLead(t *testing.T) {
+	const responderMax = uint32(50)   // responder installed up to 50
+	initHighWater := responderMax - 1 // initiator recorded only 49 (torn after 50)
+
+	a := NewSPIAllocator(Initiator)
+	a.SeedFloor(activeMasterKeyIndex, seedWithMargin(initHighWater))
+	next, err := a.Allocate(activeMasterKeyIndex)
+	require.NoError(t, err)
+	require.Greater(t, next&spiCounterMask, responderMax,
+		"the seeded epoch must exceed the responder's retained max despite the one-generation lag")
+}
+
+// TestTunnelSeedsFromDurableHighWater proves the initiator-restart recovery
+// mechanism deterministically: a fresh initiator whose store already holds a high
+// high-water (as a prior process would have left) seeds its FIRST epoch above it, so
+// a survivor that retained that high-water still accepts the new SA. It also confirms
+// the value is re-persisted.
+func TestTunnelSeedsFromDurableHighWater(t *testing.T) {
+	const prior = uint32(1000)
+	store := &fakeEpochStore{}
+	store.set(prior)
+
+	initRec, respRec := newEpochRecorder(), newEpochRecorder()
+	initT, respT, cleanup := twoTunnelsWithStore(t, initRec.install, respRec.install, 100*time.Millisecond, store)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	brCh := make(chan error, 1)
+	go func() { brCh <- respT.Bringup(ctx) }()
+	require.NoError(t, initT.Bringup(ctx))
+	require.NoError(t, <-brCh)
+
+	ie, _ := initRec.snapshot()
+	re, _ := respRec.snapshot()
+	require.Len(t, ie, 1)
+	// First epoch is seeded strictly above the durable high-water (+margin), so it
+	// exceeds anything a survivor retained from the pre-restart session.
+	require.Equal(t, seedWithMargin(prior)+1, ie[0])
+	require.Greater(t, ie[0], prior)
+	require.Equal(t, ie[0], re[0], "both peers install the seeded epoch")
+
+	// The new high-water is persisted durably for the next restart.
+	require.Eventually(t, func() bool {
+		hw, ok := store.loaded()
+		return ok && hw == ie[0]
+	}, 2*time.Second, 5*time.Millisecond)
+}
+
+// TestTunnelRequireStateFailsBringupOnCorruptState asserts the fail-closed Load
+// policy: under RequireState a corrupt/unreadable store fails Bringup (on the
+// initiator), while the default policy starts fresh.
+func TestTunnelRequireStateFailsBringupOnCorruptState(t *testing.T) {
+	idA, err := GenerateIdentity()
+	require.NoError(t, err)
+	idB, err := GenerateIdentity()
+	require.NoError(t, err)
+	aInit, err := CanonicalInitiator(idA.PublicKey(), idB.PublicKey())
+	require.NoError(t, err)
+	initID, respID := idA, idB
+	if !aInit {
+		initID, respID = idB, idA
+	}
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	loadErr := errors.New("state corrupt")
+	tn, err := NewTunnel(TunnelConfig{
+		Local: initID, PeerPub: respID.PublicKey(), Conn: conn,
+		PeerAddr: conn.LocalAddr(), RekeyInterval: time.Second,
+		EpochStore: &fakeEpochStore{loadErr: loadErr}, RequireState: true,
+	}, func(uint32, [16]byte, [16]byte) error { return nil })
+	require.NoError(t, err)
+	require.True(t, tn.Initiator())
+	defer tn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// Bringup must fail closed at loadEpochState, before any session is established.
+	err = tn.Bringup(ctx)
+	require.Error(t, err)
+	require.ErrorIs(t, err, loadErr)
+	require.Nil(t, tn.sess)
+}
+
+func TestNewTunnelRequireStateNeedsStore(t *testing.T) {
+	idA, err := GenerateIdentity()
+	require.NoError(t, err)
+	idB, err := GenerateIdentity()
+	require.NoError(t, err)
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = NewTunnel(TunnelConfig{
+		Local: idA, PeerPub: idB.PublicKey(), Conn: conn,
+		PeerAddr: conn.LocalAddr(), RekeyInterval: time.Second, RequireState: true,
+	}, func(uint32, [16]byte, [16]byte) error { return nil })
+	require.Error(t, err, "RequireState without an EpochStore must be rejected")
+}
+
+// TestTunnelDurableRoundTripAcrossRestart is the true end-to-end durable-recovery
+// proof: a real initiator persists its climbing high-water to a shared store, then a
+// SECOND initiator instance on the SAME store (a simulated restart) reloads exactly
+// what the first persisted and will seed strictly above it.
+func TestTunnelDurableRoundTripAcrossRestart(t *testing.T) {
+	store := &fakeEpochStore{}
+	idA, err := GenerateIdentity()
+	require.NoError(t, err)
+	idB, err := GenerateIdentity()
+	require.NoError(t, err)
+	aInit, err := CanonicalInitiator(idA.PublicKey(), idB.PublicKey())
+	require.NoError(t, err)
+	initID, respID := idA, idB
+	if !aInit {
+		initID, respID = idB, idA
+	}
+
+	// Round 1: run a real pair until the initiator has persisted a couple generations.
+	func() {
+		respConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+		require.NoError(t, err)
+		defer respConn.Close()
+		initConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+		require.NoError(t, err)
+		defer initConn.Close()
+
+		t1, err := NewTunnel(TunnelConfig{
+			Local: initID, PeerPub: respID.PublicKey(), Conn: initConn,
+			PeerAddr: respConn.LocalAddr(), RekeyInterval: 100 * time.Millisecond, EpochStore: store,
+		}, newEpochRecorder().install)
+		require.NoError(t, err)
+		require.True(t, t1.Initiator())
+		r, err := NewTunnel(TunnelConfig{
+			Local: respID, PeerPub: initID.PublicKey(), Conn: respConn,
+			PeerAddr: initConn.LocalAddr(), RekeyInterval: 100 * time.Millisecond,
+		}, newEpochRecorder().install)
+		require.NoError(t, err)
+		defer t1.Close()
+		defer r.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		brCh := make(chan error, 1)
+		go func() { brCh <- r.Bringup(ctx) }()
+		require.NoError(t, t1.Bringup(ctx))
+		require.NoError(t, <-brCh)
+
+		runCh := make(chan error, 2)
+		go func() { runCh <- t1.Run(ctx) }()
+		go func() { runCh <- r.Run(ctx) }()
+		require.Eventually(t, func() bool {
+			hw, ok := store.loaded()
+			return ok && hw >= 2
+		}, 10*time.Second, 10*time.Millisecond, "initiator must persist a few generations")
+		cancel()
+		require.NoError(t, <-runCh)
+		require.NoError(t, <-runCh)
+	}()
+
+	persisted, ok := store.loaded()
+	require.True(t, ok)
+	require.GreaterOrEqual(t, persisted, uint32(2))
+
+	// Round 2: a fresh initiator (same identity + store) reloads what round 1 wrote.
+	conn2, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	require.NoError(t, err)
+	defer conn2.Close()
+	t2, err := NewTunnel(TunnelConfig{
+		Local: initID, PeerPub: respID.PublicKey(), Conn: conn2,
+		PeerAddr: conn2.LocalAddr(), RekeyInterval: time.Second, EpochStore: store,
+	}, func(uint32, [16]byte, [16]byte) error { return nil })
+	require.NoError(t, err)
+	require.True(t, t2.Initiator())
+	defer t2.Close()
+
+	require.NoError(t, t2.loadEpochState())
+	require.Equal(t, persisted, t2.installedHigh, "second instance loads exactly what the first persisted")
+	require.Greater(t, seedWithMargin(t2.epochSeed), persisted, "and seeds strictly above it")
+}
+
+// TestResponderIgnoresStore pins the initiator-only invariant: a responder configured
+// with a store (and even --require-state) must never consult or write it, must not be
+// gated by a load error, and must not start a persister.
+func TestResponderIgnoresStore(t *testing.T) {
+	idA, err := GenerateIdentity()
+	require.NoError(t, err)
+	idB, err := GenerateIdentity()
+	require.NoError(t, err)
+	aInit, err := CanonicalInitiator(idA.PublicKey(), idB.PublicKey())
+	require.NoError(t, err)
+	initID, respID := idA, idB
+	if !aInit {
+		initID, respID = idB, idA
+	}
+
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	store := &fakeEpochStore{loadErr: errors.New("responder must never read this")}
+	respT, err := NewTunnel(TunnelConfig{
+		Local: respID, PeerPub: initID.PublicKey(), Conn: conn,
+		PeerAddr: conn.LocalAddr(), RekeyInterval: time.Second,
+		EpochStore: store, RequireState: true,
+	}, func(uint32, [16]byte, [16]byte) error { return nil })
+	require.NoError(t, err)
+	require.False(t, respT.Initiator())
+	defer respT.Close()
+
+	// On the responder, loadEpochState is a no-op: it must not Load (so the load error
+	// and RequireState do not gate it) and must not start a persister.
+	require.NoError(t, respT.loadEpochState())
+	require.Nil(t, respT.persist)
+	loads, stores := store.counts()
+	require.Zero(t, loads, "responder must never Load its store")
+	require.Zero(t, stores, "responder must never Store")
 }

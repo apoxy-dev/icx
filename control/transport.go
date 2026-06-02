@@ -145,6 +145,13 @@ func newSession(ctx context.Context, conn *quic.Conn, role Role) (*Session, erro
 // Role reports whether this peer is the initiator or responder.
 func (s *Session) Role() Role { return s.role }
 
+// SeedRxFloor raises this session's RX SPI allocator so the next negotiated SPI
+// (and hence, for the initiator, the shared data-plane epoch) is strictly greater
+// than floor. It must be called before the session's first NegotiateSAs. The
+// Tunnel uses it to carry the epoch high-water across a reconnect/restart so the
+// data-plane epoch keeps increasing rather than resetting to 1.
+func (s *Session) SeedRxFloor(floor uint32) { s.rxAlloc.SeedFloor(activeMasterKeyIndex, floor) }
+
 // MasterKeys returns the PSP master keys derived from this session.
 func (s *Session) MasterKeys() *MasterKeys { return s.masterKeys }
 

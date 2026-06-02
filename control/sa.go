@@ -105,6 +105,13 @@ func MakeSPI(masterKeyIndex int, role Role, counter uint32) (uint32, error) {
 	return uint32(masterKeyIndex)<<31 | uint32(role)<<spiRoleShift | counter, nil
 }
 
+// ErrSPIExhausted is returned by Allocate when the 2^30 counter space for a
+// master-key index is used up. It is a TERMINAL condition for the shared-epoch
+// bridge: the only remedy is master-key rotation, which SharedEpoch does not yet
+// support (it requires master-key index 0). Callers treat it as a non-retryable,
+// fail-closed error rather than looping a reconnect.
+var ErrSPIExhausted = errors.New("control: SPI counter space exhausted; master-key rotation required")
+
 // SPIAllocator hands out monotonically increasing, collision-free SPIs for one
 // peer's role. SPIs are never reused within a master-key generation (PSP
 // requirement); exhaustion of the 2^30 counter space forces a master-key
@@ -125,10 +132,34 @@ func (a *SPIAllocator) Allocate(masterKeyIndex int) (uint32, error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.next[masterKeyIndex]++
-	c := a.next[masterKeyIndex]
-	if c > spiCounterMask {
-		return 0, fmt.Errorf("control: SPI space exhausted for master key %d; rotate", masterKeyIndex)
+	// Check before incrementing so an exhausted counter stays pinned at the
+	// ceiling (spiCounterMask is the last usable value) rather than wrapping.
+	if a.next[masterKeyIndex] >= spiCounterMask {
+		return 0, fmt.Errorf("%w (master key %d)", ErrSPIExhausted, masterKeyIndex)
 	}
-	return MakeSPI(masterKeyIndex, a.role, c)
+	a.next[masterKeyIndex]++
+	return MakeSPI(masterKeyIndex, a.role, a.next[masterKeyIndex])
+}
+
+// SeedFloor raises the allocator's counter for masterKeyIndex so the next
+// Allocate returns a counter strictly greater than floor's counter (the low 30
+// bits of floor). It is monotonic — a floor at or below the current position is a
+// no-op — and never lowers the counter, so it is safe to call on every new
+// session. The control plane uses this to carry a per-direction epoch high-water
+// across reconnects/restarts (see control/epochstate.go): seeding the initiator's
+// allocator above the survivor's retained data-plane epoch keeps the shared epoch
+// strictly increasing across a session boundary, so the survivor's monotonicity
+// guard accepts the new SA instead of rejecting a counter that reset to 1.
+//
+// It takes the same lock as Allocate; an out-of-range index is ignored.
+func (a *SPIAllocator) SeedFloor(masterKeyIndex int, floor uint32) {
+	if masterKeyIndex < 0 || masterKeyIndex >= numMasterKeys {
+		return
+	}
+	c := floor & spiCounterMask
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c > a.next[masterKeyIndex] {
+		a.next[masterKeyIndex] = c
+	}
 }
