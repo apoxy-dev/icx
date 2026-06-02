@@ -118,10 +118,26 @@ func newSession(ctx context.Context, conn *quic.Conn, role Role) (*Session, erro
 	// NextProtos don't overlap (both sides advertise only ALPN), but enforcing the
 	// invariant in code keeps it true if NextProtos is ever widened, and makes the
 	// guarantee auditable rather than implied.
-	tlsState := conn.ConnectionState().TLS
+	state := conn.ConnectionState()
+	tlsState := state.TLS
 	if tlsState.NegotiatedProtocol != ALPN {
 		_ = conn.CloseWithError(appErrNormal, "alpn mismatch")
 		return nil, fmt.Errorf("control: unexpected ALPN %q, want %q", tlsState.NegotiatedProtocol, ALPN)
+	}
+
+	// Enforce a FRESH ECDHE handshake: refuse a resumed session or 0-RTT. The data
+	// plane's nonce-uniqueness guarantee rests on every session deriving fresh master
+	// keys (so a reset/regressed SPI is always paired with a fresh key — see
+	// handler.UpdateVirtualNetworkSAs). Resumption is already disabled in the TLS config
+	// (SessionTicketsDisabled), so this is a fail-closed backstop against a silent
+	// regression rather than an expected path.
+	if tlsState.DidResume {
+		_ = conn.CloseWithError(appErrNormal, "session resumption forbidden")
+		return nil, errors.New("control: TLS session was resumed; a fresh ECDHE handshake is required for data-plane nonce safety")
+	}
+	if state.Used0RTT {
+		_ = conn.CloseWithError(appErrNormal, "0-RTT forbidden")
+		return nil, errors.New("control: connection used 0-RTT; a fresh ECDHE handshake is required for data-plane nonce safety")
 	}
 
 	root, err := ExportRootSecret(tlsState)

@@ -63,6 +63,14 @@ func baseTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, erro
 		NextProtos:       []string{ALPN},
 		CurvePreferences: []tls.CurveID{tls.CurveP256, tls.CurveP384},
 		VerifyConnection: pinVerifier(peerPub),
+		// Disable TLS 1.3 session resumption (and therefore 0-RTT). Every (re)connect
+		// MUST be a full ECDHE handshake so each session derives FRESH master keys: that
+		// freshness is the data plane's nonce-uniqueness foundation (the per-direction
+		// install guard accepts a reset/regressed SPI precisely because its key is fresh
+		// — see handler.UpdateVirtualNetworkSAs). A resumed session could reuse keying
+		// material and, paired with a reset SPI, repeat a (key, nonce) pair. The server
+		// also never issues tickets; newSession additionally asserts !DidResume/!0-RTT.
+		SessionTicketsDisabled: true,
 	}, nil
 }
 
