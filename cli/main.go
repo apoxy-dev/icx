@@ -101,14 +101,6 @@ func main() {
 				Name:  "require-fips",
 				Usage: "Refuse to start unless the Go FIPS 140-3 module is active (GODEBUG=fips140=on)",
 			},
-			&cli.StringFlag{
-				Name:  "state-file",
-				Usage: "Path to a durable epoch-state file (control plane). Persists the epoch high-water so a one-sided restart recovers seamlessly. Set on BOTH peers (the dialer/listener role is auto-elected). Without it, a one-sided initiator restart recovers only after both peers cycle",
-			},
-			&cli.BoolFlag{
-				Name:  "require-state",
-				Usage: "Fail closed if durable epoch state is corrupt/unreadable or persistently un-writable, instead of degrading to a fresh start. Requires --state-file. Integrity tripwire only — not rollback/deletion resistant",
-			},
 			&cli.IntFlag{
 				Name:    "port",
 				Aliases: []string{"p"},
@@ -555,23 +547,6 @@ func startControlPlane(ctx context.Context, c *cli.Context, h *icx.Handler, vni 
 		return nil, nil, err
 	}
 
-	// Durable epoch state (optional). Built role-agnostically; the Tunnel consults it
-	// only when this node is the elected initiator (the responder's high-water is not
-	// load-bearing), which is why it must be configured on both peers.
-	stateFile := c.String("state-file")
-	requireState := c.Bool("require-state")
-	if requireState && stateFile == "" {
-		return nil, nil, errors.New("--require-state requires --state-file")
-	}
-	var epochStore control.EpochStore
-	if stateFile != "" {
-		store, err := control.NewFileEpochStore(stateFile, ident, peerPub)
-		if err != nil {
-			return nil, nil, err
-		}
-		epochStore = store
-	}
-
 	ctrlNet := "udp4"
 	if peerUDPAddr.IP.To4() == nil {
 		ctrlNet = "udp6"
@@ -599,8 +574,8 @@ func startControlPlane(ctx context.Context, c *cli.Context, h *icx.Handler, vni 
 		keyLifetime = 24 * time.Hour
 	}
 
-	installer := func(epoch uint32, rxKey, txKey [16]byte) error {
-		return h.UpdateVirtualNetworkKeys(vni, epoch, rxKey, txKey, time.Now().Add(keyLifetime))
+	installer := func(rxSPI, txSPI uint32, rxKey, txKey [16]byte) error {
+		return h.UpdateVirtualNetworkSAs(vni, rxSPI, txSPI, rxKey, txKey, time.Now().Add(keyLifetime))
 	}
 
 	tun, err := control.NewTunnel(control.TunnelConfig{
@@ -609,8 +584,6 @@ func startControlPlane(ctx context.Context, c *cli.Context, h *icx.Handler, vni 
 		Conn:          pconn,
 		PeerAddr:      peerControlAddr,
 		RekeyInterval: rekeyIvl,
-		EpochStore:    epochStore,
-		RequireState:  requireState,
 	}, installer)
 	if err != nil {
 		_ = pconn.Close()
