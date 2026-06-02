@@ -77,13 +77,6 @@ Relevant flags:
 - `--rekey-interval DUR` — SA rotation period (default `2m`).
 - `--require-fips` — refuse to start unless the Go FIPS 140-3 module is active
   (build/run with `GODEBUG=fips140=on`).
-- `--state-file PATH` — persist the epoch high-water so a one-sided restart recovers
-  seamlessly (see "Restart / reconnect"). Set it on **both** peers. Without it, a
-  one-sided *initiator* restart recovers only after both peers cycle.
-- `--require-state` — fail closed if the state file is corrupt/unreadable or becomes
-  persistently un-writable, instead of degrading to a fresh start. Requires
-  `--state-file`. It is an integrity tripwire against accidental corruption, not a
-  defense against an attacker who can rewrite or delete the file.
 
 ### Operational notes
 
@@ -94,34 +87,26 @@ ends close together, and run under a supervisor (systemd `Restart=always`, a con
 restart policy) so a larger startup skew self-heals on restart. Once established, the control
 plane reconnects on its own indefinitely.
 
-**Restart / reconnect.** Control-plane keys are ephemeral, so a *clean* restart is always
-crypto-safe: a new session derives fresh keys, and a reset transmit counter cannot reuse a
-nonce under a fresh key. The remaining question is *availability* after a restart, which the
-control plane handles in two layers:
+**Restart / reconnect.** Control-plane keys are ephemeral, so any restart or reconnect is
+both crypto-safe and seamless, with **no persisted state to manage**.
 
-- **Always on (no flag):** the data-plane epoch counter resets to 1 on every (re)connect, but
-  the surviving peer's monotonicity guard only accepts a strictly increasing epoch. ICX
-  carries the epoch high-water forward in memory and seeds each new session above it, so a
-  **transient reconnect** (a network blip) and a **responder restart** recover immediately —
-  the surviving *initiator* keeps the high-water and the restarted responder comes up fresh.
+Each direction is a simplex SA with its own SPI: the receiver allocates it, the sender
+encrypts to it (`nonce = SPI‖counter`). The receive-SPI allocator resets to 1 on every
+(re)connect, but because each session is a fresh ECDHE handshake (no 0-RTT, no session
+resumption — both are disabled and asserted fail-closed), every generation also derives a
+**fresh master key**. A reset or regressed SPI is therefore always paired with a key that has
+never been used, so its from-zero counter is a fresh nonce space and no AES-GCM nonce can
+repeat. The data-plane install seam accepts the reset SPI for exactly this reason; the only
+thing it refuses is re-installing the *currently-live* transmit SPI (which would reset a live
+counter under an unchanged key).
 
-- **With `--state-file` (recommended):** the high-water is also persisted durably (fsync +
-  atomic rename, integrity-protected by a MAC keyed from the identity), so an **initiator
-  restart** recovers too — the restarted initiator reloads the high-water and resumes above
-  the survivor's retained epoch. The dialer/listener role is auto-elected from the keys, so
-  set `--state-file` on **both** peers; only the elected initiator's file is load-bearing, and
-  the start-up log shows whether durable state is active for this node's role.
+This makes every recovery path seamless and symmetric:
 
-Without `--state-file`, a one-sided *initiator* restart still has the old caveat: the survivor
-forwards on its existing keys until they expire and only re-keys once the new counter climbs
-past the retained high-water — **cycle both peers** to recover immediately.
-
-`--require-state` makes a corrupt/unreadable state file (or persistently failing writes) fail
-closed instead of silently starting fresh. It is an integrity tripwire against accidental
-corruption only: because keys are per-session ephemeral, even a rolled-back or deleted
-high-water cannot cause nonce reuse — only a transient outage — so rollback and deletion
-resistance (which would need a hardware monotonic counter) are out of scope. Use one state
-file per tunnel; do not share it between processes.
+- **Transient reconnect** (a network blip, both processes survive) — the next session derives
+  fresh keys and both directions resume immediately.
+- **One-sided restart** (either peer) — the restarted peer comes back with a fresh allocator
+  and a fresh handshake; the survivor accepts the reset SPI under its fresh key and traffic
+  resumes immediately. There is no high-water to carry forward and no peer to cycle.
 
 ## Static keys (legacy)
 
