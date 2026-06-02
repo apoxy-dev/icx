@@ -77,6 +77,13 @@ Relevant flags:
 - `--rekey-interval DUR` — SA rotation period (default `2m`).
 - `--require-fips` — refuse to start unless the Go FIPS 140-3 module is active
   (build/run with `GODEBUG=fips140=on`).
+- `--state-file PATH` — persist the epoch high-water so a one-sided restart recovers
+  seamlessly (see "Restart / reconnect"). Set it on **both** peers. Without it, a
+  one-sided *initiator* restart recovers only after both peers cycle.
+- `--require-state` — fail closed if the state file is corrupt/unreadable or becomes
+  persistently un-writable, instead of degrading to a fresh start. Requires
+  `--state-file`. It is an integrity tripwire against accidental corruption, not a
+  defense against an attacker who can rewrite or delete the file.
 
 ### Operational notes
 
@@ -87,16 +94,34 @@ ends close together, and run under a supervisor (systemd `Restart=always`, a con
 restart policy) so a larger startup skew self-heals on restart. Once established, the control
 plane reconnects on its own indefinitely.
 
-**Restart / reconnect.** Control-plane keys are ephemeral, so a *clean* restart is safe: a
-new session derives fresh keys, and a reset transmit counter cannot reuse a nonce under a
-fresh key. But this build does not persist the per-session epoch high-water mark across a
-restart, so a **one-sided** restart does not promptly recover: the survivor keeps the high
-epoch from the old session, the restarted peer comes back at a low epoch, and the survivor's
-monotonicity guard rejects it — breaking traffic in **both** directions. The link forwards on
-the survivor's existing keys until they expire and only re-keys once the new session's epoch
-counter climbs back above the survivor's retained high-water mark (many rekey intervals). In
-practice, **cycle both peers** to recover immediately. Durable epoch state for seamless
-one-sided restart is planned follow-up work.
+**Restart / reconnect.** Control-plane keys are ephemeral, so a *clean* restart is always
+crypto-safe: a new session derives fresh keys, and a reset transmit counter cannot reuse a
+nonce under a fresh key. The remaining question is *availability* after a restart, which the
+control plane handles in two layers:
+
+- **Always on (no flag):** the data-plane epoch counter resets to 1 on every (re)connect, but
+  the surviving peer's monotonicity guard only accepts a strictly increasing epoch. ICX
+  carries the epoch high-water forward in memory and seeds each new session above it, so a
+  **transient reconnect** (a network blip) and a **responder restart** recover immediately —
+  the surviving *initiator* keeps the high-water and the restarted responder comes up fresh.
+
+- **With `--state-file` (recommended):** the high-water is also persisted durably (fsync +
+  atomic rename, integrity-protected by a MAC keyed from the identity), so an **initiator
+  restart** recovers too — the restarted initiator reloads the high-water and resumes above
+  the survivor's retained epoch. The dialer/listener role is auto-elected from the keys, so
+  set `--state-file` on **both** peers; only the elected initiator's file is load-bearing, and
+  the start-up log shows whether durable state is active for this node's role.
+
+Without `--state-file`, a one-sided *initiator* restart still has the old caveat: the survivor
+forwards on its existing keys until they expire and only re-keys once the new counter climbs
+past the retained high-water — **cycle both peers** to recover immediately.
+
+`--require-state` makes a corrupt/unreadable state file (or persistently failing writes) fail
+closed instead of silently starting fresh. It is an integrity tripwire against accidental
+corruption only: because keys are per-session ephemeral, even a rolled-back or deleted
+high-water cannot cause nonce reuse — only a transient outage — so rollback and deletion
+resistance (which would need a hardware monotonic counter) are out of scope. Use one state
+file per tunnel; do not share it between processes.
 
 ## Static keys (legacy)
 
