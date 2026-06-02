@@ -350,6 +350,70 @@ func TestUpdateVirtualNetworkKeysGuards(t *testing.T) {
 		"lower epoch must be rejected (monotonicity)")
 }
 
+// TestUpdateVirtualNetworkSAsGuards exercises the control-plane install seam directly.
+// Because every control-plane generation carries a FRESH per-session key, this path does
+// NOT enforce SPI monotonicity: a reconnect resets the allocator to a low SPI and that
+// reset SPI must be re-accepted under its fresh key. The only fail-closed guards are
+// non-zero SPIs, distinct rx/tx keys, and a TX anti-reset check that refuses to re-install
+// the CURRENTLY-live transmit SA — same SPI AND same key (the one in-process action that
+// would reset a live counter under an unchanged key). A colliding SPI under a FRESH key,
+// which is exactly the transient-reconnect case, is accepted.
+func TestUpdateVirtualNetworkSAsGuards(t *testing.T) {
+	localAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()), Port: 1234}
+	peerAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()), Port: 4321}
+
+	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr), icx.WithLayer3VirtFrames())
+	require.NoError(t, err)
+
+	const vni = 0x9a9a
+	prefix := netip.MustParsePrefix("192.168.1.0/24")
+	require.NoError(t, h.AddVirtualNetwork(vni, peerAddr, []icx.Route{{Src: prefix, Dst: prefix}}))
+
+	var k1, k2, k3, k4 [16]byte
+	copy(k1[:], []byte("aaaaaaaaaaaaaaaa"))
+	copy(k2[:], []byte("bbbbbbbbbbbbbbbb"))
+	copy(k3[:], []byte("cccccccccccccccc"))
+	copy(k4[:], []byte("dddddddddddddddd"))
+	exp := time.Now().Add(time.Hour)
+
+	// Either direction's SPI being zero (reserved) is rejected.
+	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 0, 20, k1, k2, exp), "rx SPI 0 must be rejected")
+	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 10, 0, k1, k2, exp), "tx SPI 0 must be rejected")
+
+	// Equal rx/tx keys are rejected even on the first install.
+	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k1, k1, exp), "equal rx/tx keys must be rejected")
+
+	// First install with distinct per-direction SPIs and distinct keys succeeds.
+	// Live transmit SA is now (SPI 20, key k2).
+	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k1, k2, exp))
+
+	// Re-installing the IDENTICAL live transmit SA (same SPI AND same key) is rejected —
+	// that is the one action that would reset a live counter under its own key. The rx side
+	// is irrelevant to this guard.
+	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k1, k2, exp),
+		"re-installing the identical live tx SA must be rejected")
+	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 99, 20, k3, k2, exp),
+		"the live tx SA is keyed by (SPI, key); a different rx SPI does not make it safe")
+
+	// The SAME transmit SPI under a FRESH key is accepted — this is the transient-reconnect
+	// case (the allocator reset to a colliding SPI value, but the master key is fresh, so the
+	// from-zero counter is a fresh nonce space). Live tx SA is now (SPI 20, key k4).
+	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k3, k4, exp),
+		"a colliding tx SPI under a fresh key is accepted (reconnect recovery)")
+
+	// A reused (non-increasing) RX SPI is accepted — the receive side never emits a nonce,
+	// so a repeated receive SPI under a fresh key is harmless. Here rx stays at 10 while tx
+	// advances to 21; live tx SA is now (21, k2).
+	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 10, 21, k1, k2, exp),
+		"a reused rx SPI is accepted (no rx monotonicity guard)")
+
+	// A LOWER transmit SPI is accepted — it can only arrive from a fresh session whose key
+	// is fresh, so the reset counter is a fresh nonce space. This models a peer reconnect
+	// that reset its allocator: rx and tx both drop back to low values. Live tx SA is now (5, k4).
+	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 3, 5, k3, k4, exp),
+		"a lower tx SPI under a fresh key is accepted (reconnect recovery)")
+}
+
 // TestRXRejectsSPINonceMismatch proves the RX side rejects a frame whose nonce
 // SPI (nonce[:4]) does not match the key epoch it selected, on BOTH the
 // cross-buffer and in-place decap paths, and that TX binds the SPI into the
