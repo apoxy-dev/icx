@@ -47,6 +47,12 @@ func DeriveMasterKeys(rootSecret []byte) (*MasterKeys, error) {
 // most-significant bit of the SPI.
 func MasterKeyIndex(spi uint32) int { return int(spi >> 31) }
 
+// RoleOf reports which role allocated an SPI, per the role bit (bit30). It is
+// the inverse of the role argument to MakeSPI and lets a peer validate that an
+// announced RX SPI was allocated by the opposite role, preserving the SPI-space
+// partition that keeps tx and rx keys distinct.
+func RoleOf(spi uint32) Role { return Role((spi >> spiRoleShift) & 1) }
+
 // SA is a unidirectional PSP security association: an SPI, the derived AES-GCM
 // key, and the PSP version (which fixes the key length / cipher).
 type SA struct {

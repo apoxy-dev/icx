@@ -23,11 +23,29 @@ var exporterContext = []byte("icx control plane master seed v1")
 // RootSecretLen is the length of the exported master-key seed (256-bit).
 const RootSecretLen = 32
 
-// pinVerifier returns a tls.Config.VerifyConnection callback that authenticates
-// the peer WireGuard-style: the leaf certificate's public key must equal the
-// pinned peer identity key. Chain/CA/hostname validation is intentionally not
-// used (the certificates are self-signed); pinning is the whole trust model.
-func pinVerifier(peerPub *ecdsa.PublicKey) func(tls.ConnectionState) error {
+// PeerAuthorizer authenticates a connecting peer by its identity public key.
+// It runs inside the TLS handshake (VerifyConnection); a non-nil error fails
+// the handshake before any session state exists. Implementations must be safe
+// for concurrent use — a multi-peer listener runs one handshake per inbound
+// peer.
+type PeerAuthorizer func(peerPub *ecdsa.PublicKey) error
+
+// PinnedPeer returns a PeerAuthorizer that accepts exactly one peer key — the
+// WireGuard-style 1:1 trust model used by the symmetric tunnel.
+func PinnedPeer(peerPub *ecdsa.PublicKey) PeerAuthorizer {
+	return func(leafPub *ecdsa.PublicKey) error {
+		if !leafPub.Equal(peerPub) {
+			return errors.New("control: peer key pin mismatch")
+		}
+		return nil
+	}
+}
+
+// authVerifier returns a tls.Config.VerifyConnection callback that extracts
+// the leaf certificate's ECDSA key and hands it to authorize. Chain/CA/
+// hostname validation is intentionally not used (the certificates are
+// self-signed); identity-key authorization is the whole trust model.
+func authVerifier(authorize PeerAuthorizer) func(tls.ConnectionState) error {
 	return func(cs tls.ConnectionState) error {
 		if len(cs.PeerCertificates) == 0 {
 			return errors.New("control: peer presented no certificate")
@@ -36,21 +54,18 @@ func pinVerifier(peerPub *ecdsa.PublicKey) func(tls.ConnectionState) error {
 		if !ok {
 			return errors.New("control: peer certificate key is not ECDSA")
 		}
-		if !leafPub.Equal(peerPub) {
-			return errors.New("control: peer key pin mismatch")
-		}
-		return nil
+		return authorize(leafPub)
 	}
 }
 
 // baseTLSConfig builds the shared TLS 1.3 configuration: our self-signed
-// identity certificate, the pinned-peer verifier, TLS 1.3 only, the ICX ALPN,
+// identity certificate, the peer authorizer, TLS 1.3 only, the ICX ALPN,
 // and FIPS-approved curves. In a fips140=on build the module further restricts
 // the suite to AES-GCM + SHA-2 and disables X25519/ChaCha automatically, so the
 // whole handshake stays inside the validated boundary.
-func baseTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, error) {
-	if local == nil || peerPub == nil {
-		return nil, errors.New("control: local identity and peer key are required")
+func baseTLSConfig(local *Identity, authorize PeerAuthorizer) (*tls.Config, error) {
+	if local == nil || authorize == nil {
+		return nil, errors.New("control: local identity and peer authorizer are required")
 	}
 	cert, err := local.TLSCertificate()
 	if err != nil {
@@ -62,7 +77,7 @@ func baseTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, erro
 		MaxVersion:       tls.VersionTLS13,
 		NextProtos:       []string{ALPN},
 		CurvePreferences: []tls.CurveID{tls.CurveP256, tls.CurveP384},
-		VerifyConnection: pinVerifier(peerPub),
+		VerifyConnection: authVerifier(authorize),
 		// Disable TLS 1.3 session resumption (and therefore 0-RTT). Every (re)connect
 		// MUST be a full ECDHE handshake so each session derives FRESH master keys: that
 		// freshness is the data plane's nonce-uniqueness foundation (the per-direction
@@ -77,11 +92,22 @@ func baseTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, erro
 // ServerTLSConfig builds the responder side of the control-plane mTLS: it
 // requires (and pins) a client certificate.
 func ServerTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, error) {
-	cfg, err := baseTLSConfig(local, peerPub)
+	if peerPub == nil {
+		return nil, errors.New("control: peer key is required")
+	}
+	return ServerTLSConfigAuth(local, PinnedPeer(peerPub))
+}
+
+// ServerTLSConfigAuth builds a multi-peer responder mTLS config: any client
+// whose identity key passes authorize may complete the handshake. This is the
+// key-plane trust model (one responder, many authorized initiators), vs
+// ServerTLSConfig's 1:1 pinned tunnel.
+func ServerTLSConfigAuth(local *Identity, authorize PeerAuthorizer) (*tls.Config, error) {
+	cfg, err := baseTLSConfig(local, authorize)
 	if err != nil {
 		return nil, err
 	}
-	// Accept any presented client cert at the chain layer; pinVerifier (run via
+	// Accept any presented client cert at the chain layer; authVerifier (run via
 	// VerifyConnection) is what actually authenticates it.
 	cfg.ClientAuth = tls.RequireAnyClientCert
 	return cfg, nil
@@ -89,7 +115,10 @@ func ServerTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, er
 
 // ClientTLSConfig builds the initiator side of the control-plane mTLS.
 func ClientTLSConfig(local *Identity, peerPub *ecdsa.PublicKey) (*tls.Config, error) {
-	cfg, err := baseTLSConfig(local, peerPub)
+	if peerPub == nil {
+		return nil, errors.New("control: peer key is required")
+	}
+	cfg, err := baseTLSConfig(local, PinnedPeer(peerPub))
 	if err != nil {
 		return nil, err
 	}
