@@ -13,34 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSelectMode(t *testing.T) {
-	cases := []struct {
-		name                    string
-		keyFile, identity, peer bool
-		want                    Mode
-		wantErr                 bool
-	}{
-		{"static", true, false, false, ModeStatic, false},
-		{"control-plane", false, true, true, ModeControlPlane, false},
-		{"cp half (identity only)", false, true, false, ModeNone, true},
-		{"cp half (peer only)", false, false, true, ModeNone, true},
-		{"both modes", true, true, true, ModeNone, true},
-		{"static + identity", true, true, false, ModeNone, true},
-		{"nothing", false, false, false, ModeNone, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := SelectMode(tc.keyFile, tc.identity, tc.peer)
-			if tc.wantErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-			require.Equal(t, tc.want, got)
-		})
-	}
-}
-
 func TestCanonicalInitiator(t *testing.T) {
 	a, err := GenerateIdentity()
 	require.NoError(t, err)

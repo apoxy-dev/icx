@@ -34,51 +34,6 @@ import (
 // SPI), which makes a transient reconnect and a one-sided restart of either peer recover
 // seamlessly with zero on-disk state.
 
-// Mode is the keying mode selected from the CLI flags.
-type Mode int
-
-const (
-	ModeNone Mode = iota
-	// ModeStatic is the legacy static pre-shared keys loaded from an INI file.
-	ModeStatic
-	// ModeControlPlane is the QUIC/mTLS control plane with ephemeral, forward-secret,
-	// per-session keys.
-	ModeControlPlane
-)
-
-func (m Mode) String() string {
-	switch m {
-	case ModeStatic:
-		return "static"
-	case ModeControlPlane:
-		return "control-plane"
-	default:
-		return "none"
-	}
-}
-
-// SelectMode resolves the keying mode from which flags are set, fail-closed.
-// Exactly one mode must be configured: either static keys (--key-file) OR the
-// control plane (--identity-key AND --peer-key). Any other combination — both, the
-// control plane half-configured, or nothing — is an error. There is deliberately no
-// silent fallback from the control plane to static keys.
-func SelectMode(hasKeyFile, hasIdentity, hasPeer bool) (Mode, error) {
-	cp := hasIdentity || hasPeer
-	switch {
-	case hasKeyFile && cp:
-		return ModeNone, errors.New("conflicting keying modes: set --key-file (static) OR --identity-key/--peer-key (control plane), not both")
-	case cp:
-		if !hasIdentity || !hasPeer {
-			return ModeNone, errors.New("control-plane mode requires both --identity-key and --peer-key")
-		}
-		return ModeControlPlane, nil
-	case hasKeyFile:
-		return ModeStatic, nil
-	default:
-		return ModeNone, errors.New("no keying configured: set --key-file (static) or --identity-key and --peer-key (control plane)")
-	}
-}
-
 // CanonicalInitiator reports whether the local node is the control-plane initiator
 // — the peer that dials. The role is elected deterministically from the two pinned
 // identities so both ends agree with zero configuration (WireGuard-style): the node
