@@ -73,8 +73,38 @@ func Listen(pconn net.PacketConn, local *Identity, peerPub *ecdsa.PublicKey) (*L
 	if err != nil {
 		return nil, err
 	}
+	return listen(pconn, tlsConf, defaultQUICConfig())
+}
+
+// keyPlaneMaxConcurrentStreams bounds how many in-flight per-sandbox exchange
+// streams a single key-plane session may have open at once. Each exchange is a
+// short request/reply on its own stream that roundTrip/ServeKeyPlane open,
+// drain to EOF, and retire — so this caps CONCURRENT sandbox starts on one
+// worker session, not the lifetime total. Raising it trades responder memory
+// for burst headroom; exceeding it makes the next OpenStreamSync block (not
+// fail) until an earlier exchange's stream retires.
+const keyPlaneMaxConcurrentStreams = 256
+
+// ListenPeers returns a multi-peer control-plane listener: any peer whose
+// identity key passes authorize may establish a session. This is the
+// key-plane trust model (one responder, many authorized initiators — see
+// ServeKeyPlane); the symmetric 1:1 tunnel keeps using Listen. The QUIC
+// config allows a deeper incoming-stream window than the 1:1 tunnel because
+// each sandbox start opens a short-lived exchange stream and starts arrive in
+// bursts.
+func ListenPeers(pconn net.PacketConn, local *Identity, authorize PeerAuthorizer) (*Listener, error) {
+	tlsConf, err := ServerTLSConfigAuth(local, authorize)
+	if err != nil {
+		return nil, err
+	}
+	cfg := defaultQUICConfig()
+	cfg.MaxIncomingStreams = keyPlaneMaxConcurrentStreams
+	return listen(pconn, tlsConf, cfg)
+}
+
+func listen(pconn net.PacketConn, tlsConf *tls.Config, cfg *quic.Config) (*Listener, error) {
 	tr := &quic.Transport{Conn: pconn}
-	ln, err := tr.Listen(tlsConf, defaultQUICConfig())
+	ln, err := tr.Listen(tlsConf, cfg)
 	if err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("control: listen: %w", err)
@@ -168,6 +198,22 @@ func (s *Session) MasterKeys() *MasterKeys { return s.masterKeys }
 // peer certificate). Useful for logging and for asserting the FIPS suite.
 func (s *Session) TLSState() tls.ConnectionState { return s.conn.ConnectionState().TLS }
 
+// PeerPublicKey returns the peer's authenticated identity key — the leaf
+// certificate's ECDSA key, already verified by the handshake's authorizer.
+// On a multi-peer responder this is how a session maps back to which
+// initiator it belongs to.
+func (s *Session) PeerPublicKey() (*ecdsa.PublicKey, error) {
+	certs := s.conn.ConnectionState().TLS.PeerCertificates
+	if len(certs) == 0 {
+		return nil, errors.New("control: peer presented no certificate")
+	}
+	pub, ok := certs[0].PublicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, errors.New("control: peer certificate key is not ECDSA")
+	}
+	return pub, nil
+}
+
 // Context returns a context that is cancelled when the underlying QUIC connection
 // closes (peer close, idle timeout, or transport error). RunTunnel selects on it to
 // detect session loss promptly rather than waiting for the next rekey tick.
@@ -251,6 +297,20 @@ func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalS
 func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) (*DirectionalSAs, error) {
 	if peer.Version != v {
 		return nil, fmt.Errorf("control: cipher suite mismatch: local %d, peer %d", v, peer.Version)
+	}
+	// The peer's RX SPI is attacker-influenced on the multi-peer key plane, so
+	// enforce the role-partition invariant before deriving a key from it: a
+	// peer-allocated SPI MUST carry the opposite role bit and the active
+	// master-key index. Without this a malicious initiator could announce an SPI
+	// inside the responder's own role/index partition, making the responder's TX
+	// key for one exchange collide byte-for-byte with an RX key its allocator
+	// later mints for a different VNI — same key, same SPI, distinct SA, i.e.
+	// catastrophic (key, nonce) reuse the per-exchange tx!=rx guard cannot see.
+	if MasterKeyIndex(peer.RxSPI) != activeMasterKeyIndex {
+		return nil, fmt.Errorf("control: peer SPI uses inactive master-key index %d", MasterKeyIndex(peer.RxSPI))
+	}
+	if RoleOf(peer.RxSPI) == s.role {
+		return nil, errors.New("control: peer SPI collides with the local role partition (SPI spoofing)")
 	}
 	rx, err := s.masterKeys.DeriveSA(myRxSPI, v)
 	if err != nil {
