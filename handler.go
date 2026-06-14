@@ -400,9 +400,9 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 // accepted, as is any lower-or-higher txSPI; safety rests on the fresh-key guarantee
 // above, not on monotonicity.
 // Callers must serialize installs per VNI; the guard→install sequence is not
-// internally locked (the control plane is single-threaded per Tunnel). Static
-// pre-shared keys, which have NO per-session freshness, must use the strictly-guarded
-// UpdateVirtualNetworkKeys instead.
+// internally locked (the control plane is single-threaded per Tunnel). Manually-keyed
+// SAs that lack per-session key freshness should use the strictly-guarded single-epoch
+// UpdateVirtualNetworkKeys seam instead.
 func (h *Handler) UpdateVirtualNetworkSAs(vni uint, rxSPI, txSPI uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
@@ -447,19 +447,21 @@ func (h *Handler) UpdateVirtualNetworkSAs(vni uint, rxSPI, txSPI uint32, rxKey, 
 	return h.installKeys(vnet, rxSPI, txSPI, rxKey, txKey, expiresAt)
 }
 
-// UpdateVirtualNetworkKeys is the legacy install seam for STATIC pre-shared keys
-// (the --key-file/INI path): it installs a single epoch (SPI) for BOTH simplex
-// directions, separated only by the distinct rx/tx keys.
+// UpdateVirtualNetworkKeys installs a single epoch (SPI) for BOTH simplex directions,
+// separated only by the distinct rx/tx keys. It is the simple manual-keying seam — used
+// by tests and by embedders that drive their own keying rather than the QUIC control
+// plane (which installs genuine per-direction SAs via UpdateVirtualNetworkSAs).
 //
-// Unlike the control plane, static keys carry NO per-session freshness — the same key
-// is reused across reloads and process restarts — so this path keeps the STRICT
-// monotonicity guard: the epoch must strictly increase within the process. That stops
-// an operator from reinstalling an older-or-equal epoch with a reused key (which would
-// reset the counter under an already-used (epoch, key) and reuse a nonce). It does NOT
-// (and cannot) prevent a cross-RESTART reuse — a restart resets the in-memory counter
-// to zero under the persisted key (the residual APO-644 hazard); the control plane
-// (fresh per-session keys) is the fix, which is why static keying is being retired.
-// Callers must serialize installs per VNI (the static path does so under a mutex).
+// It enforces a STRICT monotonicity guard: the epoch must strictly increase within the
+// process. That stops a caller from reinstalling an older-or-equal epoch with a reused
+// key, which would reset the GCM counter under an already-used (epoch, key) and repeat a
+// nonce. The guard cannot see across process restarts, so a caller that supplies a key
+// which SURVIVES restarts (e.g. one read from disk) MUST advance the epoch past the last
+// value used in any prior run — otherwise the from-zero counter reuses nonces under the
+// persisted key. The control plane sidesteps this entirely by deriving a fresh key per
+// session; manual callers own the invariant.
+//
+// Callers must serialize installs per VNI.
 func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
@@ -470,7 +472,8 @@ func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey 
 	if epoch == 0 {
 		return errors.New("epoch (SPI) must be non-zero")
 	}
-	// Strict monotonicity (static keys have no per-session key freshness to fall back on).
+	// Strict monotonicity: a manual-keyed caller has no per-session key freshness to fall
+	// back on, so the epoch must strictly increase or a reset counter could reuse a nonce.
 	if cur := vnet.txCipher.Load(); cur != nil && epoch <= cur.epoch {
 		return fmt.Errorf("epoch must be monotonically increasing: new %d <= current %d", epoch, cur.epoch)
 	}

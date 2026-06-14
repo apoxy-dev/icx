@@ -214,9 +214,9 @@ func TestSharedEpochCollapseMismatchDropsTraffic(t *testing.T) {
 	hI := newPeerHandler(t, vni, addrA, addrB)
 	hR := newPeerHandler(t, vni, addrB, addrA)
 
-	// Collapse both directions onto each peer's OWN receive SPI via the legacy shared-
-	// epoch shim. hI then transmits under iSAs.Rx.SPI, which hR (installed under
-	// rSAs.Rx.SPI) does not have.
+	// Collapse both directions onto each peer's OWN receive SPI via the single-epoch
+	// UpdateVirtualNetworkKeys seam. hI then transmits under iSAs.Rx.SPI, which hR
+	// (installed under rSAs.Rx.SPI) does not have.
 	var iRx, iTx, rRx, rTx [16]byte
 	copy(iRx[:], iSAs.Rx.Key)
 	copy(iTx[:], iSAs.Tx.Key)
