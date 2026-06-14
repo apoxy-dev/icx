@@ -10,7 +10,6 @@ require (
 	github.com/urfave/cli/v2 v2.27.7
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sync v0.16.0
-	gopkg.in/ini.v1 v1.67.0
 	gvisor.dev/gvisor v0.0.0-20250606001031-fa4c4dd86b43
 )
 

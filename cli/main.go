@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/fips140"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -18,7 +17,6 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -37,8 +35,6 @@ import (
 	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/queues"
 	"github.com/apoxy-dev/icx/veth"
-
-	ini "gopkg.in/ini.v1"
 )
 
 func main() {
@@ -56,10 +52,10 @@ func main() {
 				Usage:   "Set the logging level (debug, info, warn, error, fatal, panic)",
 				Value:   "info",
 			},
-			// NOTE: --interface and --key-file are intentionally NOT marked Required.
-			// urfave/cli enforces required root flags before dispatching to a
-			// subcommand, which would make `icx genkey`/`icx pubkey` unrunnable. They
-			// are validated inside run() instead.
+			// NOTE: --interface is intentionally NOT marked Required. urfave/cli
+			// enforces required root flags before dispatching to a subcommand, which
+			// would make `icx genkey`/`icx pubkey` unrunnable. It is validated inside
+			// run() instead.
 			&cli.StringFlag{
 				Name:    "interface",
 				Aliases: []string{"i"},
@@ -70,10 +66,6 @@ func main() {
 				Aliases: []string{"v"},
 				Usage:   "Virtual Network Identifier (VNI) for the tunnel (24-bit value)",
 				Value:   1,
-			},
-			&cli.StringFlag{
-				Name:  "key-file",
-				Usage: "Path to INI file with static keys (rx, tx, optional expires). Legacy/static mode; prefer the control plane (--identity-key/--peer-key)",
 			},
 			&cli.StringFlag{
 				Name:  "identity-key",
@@ -253,14 +245,10 @@ func run(c *cli.Context) error {
 	}
 	slog.SetLogLoggerLevel(level)
 
-	// Resolve the keying mode (static INI vs control plane) up front, fail-closed:
-	// exactly one must be configured, and there is no silent fallback between them.
-	keyFile := c.String("key-file")
-	identityKey := c.String("identity-key")
-	peerKey := c.String("peer-key")
-	mode, err := control.SelectMode(keyFile != "", identityKey != "", peerKey != "")
-	if err != nil {
-		return err
+	// The control plane is the only keying mode: require both halves of the pinned
+	// identity pair up front, fail-closed. There is deliberately no static/INI fallback.
+	if c.String("identity-key") == "" || c.String("peer-key") == "" {
+		return errors.New("control-plane keying requires both --identity-key and --peer-key (generate them with `icx genkey` / `icx pubkey`)")
 	}
 
 	if c.String("interface") == "" {
@@ -409,24 +397,15 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to add virtual network: %w", err)
 	}
 
-	// Keying: install the data-plane keys (and arrange ongoing rotation) according to
-	// the selected mode. tun is non-nil only in control-plane mode.
-	var tun *control.Tunnel
-	switch mode {
-	case control.ModeStatic:
-		if err := runStaticKeying(ctx, c, h, vni); err != nil {
-			return err
-		}
-	case control.ModeControlPlane:
-		var ctrlConn *net.UDPConn
-		tun, ctrlConn, err = startControlPlane(ctx, c, h, vni, peerUDPAddr)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tun.Close() }()
-		// The Tunnel only borrows the control socket; own its lifetime here.
-		defer func() { _ = ctrlConn.Close() }()
+	// Establish the QUIC/mTLS control plane: install the initial SAs and drive ongoing
+	// rekeys. This is the only keying path.
+	tun, ctrlConn, err := startControlPlane(ctx, c, h, vni, peerUDPAddr)
+	if err != nil {
+		return err
 	}
+	defer func() { _ = tun.Close() }()
+	// The Tunnel only borrows the control socket; own its lifetime here.
+	defer func() { _ = ctrlConn.Close() }()
 
 	fwd, err := forwarder.NewForwarder(
 		h,
@@ -439,93 +418,22 @@ func run(c *cli.Context) error {
 		return fmt.Errorf("failed to create forwarder: %w", err)
 	}
 
-	// In control-plane mode, run the rekey loop and the forwarder under one errgroup
-	// sharing a cancel: a signal (ctx) or a forwarder error stops both. The control
-	// plane reconnects indefinitely on its own (Tunnel.Run does not return on CP
-	// failures), so it does not abort the forwarder; if it cannot re-establish, the
-	// data plane fails closed when the installed keys expire (see key lifetime below).
-	if tun != nil {
-		g, gctx := errgroup.WithContext(ctx)
-		g.Go(func() error { return tun.Run(gctx) })
-		g.Go(func() error {
-			if err := fwd.Start(gctx); err != nil && !errors.Is(err, context.Canceled) {
-				return fmt.Errorf("forwarder: %w", err)
-			}
-			return nil
-		})
-		if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
-			return err
+	// Run the rekey loop and the forwarder under one errgroup sharing a cancel: a signal
+	// (ctx) or a forwarder error stops both. The control plane reconnects indefinitely on
+	// its own (Tunnel.Run does not return on CP failures), so it does not abort the
+	// forwarder; if it cannot re-establish, the data plane fails closed when the installed
+	// keys expire (see key lifetime below).
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return tun.Run(gctx) })
+	g.Go(func() error {
+		if err := fwd.Start(gctx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("forwarder: %w", err)
 		}
 		return nil
-	}
-
-	if err := fwd.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return fmt.Errorf("failed to start forwarder: %w", err)
-	}
-
-	return nil
-}
-
-// runStaticKeying installs the static INI keys and starts the SIGHUP reload loop.
-// This is the legacy path; it is gated to ModeStatic so a control-plane deployment
-// never has a competing installer touching the same VNI.
-func runStaticKeying(ctx context.Context, c *cli.Context, h *icx.Handler, vni uint) error {
-	keyFile := c.String("key-file")
-	epoch := uint32(1) // initial epoch
-	rxKey, txKey, expiresAt, err := loadKeysFromINI(keyFile)
-	if err != nil {
+	})
+	if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	if err := h.UpdateVirtualNetworkKeys(vni, epoch, rxKey, txKey, expiresAt); err != nil {
-		return fmt.Errorf("failed to update virtual network key: %w", err)
-	}
-	slog.Warn("using static INI keys (legacy mode); prefer the control plane (--identity-key/--peer-key). " +
-		"A restart re-reads the INI at epoch 1 with the TX counter reset, so do not restart against an unchanged key file")
-
-	var keyMu sync.Mutex
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGHUP)
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-sigCh:
-				newRX, newTX, newExpires, loadErr := loadKeysFromINI(keyFile)
-				if loadErr != nil {
-					slog.Error("Key reload failed", slog.Any("error", loadErr))
-					continue
-				}
-
-				keyMu.Lock()
-				// Refuse reload if keys are identical to current ones.
-				if rxKey == newRX && txKey == newTX {
-					slog.Warn("Refusing key reload: rx/tx unchanged; keeping current epoch",
-						slog.Uint64("epoch", uint64(epoch)),
-					)
-					keyMu.Unlock()
-					continue
-				}
-
-				// Keys changed: commit and bump epoch.
-				rxKey = newRX
-				txKey = newTX
-				expiresAt = newExpires
-				epoch++
-
-				if err := h.UpdateVirtualNetworkKeys(vni, epoch, rxKey, txKey, expiresAt); err != nil {
-					slog.Error("Failed to apply reloaded keys", slog.Any("error", err))
-				} else {
-					slog.Info("Reloaded keys",
-						slog.Uint64("epoch", uint64(epoch)),
-						slog.Time("expiresAt", expiresAt),
-					)
-				}
-				keyMu.Unlock()
-			}
-		}
-	}()
 	return nil
 }
 
@@ -620,69 +528,6 @@ func readPeerKey(val string) (*ecdsa.PublicKey, error) {
 		s = strings.TrimSpace(string(data))
 	}
 	return control.ParsePublicKey(s)
-}
-
-// loadKeysFromINI loads rx/tx (hex, 16-byte each) and optional expires from an INI file.
-//
-// Required layout:
-//
-//	[keys]
-//	rx=0123... (32 hex chars -> 16 bytes)
-//	tx=abcd... (32 hex chars -> 16 bytes)
-//	expires=24h            // OR RFC3339 like 2025-10-16T12:34:56Z
-//
-// "expires" may be either a Go duration (e.g., "24h", "90m") or RFC3339 timestamp.
-// If omitted, a default of 24h from now is applied.
-func loadKeysFromINI(path string) (rxKey, txKey [16]byte, expiresAt time.Time, err error) {
-	cfg, err := ini.Load(path)
-	if err != nil {
-		return rxKey, txKey, time.Time{}, fmt.Errorf("open INI: %w", err)
-	}
-
-	sec, err := cfg.GetSection("keys")
-	if err != nil {
-		return rxKey, txKey, time.Time{}, errors.New("INI must contain a [keys] section")
-	}
-
-	get := func(k string) string { return strings.TrimSpace(sec.Key(k).String()) }
-
-	rxHex := get("rx")
-	txHex := get("tx")
-	expStr := get("expires")
-
-	if rxHex == "" || txHex == "" {
-		return rxKey, txKey, time.Time{}, errors.New("INI [keys] missing required keys: rx and tx")
-	}
-	if len(rxHex) != 32 || len(txHex) != 32 {
-		return rxKey, txKey, time.Time{}, errors.New("INI [keys] rx/tx must be 32 hex characters (16 bytes)")
-	}
-
-	rxBytes, err := hex.DecodeString(rxHex)
-	if err != nil {
-		return rxKey, txKey, time.Time{}, fmt.Errorf("decode INI [keys].rx: %w", err)
-	}
-	txBytes, err := hex.DecodeString(txHex)
-	if err != nil {
-		return rxKey, txKey, time.Time{}, fmt.Errorf("decode INI [keys].tx: %w", err)
-	}
-	copy(rxKey[:], rxBytes)
-	copy(txKey[:], txBytes)
-
-	// Expiry handling: optional; default to 24h if absent.
-	if expStr != "" {
-		// Prefer duration, fall back to RFC3339.
-		if d, derr := time.ParseDuration(expStr); derr == nil {
-			expiresAt = time.Now().Add(d)
-		} else if t, terr := time.Parse(time.RFC3339, expStr); terr == nil {
-			expiresAt = t
-		} else {
-			return rxKey, txKey, time.Time{}, fmt.Errorf("expires must be duration (e.g. 24h) or RFC3339 timestamp: %q", expStr)
-		}
-	} else {
-		expiresAt = time.Now().Add(24 * time.Hour)
-	}
-
-	return rxKey, txKey, expiresAt, nil
 }
 
 func selectSourceAddr(link netlink.Link, dstAddr *tcpip.FullAddress) (*tcpip.FullAddress, error) {

@@ -1,17 +1,11 @@
 # InterCloud eXpress (ICX) - CLI
 
-ICX encrypts tunnel traffic with AES-128-GCM. Keys can be established two ways:
+ICX encrypts tunnel traffic with AES-128-GCM. Keys are established by a **QUIC/mTLS
+control plane**: a channel that authenticates the peers, negotiates fresh,
+forward-secret, per-session keys, and rotates them automatically — so the tunnel is safe
+across restarts with no persisted key state.
 
-- **Control plane (recommended):** a QUIC/mTLS channel negotiates fresh,
-  forward-secret, per-session keys and rotates them automatically. This is the only
-  mode that is safe across restarts.
-- **Static keys (legacy):** a pair of pre-shared keys loaded from an INI file and
-  rotated by hand via `SIGHUP`. Retained for compatibility; see the caveats below.
-
-The two modes are mutually exclusive and fail closed: configure exactly one. ICX never
-silently falls back from the control plane to static keys.
-
-## Control plane (recommended)
+## Control plane
 
 Each node has a long-term **identity key** (ECDSA P-256). Peers authenticate each other
 WireGuard-style by pinning the expected public key — there is no CA. The control channel
@@ -108,56 +102,3 @@ This makes every recovery path seamless and symmetric:
   and a fresh handshake; the survivor accepts the reset SPI under its fresh key and traffic
   resumes immediately. There is no high-water to carry forward and no peer to cycle.
 
-## Static keys (legacy)
-
-> Prefer the control plane. Static keys provide **no forward secrecy** and are **not safe
-> across restarts**: a restart re-reads the INI starting again at epoch 1 with the TX
-> counter reset to 0, so **do not restart against an unchanged key file** — rotate to
-> fresh keys (below), otherwise the AES-GCM nonce sequence is reused under the same key.
-
-ICX enforces two invariants when keys are installed and refuses the key otherwise: `rx`
-and `tx` **must differ** (each direction needs its own key), and the key epoch must
-**strictly increase** within a running process.
-
-### 1) Generate two one-time keys
-
-```bash
-# Key used for A → B traffic
-K_AB=$(openssl rand -hex 16)
-# Key used for B → A traffic
-K_BA=$(openssl rand -hex 16)
-```
-
-### 2) Create an INI file on each host
-
-Each host reads keys from an INI file at `--key-file`. The required format is:
-
-```ini
-[keys]
-rx=<32 hex chars>   # the key this host expects to RECEIVE with
-tx=<32 hex chars>   # the key this host will TRANSMIT with
-# Optional expiry (defaults to 24h if omitted):
-# - as a Go duration (e.g. 24h, 90m)
-# - or an RFC3339 timestamp (e.g. 2025-10-16T12:34:56Z)
-expires=24h
-```
-
-For Host A `rx=${K_BA}`, `tx=${K_AB}`; for Host B `rx=${K_AB}`, `tx=${K_BA}`.
-
-### 3) Start ICX on both hosts
-
-```bash
-icx -i <iface> --key-file=/path/to/icx.ini <peer_ip>:<port>
-```
-
-### 4) Key rotation (SIGHUP)
-
-Update the same INI file with new rx/tx values, then send `SIGHUP`:
-
-```bash
-pkill -HUP icx
-```
-
-ICX reloads the INI, bumps the epoch, and applies the new keys. If the reloaded keys are
-identical to the current ones, the reload is refused (epoch unchanged). `SIGHUP` reload is
-only active in static mode.
