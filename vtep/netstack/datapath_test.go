@@ -35,6 +35,12 @@ type fakeUnderlay struct {
 	out       chan []byte
 	closed    chan struct{}
 	closeOnce sync.Once
+
+	// writeMax caps how many frames a single WriteFrames call accepts (0 = all),
+	// modelling a batched datagram send that does a short write. writeDelay slows
+	// each call to encourage the outbound pump to coalesce multi-frame batches.
+	writeMax   int
+	writeDelay time.Duration
 }
 
 func newFakeUnderlay() *fakeUnderlay {
@@ -55,7 +61,14 @@ func (u *fakeUnderlay) ReadFrame(buf []byte) (int, error) {
 }
 
 func (u *fakeUnderlay) WriteFrames(frames [][]byte) (int, error) {
-	for _, f := range frames {
+	if u.writeDelay > 0 {
+		time.Sleep(u.writeDelay)
+	}
+	n := len(frames)
+	if u.writeMax > 0 && n > u.writeMax {
+		n = u.writeMax // short write: accept only a prefix, leave the rest unsent
+	}
+	for _, f := range frames[:n] {
 		cp := make([]byte, len(f))
 		copy(cp, f)
 		select {
@@ -64,7 +77,7 @@ func (u *fakeUnderlay) WriteFrames(frames [][]byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 	}
-	return len(frames), nil
+	return n, nil
 }
 
 func (u *fakeUnderlay) Close() { u.closeOnce.Do(func() { close(u.closed) }) }
@@ -183,6 +196,83 @@ func TestDatapath_Outbound(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for outbound frame on underlay")
+	}
+}
+
+// TestDatapath_OutboundShortWriteDrains verifies the outbound pump re-sends the
+// unsent suffix when the underlay does a short write, so no frame in a coalesced
+// batch is dropped. With writeMax=1 the underlay accepts a single frame per call;
+// the pump must loop until the whole batch is on the wire. Without the drain loop
+// this test loses the tail of every multi-frame batch and times out.
+func TestDatapath_OutboundShortWriteDrains(t *testing.T) {
+	ep := channel.New(256, testMTU, "")
+	local := tcpip.AddrFromSlice([]byte{10, 0, 0, 1})
+	s := newTestStack(t, ep, local)
+	defer s.Close()
+
+	u := newFakeUnderlay()
+	u.writeMax = 1                        // accept one frame per WriteFrames call
+	u.writeDelay = 200 * time.Microsecond // back up the pump so it coalesces batches
+	defer u.Close()
+	stop := startDatapath(t, fakeEngine{}, ep, u)
+	defer stop()
+
+	conn, err := gonet.DialUDP(s, &tcpip.FullAddress{
+		NIC: 1, Addr: local, Port: 12345,
+	}, &tcpip.FullAddress{
+		Addr: tcpip.AddrFromSlice([]byte{10, 0, 0, 9}), Port: 9999,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer conn.Close()
+
+	const n = 64
+	// Collect captured frames concurrently so WriteFrames never blocks on out.
+	var mu sync.Mutex
+	seen := make(map[uint16]bool)
+	allSeen := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case frame := <-u.out:
+				ip := header.IPv4(frame)
+				if !ip.IsValid(len(frame)) {
+					continue
+				}
+				pl := header.UDP(ip.Payload()).Payload()
+				if len(pl) < 2 {
+					continue
+				}
+				seq := uint16(pl[0])<<8 | uint16(pl[1])
+				mu.Lock()
+				seen[seq] = true
+				done := len(seen) == n
+				mu.Unlock()
+				if done {
+					close(allSeen)
+					return
+				}
+			case <-u.closed:
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < n; i++ {
+		if _, err := conn.Write([]byte{byte(i >> 8), byte(i)}); err != nil {
+			t.Fatalf("Write %d: %v", i, err)
+		}
+	}
+
+	select {
+	case <-allSeen:
+		// All 64 distinct frames reached the underlay despite one-frame-per-call writes.
+	case <-time.After(3 * time.Second):
+		mu.Lock()
+		got := len(seen)
+		mu.Unlock()
+		t.Fatalf("short-write drain dropped frames: only %d/%d distinct frames arrived", got, n)
 	}
 }
 

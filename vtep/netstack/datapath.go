@@ -54,9 +54,14 @@ type Underlay interface {
 	// ReadFrame reads a single underlay frame into buf, returning its length.
 	// A length of 0 with a nil error is skipped.
 	ReadFrame(buf []byte) (int, error)
-	// WriteFrames writes a batch of underlay frames, returning the number sent.
-	// The frames are owned by the caller and remain valid only until the call
-	// returns, so implementations must not retain them.
+	// WriteFrames writes a batch of underlay frames, returning the number actually
+	// sent. A short write (n < len(frames)) is permitted — a batched datagram send
+	// can put fewer frames on the wire than offered (EAGAIN, a mid-batch error, or
+	// a platform whose batch syscall degrades to one message per call). The datapath
+	// drains the unsent suffix (frames[n:]) by calling again, so implementations
+	// must NOT silently drop the tail. A zero return with a nil error is treated as
+	// a stall. The frames are owned by the caller and remain valid only until the
+	// call returns, so implementations must not retain them.
 	WriteFrames(frames [][]byte) (int, error)
 }
 
@@ -291,13 +296,31 @@ func (d *Datapath) outbound() error {
 		for i := 0; i < count; i++ {
 			out[i] = batch[i].frame
 		}
-		_, err := d.underlay.WriteFrames(out)
-		putOwned(batch)
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return err
+		// Drain short writes: WriteFrames may report fewer frames sent than
+		// offered, leaving an unsent suffix. Loop over it so the tail of a batch
+		// is never silently dropped, regardless of the underlay implementation.
+		// The frames stay valid until putOwned below.
+		var writeErr error
+		for len(out) > 0 {
+			n, err := d.underlay.WriteFrames(out)
+			if n > 0 {
+				out = out[n:]
 			}
-			slog.Warn("Error writing batched underlay frames", slog.Any("error", err))
+			if err != nil {
+				writeErr = err
+				break
+			}
+			if n == 0 {
+				writeErr = fmt.Errorf("netstack datapath: underlay write stalled, %d frames undelivered", len(out))
+				break
+			}
+		}
+		putOwned(batch)
+		if writeErr != nil {
+			if errors.Is(writeErr, net.ErrClosed) {
+				return writeErr
+			}
+			slog.Warn("Error writing batched underlay frames", slog.Any("error", writeErr))
 			continue
 		}
 	}
