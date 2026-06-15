@@ -185,7 +185,7 @@ type DirectionalSAs struct {
 }
 
 // NegotiateSAs runs the SA-setup exchange over a fresh QUIC stream and returns
-// the tx/rx SAs for PSP version v. Each peer allocates and announces its own RX
+// the tx/rx SAs for cipher suite v. Each peer allocates and announces its own RX
 // SPI; both then derive every key locally from the shared master keys. The
 // initiator writes first, the responder replies, so there is no deadlock.
 //
@@ -201,15 +201,15 @@ type DirectionalSAs struct {
 // sequentially, or have both peers issue the same number of concurrent calls
 // (≤ MaxIncomingStreams); a surplus initiator call blocks until a matching
 // responder call or the ctx deadline.
-func (s *Session) NegotiateSAs(ctx context.Context, v PSPVersion) (*DirectionalSAs, error) {
+func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalSAs, error) {
 	if !v.valid() {
-		return nil, fmt.Errorf("control: unsupported PSP version %d", v)
+		return nil, fmt.Errorf("control: unsupported cipher suite %d", v)
 	}
 	myRxSPI, err := s.rxAlloc.Allocate(activeMasterKeyIndex)
 	if err != nil {
 		return nil, err
 	}
-	offer := saOffer{PSPVersion: v, RxSPI: myRxSPI}
+	offer := saOffer{Version: v, RxSPI: myRxSPI}
 
 	var stream *quic.Stream
 	if s.role == Initiator {
@@ -248,9 +248,9 @@ func (s *Session) NegotiateSAs(ctx context.Context, v PSPVersion) (*DirectionalS
 // deriveDirectional derives the tx/rx SAs and enforces the txKey != rxKey
 // invariant (the role-partitioned SPI space guarantees distinct SPIs, but we
 // assert on the derived keys as a belt-and-suspenders check).
-func (s *Session) deriveDirectional(v PSPVersion, myRxSPI uint32, peer saOffer) (*DirectionalSAs, error) {
-	if peer.PSPVersion != v {
-		return nil, fmt.Errorf("control: PSP version mismatch: local %d, peer %d", v, peer.PSPVersion)
+func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) (*DirectionalSAs, error) {
+	if peer.Version != v {
+		return nil, fmt.Errorf("control: cipher suite mismatch: local %d, peer %d", v, peer.Version)
 	}
 	rx, err := s.masterKeys.DeriveSA(myRxSPI, v)
 	if err != nil {

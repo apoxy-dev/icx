@@ -40,7 +40,7 @@ func TestCanonicalInitiator(t *testing.T) {
 	require.Error(t, err)
 }
 
-// validV0SAs returns a role-partitioned, PSPv0 DirectionalSAs with distinct
+// validV0SAs returns a role-partitioned, AESGCM128 DirectionalSAs with distinct
 // 16-byte keys, as NegotiateSAs would produce.
 func validV0SAs() *DirectionalSAs {
 	iSPI, _ := MakeSPI(0, Initiator, 1)
@@ -52,18 +52,18 @@ func validV0SAs() *DirectionalSAs {
 		tx[i] = byte(i + 100)
 	}
 	return &DirectionalSAs{
-		Tx: &SA{SPI: rSPI, Key: tx, Version: PSPv0},
-		Rx: &SA{SPI: iSPI, Key: rx, Version: PSPv0},
+		Tx: &SA{SPI: rSPI, Key: tx, Version: AESGCM128},
+		Rx: &SA{SPI: iSPI, Key: rx, Version: AESGCM128},
 	}
 }
 
 func TestInstallSAsRejectsNonV0(t *testing.T) {
 	tn := &Tunnel{install: func(uint32, uint32, [16]byte, [16]byte) error {
-		t.Fatal("installer must not be called for a non-PSPv0 SA")
+		t.Fatal("installer must not be called for a non-AES-GCM-128 SA")
 		return nil
 	}}
 	sas := validV0SAs()
-	sas.Tx.Version = PSPv1
+	sas.Tx.Version = AESGCM256
 	sas.Tx.Key = make([]byte, 32)
 	require.Error(t, tn.installSAs(sas))
 }

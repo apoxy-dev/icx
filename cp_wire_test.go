@@ -64,10 +64,10 @@ func negotiateLoopback(t *testing.T) (iSAs, rSAs *control.DirectionalSAs) {
 	}
 	negCh := make(chan nres, 1)
 	go func() {
-		sas, err := rSess.NegotiateSAs(ctx, control.PSPv0)
+		sas, err := rSess.NegotiateSAs(ctx, control.AESGCM128)
 		negCh <- nres{sas, err}
 	}()
-	iSAs, err = iSess.NegotiateSAs(ctx, control.PSPv0)
+	iSAs, err = iSess.NegotiateSAs(ctx, control.AESGCM128)
 	require.NoError(t, err)
 	neg := <-negCh
 	require.NoError(t, neg.err)

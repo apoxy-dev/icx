@@ -99,10 +99,10 @@ func TestControlSessionHandshakeAndSANegotiation(t *testing.T) {
 	}
 	rCh := make(chan res, 1)
 	go func() {
-		sas, err := responder.NegotiateSAs(ctx, PSPv0)
+		sas, err := responder.NegotiateSAs(ctx, AESGCM128)
 		rCh <- res{sas, err}
 	}()
-	iSAs, err := initiator.NegotiateSAs(ctx, PSPv0)
+	iSAs, err := initiator.NegotiateSAs(ctx, AESGCM128)
 	if err != nil {
 		t.Fatalf("initiator NegotiateSAs: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestControlSessionRejectsUnpinnedPeer(t *testing.T) {
 		return // rejected at dial — also acceptable
 	}
 	defer sess.Close()
-	if _, err := sess.NegotiateSAs(ctx, PSPv0); err == nil {
+	if _, err := sess.NegotiateSAs(ctx, AESGCM128); err == nil {
 		t.Fatal("SA negotiation succeeded against a responder that pinned a different key")
 	}
 }

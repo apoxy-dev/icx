@@ -5,17 +5,18 @@ import (
 	"fmt"
 )
 
-// PSPVersion is a PSP encryption-mode codepoint. It selects both the AEAD
-// (AES-GCM-128 vs AES-GCM-256) and, via the KDF label, the size of the derived
-// security-association key.
-type PSPVersion uint8
+// ICXVersion is an AEAD cipher-suite codepoint for an SA. It selects both the
+// AEAD (AES-GCM-128 vs AES-GCM-256) and, via the KDF label, the size of the
+// derived security-association key. It is a local cipher selector, not a
+// wire-format version (that is ProtocolVersion in protocol.go).
+type ICXVersion uint8
 
 const (
-	// PSPv0 is AES-GCM-128: a 16-byte SA key. Required by every PSP
-	// implementation; the ICX default (zero churn to the [16]byte data plane).
-	PSPv0 PSPVersion = 0
-	// PSPv1 is AES-GCM-256: a 32-byte SA key. The CNSA / 256-bit path.
-	PSPv1 PSPVersion = 1
+	// AESGCM128 selects AES-GCM-128: a 16-byte SA key. The ICX default (zero
+	// churn to the [16]byte data plane).
+	AESGCM128 ICXVersion = 0
+	// AESGCM256 selects AES-GCM-256: a 32-byte SA key. The CNSA / 256-bit path.
+	AESGCM256 ICXVersion = 1
 )
 
 // MasterKeyLen is the required length of a PSP master key (256 bits). PSP
@@ -26,19 +27,19 @@ const MasterKeyLen = 32
 // (0x50 0x76 0x30 0x00) for v0, "Pv1\0" for v1. The trailing NUL also serves as
 // the SP 800-108 label/context separator. Per the spec, the version number may
 // be OR'd into the third byte of the base label.
-func (v PSPVersion) label() [4]byte {
+func (v ICXVersion) label() [4]byte {
 	return [4]byte{0x50, 0x76, 0x30 | byte(v), 0x00}
 }
 
-// valid reports whether v is a supported PSP version. Callers must reject
+// valid reports whether v is a supported cipher suite. Callers must reject
 // unsupported versions before deriving keys (fail-closed), so keyLen/label are
 // never asked to map an unknown version.
-func (v PSPVersion) valid() bool { return v == PSPv0 || v == PSPv1 }
+func (v ICXVersion) valid() bool { return v == AESGCM128 || v == AESGCM256 }
 
 // keyLen returns the derived SA key length in bytes for the version. Only valid
 // versions reach here (guarded by DeriveSAKey); v0 = 16, v1 = 32.
-func (v PSPVersion) keyLen() int {
-	if v == PSPv1 {
+func (v ICXVersion) keyLen() int {
+	if v == AESGCM256 {
 		return 32
 	}
 	return 16
@@ -57,12 +58,12 @@ func (v PSPVersion) keyLen() int {
 // The caller is responsible for selecting which master key to pass based on the
 // SPI's most-significant bit (the PSP master-key selector); the SPI is fed into
 // the KDF context verbatim, MSB included, so the derivation is bound to it.
-func DeriveSAKey(masterKey []byte, spi uint32, v PSPVersion) ([]byte, error) {
+func DeriveSAKey(masterKey []byte, spi uint32, v ICXVersion) ([]byte, error) {
 	if len(masterKey) != MasterKeyLen {
 		return nil, fmt.Errorf("control: master key must be %d bytes, got %d", MasterKeyLen, len(masterKey))
 	}
 	if !v.valid() {
-		return nil, fmt.Errorf("control: unsupported PSP version %d", v)
+		return nil, fmt.Errorf("control: unsupported cipher suite %d", v)
 	}
 
 	keyLen := v.keyLen()
@@ -73,10 +74,10 @@ func DeriveSAKey(masterKey []byte, spi uint32, v PSPVersion) ([]byte, error) {
 	out := make([]byte, 0, blocks*16)
 	for i := 1; i <= blocks; i++ {
 		var in [16]byte
-		binary.BigEndian.PutUint32(in[0:4], uint32(i))   // counter
-		copy(in[4:8], label[:])                          // label
-		binary.BigEndian.PutUint32(in[8:12], spi)        // context = SPI
-		binary.BigEndian.PutUint32(in[12:16], bitLen)    // length (bits)
+		binary.BigEndian.PutUint32(in[0:4], uint32(i)) // counter
+		copy(in[4:8], label[:])                        // label
+		binary.BigEndian.PutUint32(in[8:12], spi)      // context = SPI
+		binary.BigEndian.PutUint32(in[12:16], bitLen)  // length (bits)
 		mac, err := aesCMAC(masterKey, in[:])
 		if err != nil {
 			return nil, err

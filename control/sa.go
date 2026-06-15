@@ -48,15 +48,15 @@ func DeriveMasterKeys(rootSecret []byte) (*MasterKeys, error) {
 func MasterKeyIndex(spi uint32) int { return int(spi >> 31) }
 
 // SA is a unidirectional PSP security association: an SPI, the derived AES-GCM
-// key, and the PSP version (which fixes the key length / cipher).
+// key, and the cipher suite (which fixes the key length / cipher).
 type SA struct {
 	SPI     uint32
 	Key     []byte
-	Version PSPVersion
+	Version ICXVersion
 }
 
 // DeriveSA derives the SA key for spi using the master key its MSB selects.
-func (m *MasterKeys) DeriveSA(spi uint32, v PSPVersion) (*SA, error) {
+func (m *MasterKeys) DeriveSA(spi uint32, v ICXVersion) (*SA, error) {
 	if spi&spiLowMask == 0 {
 		return nil, errors.New("control: SPI low 31 bits must be non-zero (zero is reserved)")
 	}

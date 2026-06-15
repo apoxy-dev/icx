@@ -30,20 +30,20 @@ const (
 )
 
 // saOffer announces the SPI on which the sender will RECEIVE data-plane traffic
-// for the given PSP version. The peer derives the key for this SPI and uses it
+// for the given cipher suite. The peer derives the key for this SPI and uses it
 // as its TX key; the sender uses it as its RX key.
 type saOffer struct {
-	PSPVersion PSPVersion
-	RxSPI      uint32
+	Version ICXVersion
+	RxSPI   uint32
 }
 
-const saOfferLen = 1 + 1 + 1 + 4 // protoVer + type + pspVer + rxSPI
+const saOfferLen = 1 + 1 + 1 + 4 // protoVer + type + suite + rxSPI
 
 func (o saOffer) marshal() []byte {
 	b := make([]byte, saOfferLen)
 	b[0] = ProtocolVersion
 	b[1] = byte(msgSAOffer)
-	b[2] = byte(o.PSPVersion)
+	b[2] = byte(o.Version)
 	binary.BigEndian.PutUint32(b[3:], o.RxSPI)
 	return b
 }
@@ -59,8 +59,8 @@ func parseSAOffer(b []byte) (saOffer, error) {
 		return saOffer{}, fmt.Errorf("control: expected SA offer, got message type %d", b[1])
 	}
 	return saOffer{
-		PSPVersion: PSPVersion(b[2]),
-		RxSPI:      binary.BigEndian.Uint32(b[3:7]),
+		Version: ICXVersion(b[2]),
+		RxSPI:   binary.BigEndian.Uint32(b[3:7]),
 	}, nil
 }
 

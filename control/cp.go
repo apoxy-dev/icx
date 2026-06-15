@@ -248,14 +248,14 @@ func (t *Tunnel) runResponder(ctx context.Context) error {
 // result. installSAs swallows an install rejection (returns nil) so it does not look
 // like a transport failure; a non-nil error here means the wire exchange failed.
 func (t *Tunnel) negotiateAndInstall(ctx context.Context) error {
-	sas, err := t.sess.NegotiateSAs(ctx, PSPv0)
+	sas, err := t.sess.NegotiateSAs(ctx, AESGCM128)
 	if err != nil {
 		return err
 	}
 	return t.installSAs(sas)
 }
 
-// installSAs validates the negotiated SAs fail-closed (PSPv0, 16-byte keys) and hands
+// installSAs validates the negotiated SAs fail-closed (AES-GCM-128, 16-byte keys) and hands
 // the two per-direction SPIs/keys to the installer. Every session derives fresh keys
 // (fresh ECDHE; see transport.go), so the handler accepts the install even when the
 // per-session allocator reset the SPIs to a low value after a reconnect. An install
@@ -263,8 +263,8 @@ func (t *Tunnel) negotiateAndInstall(ctx context.Context) error {
 // currently-live transmit SPI): the previously installed keys keep forwarding and the
 // data plane fails closed on their own expiry.
 func (t *Tunnel) installSAs(sas *DirectionalSAs) error {
-	if sas.Tx.Version != PSPv0 || sas.Rx.Version != PSPv0 {
-		return fmt.Errorf("control: only PSPv0/AES-128 is supported in this build (tx=%d rx=%d)", sas.Tx.Version, sas.Rx.Version)
+	if sas.Tx.Version != AESGCM128 || sas.Rx.Version != AESGCM128 {
+		return fmt.Errorf("control: only the AES-GCM-128 cipher suite is supported in this build (tx=%d rx=%d)", sas.Tx.Version, sas.Rx.Version)
 	}
 	if len(sas.Rx.Key) != 16 || len(sas.Tx.Key) != 16 {
 		return fmt.Errorf("control: expected 16-byte SA keys (rx=%d tx=%d)", len(sas.Rx.Key), len(sas.Tx.Key))

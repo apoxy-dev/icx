@@ -60,20 +60,20 @@ func TestDeriveSAKey_PSPSpec(t *testing.T) {
 		name    string
 		master  []byte
 		spi     uint32
-		version PSPVersion
+		version ICXVersion
 		want    string
 	}{
 		{
-			name: "v0_spi_12345678_mk0", master: k0, spi: 0x12345678, version: PSPv0,
+			name: "v0_spi_12345678_mk0", master: k0, spi: 0x12345678, version: AESGCM128,
 			want: "96c22dc799198090b74b70ae468e4e30",
 		},
 		{
 			// MSB set -> master key 1 selected by the caller.
-			name: "v0_spi_9A345678_mk1", master: k1, spi: 0x9A345678, version: PSPv0,
+			name: "v0_spi_9A345678_mk1", master: k1, spi: 0x9A345678, version: AESGCM128,
 			want: "3946da2554eae46ad1ef77a64372edc4",
 		},
 		{
-			name: "v1_spi_12345678_mk0", master: k0, spi: 0x12345678, version: PSPv1,
+			name: "v1_spi_12345678_mk0", master: k0, spi: 0x12345678, version: AESGCM256,
 			want: "2b7d72074e42ca334487f2990e3f8c4037e436f38283449b76463e9b7fb2e3de",
 		},
 	}
@@ -94,14 +94,14 @@ func TestDeriveSAKey_PSPSpec(t *testing.T) {
 }
 
 func TestDeriveSAKey_BadMasterKeyLen(t *testing.T) {
-	if _, err := DeriveSAKey(make([]byte, 16), 1, PSPv0); err == nil {
+	if _, err := DeriveSAKey(make([]byte, 16), 1, AESGCM128); err == nil {
 		t.Fatal("expected error for 16-byte master key, got nil")
 	}
 }
 
 func TestDeriveSAKey_UnsupportedVersionFailsClosed(t *testing.T) {
 	mk := make([]byte, MasterKeyLen)
-	if _, err := DeriveSAKey(mk, 1, PSPVersion(7)); err == nil {
-		t.Fatal("expected error for unsupported PSP version, got nil (must fail closed, not default to 16 bytes)")
+	if _, err := DeriveSAKey(mk, 1, ICXVersion(7)); err == nil {
+		t.Fatal("expected error for unsupported cipher suite, got nil (must fail closed, not default to 16 bytes)")
 	}
 }

@@ -44,20 +44,20 @@ func TestDeriveSAMatchesKDFAndSelectsMasterKey(t *testing.T) {
 	spi0, _ := MakeSPI(0, Initiator, 7)
 	spi1, _ := MakeSPI(1, Initiator, 7)
 
-	sa0, err := mk.DeriveSA(spi0, PSPv0)
+	sa0, err := mk.DeriveSA(spi0, AESGCM128)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want0, _ := DeriveSAKey(mk.keys[0][:], spi0, PSPv0)
+	want0, _ := DeriveSAKey(mk.keys[0][:], spi0, AESGCM128)
 	if !bytes.Equal(sa0.Key, want0) {
 		t.Fatal("DeriveSA(MSB=0) did not use master key 0")
 	}
 
-	sa1, err := mk.DeriveSA(spi1, PSPv0)
+	sa1, err := mk.DeriveSA(spi1, AESGCM128)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want1, _ := DeriveSAKey(mk.keys[1][:], spi1, PSPv0)
+	want1, _ := DeriveSAKey(mk.keys[1][:], spi1, AESGCM128)
 	if !bytes.Equal(sa1.Key, want1) {
 		t.Fatal("DeriveSA(MSB=1) did not use master key 1")
 	}
@@ -89,8 +89,8 @@ func TestDirectionsNeverCollide(t *testing.T) {
 		}
 		seen[is], seen[rs] = true, true
 
-		txSA, _ := mk.DeriveSA(is, PSPv0)
-		rxSA, _ := mk.DeriveSA(rs, PSPv0)
+		txSA, _ := mk.DeriveSA(is, AESGCM128)
+		rxSA, _ := mk.DeriveSA(rs, AESGCM128)
 		if bytes.Equal(txSA.Key, rxSA.Key) {
 			t.Fatal("tx and rx SA keys collided")
 		}
@@ -112,7 +112,7 @@ func TestMakeSPIValidation(t *testing.T) {
 func TestDeriveSARejectsReservedSPI(t *testing.T) {
 	mk, _ := DeriveMasterKeys(bytes.Repeat([]byte{0x01}, RootSecretLen))
 	// SPI whose low 31 bits are zero (only the master-key bit set) is reserved.
-	if _, err := mk.DeriveSA(uint32(1)<<31, PSPv0); err == nil {
+	if _, err := mk.DeriveSA(uint32(1)<<31, AESGCM128); err == nil {
 		t.Fatal("expected error for reserved SPI (zero low 31 bits)")
 	}
 }

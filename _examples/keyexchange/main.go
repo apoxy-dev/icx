@@ -27,12 +27,12 @@ import (
 )
 
 func main() {
-	pspV1 := flag.Bool("v1", false, "use PSP v1 (AES-256-GCM) instead of v0 (AES-128-GCM)")
+	useV1 := flag.Bool("v1", false, "use the AES-GCM-256 cipher suite instead of AES-GCM-128")
 	flag.Parse()
 
-	version := control.PSPv0
-	if *pspV1 {
-		version = control.PSPv1
+	version := control.AESGCM128
+	if *useV1 {
+		version = control.AESGCM256
 	}
 
 	if err := run(version); err != nil {
@@ -40,7 +40,7 @@ func main() {
 	}
 }
 
-func run(version control.PSPVersion) error {
+func run(version control.ICXVersion) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -123,7 +123,7 @@ func run(version control.PSPVersion) error {
 
 	// 6. Report and verify.
 	fmt.Printf("master keys agree: %v\n", initSess.MasterKeys() != nil && r.sess.MasterKeys() != nil)
-	fmt.Printf("SAs (PSP %s):\n", pspName(version))
+	fmt.Printf("SAs (%s):\n", suiteName(version))
 	fmt.Printf("  initiator: tx spi=%#08x key=%s | rx spi=%#08x key=%s\n",
 		initSAs.Tx.SPI, fp(initSAs.Tx.Key), initSAs.Rx.SPI, fp(initSAs.Rx.Key))
 	fmt.Printf("  responder: tx spi=%#08x key=%s | rx spi=%#08x key=%s\n",
@@ -160,15 +160,15 @@ func equal(a, b []byte) bool {
 	return true
 }
 
-func expectedKeyLen(v control.PSPVersion) int {
-	if v == control.PSPv1 {
+func expectedKeyLen(v control.ICXVersion) int {
+	if v == control.AESGCM256 {
 		return 32
 	}
 	return 16
 }
 
-func pspName(v control.PSPVersion) string {
-	if v == control.PSPv1 {
+func suiteName(v control.ICXVersion) string {
+	if v == control.AESGCM256 {
 		return "v1/AES-256-GCM"
 	}
 	return "v0/AES-128-GCM"
