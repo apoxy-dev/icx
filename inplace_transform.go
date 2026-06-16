@@ -297,7 +297,7 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// previously omitted (APO-649), confining a peer to the local subnets it is
 	// permitted to deliver to. Mirrors PhyToVirt.
 	var validSrc, validDst bool
-	for _, route := range vnet.AllowedRoutes {
+	for _, route := range vnet.AllowedRoutes() {
 		if !validSrc && route.Dst.Contains(srcAddr) {
 			validSrc = true
 		}
@@ -541,6 +541,16 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		return dropWindowOffset, 0, false
 	}
 
+	// Fail closed once the transmit SA expires: RX already drops an expired key, so TX
+	// must stop sealing under one too, or a node whose control plane stopped rekeying
+	// would keep emitting frames under a stale key (APO-656). The control plane installs
+	// a fresh SA well before this fires. Mirrors VirtToPhy.
+	if txCipher.expiresAt.Before(h.clock.Now()) {
+		slog.Warn("Dropping frame: transmit key expired, rotate the key")
+		vnet.Stats.TXDropsExpiredKey.Add(1)
+		return dropWindowOffset, 0, false
+	}
+
 	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], txCipher.epoch)
 
 	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
@@ -648,7 +658,7 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 
 	localAddr := *best
 	if h.opts.sourcePortHashing {
-		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(buf[ipStart : ipStart+ptLen]))
+		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(h.flowHashKey, buf[ipStart:ipStart+ptLen]))
 	}
 
 	// Write the outer Eth/IP/UDP headers into the headroom at phyStart. The
@@ -758,6 +768,14 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
 		// No key yet, not really an error for keep-alives.
+		return dropWindowOffset, 0
+	}
+
+	// Fail closed once the transmit SA expires (APO-656): no point keeping a NAT
+	// mapping warm under a key the peer would reject. Mirrors ToPhy.
+	if txCipher.expiresAt.Before(h.clock.Now()) {
+		slog.Warn("Dropping keep-alive: transmit key expired, rotate the key")
+		vnet.Stats.TXDropsExpiredKey.Add(1)
 		return dropWindowOffset, 0
 	}
 

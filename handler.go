@@ -3,6 +3,7 @@ package icx
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -70,6 +71,10 @@ type Statistics struct {
 	TXBytes atomic.Uint64
 	// TXErrors is the number of transmission errors.
 	TXErrors atomic.Uint64
+	// TXDropsExpiredKey is the number of outbound frames dropped because the transmit
+	// SA's key had expired (APO-656). RX enforces key expiry; this makes TX fail closed
+	// symmetrically instead of sealing indefinitely under a stale key.
+	TXDropsExpiredKey atomic.Uint64
 	// LastRXUnixNano is the timestamp of the last received packet.
 	LastRXUnixNano atomic.Int64
 	// LastTXUnixNano is the timestamp of the last transmitted packet.
@@ -97,6 +102,10 @@ type receiveCipher struct {
 type transmitCipher struct {
 	cipher.AEAD
 	epoch uint32
+	// expiresAt is the transmit SA's expiry. TX fails closed once it passes (APO-656),
+	// mirroring the receiveCipher.expiresAt enforcement, so a node whose control plane
+	// stops rekeying stops emitting under the stale key instead of sealing forever.
+	expiresAt time.Time
 	// key is the transmit key, retained so the TX anti-reset guard can distinguish a
 	// genuine double-install of the live SA (same SPI AND same key) from a fresh-session
 	// install that merely reused the SPI value under a new key (see UpdateVirtualNetworkSAs).
@@ -110,8 +119,12 @@ type VirtualNetwork struct {
 	ID uint
 	// RemoteAddr is the address of the remote endpoint.
 	RemoteAddr *tcpip.FullAddress
-	// AllowedRoutes is the list of allowed source/destination address prefix pairs for this virtual network.
-	AllowedRoutes []Route
+	// allowedRoutes is the list of allowed source/destination address prefix pairs for
+	// this virtual network, published atomically (APO-652): the RX validation hot path
+	// Loads a stable slice snapshot while UpdateVirtualNetworkRoutes Stores a whole
+	// replacement, so a reader and the writer never race on the slice header. Read it
+	// through the AllowedRoutes accessor.
+	allowedRoutes atomic.Pointer[[]Route]
 	// Statistics associated with this virtual network.
 	Stats Statistics
 	// Internal state (not exposed)
@@ -130,6 +143,17 @@ type VirtualNetwork struct {
 	// crypto CPU (APO-655). nil when no limit is configured, in which case the hot
 	// path skips it entirely.
 	rxLimiter *rxRateLimiter
+}
+
+// AllowedRoutes returns a snapshot of the virtual network's allowed routes. The
+// slice is published atomically (APO-652) and must be treated as read-only: a
+// concurrent UpdateVirtualNetworkRoutes replaces the whole slice rather than
+// mutating it in place, so a caller keeps a consistent (if possibly older) view.
+func (v *VirtualNetwork) AllowedRoutes() []Route {
+	if p := v.allowedRoutes.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // Clock provides time to the handler. Tests can inject a fake clock.
@@ -311,6 +335,11 @@ type Handler struct {
 	ndProxy    *ndproxy.NDProxy
 	hdrPool    *sync.Pool
 	clock      Clock
+	// flowHashKey is a random per-handler secret keying the source-port flow hash,
+	// so the outer UDP source port is not a public function of the inner 5-tuple an
+	// off-path observer could fingerprint (APO-661). Fixed for the handler's life so
+	// a flow's port stays stable (ECMP); shared by both TX paths.
+	flowHashKey uint64
 }
 
 // NewHandler returns a new Handler configured with the given options.
@@ -338,6 +367,13 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		},
 	}
 
+	// Random per-handler key for the source-port flow hash (APO-661). Sourced from
+	// the SP 800-90A DRBG (crypto/rand) so it is unpredictable to an off-path observer.
+	var seed [8]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return nil, fmt.Errorf("failed to seed flow-hash key: %w", err)
+	}
+
 	return &Handler{
 		opts:              &options,
 		networksByAddress: iptrie.NewTrie(),
@@ -346,6 +382,7 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		ndProxy:           ndproxy.NewNDProxy(options.srcMAC),
 		hdrPool:           hdrPool,
 		clock:             options.clock,
+		flowHashKey:       binary.BigEndian.Uint64(seed[:]),
 	}, nil
 }
 
@@ -410,10 +447,10 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, all
 	}
 
 	vnet := &VirtualNetwork{
-		ID:            vni,
-		RemoteAddr:    remoteAddr,
-		AllowedRoutes: allowedRoutes,
+		ID:         vni,
+		RemoteAddr: remoteAddr,
 	}
+	vnet.allowedRoutes.Store(&allowedRoutes)
 	if h.opts.rxRateLimitPPS > 0 {
 		vnet.rxLimiter = newRxRateLimiter(h.opts.rxRateLimitPPS)
 	}
@@ -450,7 +487,7 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 	// Remove only the routes this vnet owns, so removing it never blackholes a
 	// different network that shares a Dst prefix (APO-654).
 	h.networksByAddressMu.Lock()
-	for _, route := range vnet.AllowedRoutes {
+	for _, route := range vnet.AllowedRoutes() {
 		h.removeRouteLocked(route, vnet)
 	}
 	h.networksByAddressMu.Unlock()
@@ -473,11 +510,11 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 	// routes that remain (other networks). On conflict, restore the old routes so
 	// the update is atomic — it never leaves the network partially routed or
 	// silently steals another network's slot (APO-653).
-	for _, route := range vnet.AllowedRoutes {
+	for _, route := range vnet.AllowedRoutes() {
 		h.removeRouteLocked(route, vnet)
 	}
 	if err := h.checkRouteCollisionsLocked(allowedRoutes, vnet); err != nil {
-		for _, route := range vnet.AllowedRoutes {
+		for _, route := range vnet.AllowedRoutes() {
 			h.addRouteLocked(route, vnet)
 		}
 		return err
@@ -485,7 +522,7 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 	for _, route := range allowedRoutes {
 		h.addRouteLocked(route, vnet)
 	}
-	vnet.AllowedRoutes = allowedRoutes
+	vnet.allowedRoutes.Store(&allowedRoutes)
 
 	return nil
 }
@@ -683,9 +720,10 @@ func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, 
 	// carried the counter across installs would reintroduce reuse. The key is retained so the
 	// TX anti-reset guard can reject a literal double-install of this same live SA.
 	vnet.txCipher.Store(&transmitCipher{
-		AEAD:  txCipher,
-		epoch: txSPI,
-		key:   txKey,
+		AEAD:      txCipher,
+		epoch:     txSPI,
+		key:       txKey,
+		expiresAt: expiresAt,
 	})
 
 	return nil
@@ -933,7 +971,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	// previously omitted (APO-649), confining a peer to the local subnets it is
 	// permitted to deliver to.
 	var validSrc, validDst bool
-	for _, route := range vnet.AllowedRoutes {
+	for _, route := range vnet.AllowedRoutes() {
 		if !validSrc && route.Dst.Contains(srcAddr) {
 			validSrc = true
 		}
@@ -1140,6 +1178,16 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
+	// Fail closed once the transmit SA expires: RX already drops an expired key, so TX
+	// must stop sealing under one too, or a node whose control plane stopped rekeying
+	// would keep emitting frames under a stale key (APO-656). The control plane installs
+	// a fresh SA well before this fires. Mirrors VirtToPhyInPlace.
+	if txCipher.expiresAt.Before(h.clock.Now()) {
+		slog.Warn("Dropping frame: transmit key expired, rotate the key")
+		vnet.Stats.TXDropsExpiredKey.Add(1)
+		return 0, false
+	}
+
 	binary.BigEndian.PutUint32(hdr.Options[0].Value[:4], txCipher.epoch)
 
 	if txCipher.counter.Load() >= replay.RekeyAfterMessages {
@@ -1209,7 +1257,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 
 	localAddr := *best
 	if h.opts.sourcePortHashing {
-		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(ipPacket))
+		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(h.flowHashKey, ipPacket))
 	}
 
 	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, false)
@@ -1255,6 +1303,14 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
 		// No key yet, not really an error for keep-alives.
+		return 0
+	}
+
+	// Fail closed once the transmit SA expires (APO-656): no point keeping a NAT
+	// mapping warm under a key the peer would reject. Mirrors ToPhyInPlace.
+	if txCipher.expiresAt.Before(h.clock.Now()) {
+		slog.Warn("Dropping keep-alive: transmit key expired, rotate the key")
+		vnet.Stats.TXDropsExpiredKey.Add(1)
 		return 0
 	}
 

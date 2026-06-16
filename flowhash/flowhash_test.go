@@ -11,6 +11,10 @@ import (
 	"github.com/apoxy-dev/icx/flowhash"
 )
 
+// testKey is a fixed, non-zero flow-hash key so these tests are deterministic
+// across runs; production handlers use a random per-session key.
+const testKey uint64 = 0x9e3779b97f4a7c15
+
 func makeIPv4UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16) []byte {
 	ipHdr := make([]byte, header.IPv4MinimumSize+header.UDPMinimumSize)
 	ip := header.IPv4(ipHdr)
@@ -58,13 +62,13 @@ func makeIPv6UDPPacket(srcIP, dstIP net.IP, srcPort, dstPort uint16) []byte {
 
 func TestFlowHash_IPv4(t *testing.T) {
 	pkt := makeIPv4UDPPacket(net.IPv4(10, 0, 0, 1), net.IPv4(10, 0, 0, 2), 1234, 5678)
-	hash := flowhash.Hash(pkt)
+	hash := flowhash.Hash(testKey, pkt)
 	require.NotZero(t, hash)
 }
 
 func TestFlowHash_IPv6(t *testing.T) {
 	pkt := makeIPv6UDPPacket(net.ParseIP("2001:db8::1"), net.ParseIP("2001:db8::2"), 1234, 5678)
-	hash := flowhash.Hash(pkt)
+	hash := flowhash.Hash(testKey, pkt)
 	require.NotZero(t, hash)
 }
 
@@ -84,8 +88,8 @@ func TestFlowHash_Symmetric_IPv4(t *testing.T) {
 			fwd := makeIPv4UDPPacket(tt.src, tt.dst, tt.srcPort, tt.dstPort)
 			rev := makeIPv4UDPPacket(tt.dst, tt.src, tt.dstPort, tt.srcPort)
 
-			fwdHash := flowhash.Hash(fwd)
-			revHash := flowhash.Hash(rev)
+			fwdHash := flowhash.Hash(testKey, fwd)
+			revHash := flowhash.Hash(testKey, rev)
 
 			require.NotZero(t, fwdHash, "forward hash should be non-zero")
 			require.NotZero(t, revHash, "reverse hash should be non-zero")
@@ -110,8 +114,8 @@ func TestFlowHash_Symmetric_IPv6(t *testing.T) {
 			fwd := makeIPv6UDPPacket(tt.src, tt.dst, tt.srcPort, tt.dstPort)
 			rev := makeIPv6UDPPacket(tt.dst, tt.src, tt.dstPort, tt.srcPort)
 
-			fwdHash := flowhash.Hash(fwd)
-			revHash := flowhash.Hash(rev)
+			fwdHash := flowhash.Hash(testKey, fwd)
+			revHash := flowhash.Hash(testKey, rev)
 
 			require.NotZero(t, fwdHash, "forward hash should be non-zero")
 			require.NotZero(t, revHash, "reverse hash should be non-zero")
@@ -125,7 +129,7 @@ func BenchmarkFlowHash_IPv4(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = flowhash.Hash(pkt)
+		_ = flowhash.Hash(testKey, pkt)
 	}
 }
 
@@ -134,7 +138,7 @@ func BenchmarkFlowHash_IPv6(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = flowhash.Hash(pkt)
+		_ = flowhash.Hash(testKey, pkt)
 	}
 }
 
