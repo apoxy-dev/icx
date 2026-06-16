@@ -1,0 +1,13 @@
+version: "2"
+
+# errcheck flags unchecked Close() returns. In tests these are deferred cleanups
+# on conns/listeners/sessions whose error is intentionally ignored -- not real
+# defects -- so exclude errcheck from *_test.go rather than wrapping every call.
+# Production code keeps an explicit //nolint:errcheck at its few deferred-Close
+# sites, so a genuinely missed error there still surfaces.
+linters:
+  exclusions:
+    rules:
+      - path: _test\.go$
+        linters:
+          - errcheck

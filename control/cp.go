@@ -175,7 +175,7 @@ func (t *Tunnel) Bringup(ctx context.Context) (err error) {
 // re-establish, the data plane fails closed when the installed keys expire — Run does
 // not proactively tear it down. Bringup must have succeeded first.
 func (t *Tunnel) Run(ctx context.Context) error {
-	defer t.Close()
+	defer t.Close() //nolint:errcheck
 	if t.initiator {
 		return t.runInitiator(ctx)
 	}

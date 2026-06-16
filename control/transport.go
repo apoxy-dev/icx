@@ -266,7 +266,7 @@ func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalS
 	if err != nil {
 		return nil, fmt.Errorf("control: open SA-setup stream: %w", err)
 	}
-	defer stream.Close()
+	defer stream.Close() //nolint:errcheck
 	if dl, ok := ctx.Deadline(); ok {
 		_ = stream.SetDeadline(dl)
 	}
