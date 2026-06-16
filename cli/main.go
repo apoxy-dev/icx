@@ -116,6 +116,20 @@ func main() {
 				Usage: "Source port hashing (you will need to disable this if you are behind a NAT)",
 				Value: true,
 			},
+			&cli.BoolFlag{
+				Name:  "peer-ip-filter",
+				Usage: "Drop received frames whose outer underlay source IP is not the configured peer (disable for peers behind asymmetric routing/NAT)",
+				Value: true,
+			},
+			&cli.IntFlag{
+				Name:  "rx-rate-limit",
+				Usage: "Max received frames per second per virtual network admitted to decryption; 0 disables (set above the tunnel's legitimate peak to bound DoS CPU)",
+				Value: 0,
+			},
+			&cli.StringSliceFlag{
+				Name:  "allowed-route",
+				Usage: "Allowed inner route as `srcCIDR=dstCIDR` (or a bare CIDR for src==dst); repeatable. Defaults to wildcard (no L3 containment) with a warning",
+			},
 			&cli.StringFlag{
 				Name:  "cpu-profile",
 				Usage: "Path to write optional CPU profiling output",
@@ -381,15 +395,25 @@ func run(c *cli.Context) error {
 	if c.Bool("source-port-hash") {
 		opts = append(opts, icx.WithSourcePortHashing())
 	}
+	if c.Bool("peer-ip-filter") {
+		// Drop frames whose outer source IP is not the configured peer before any
+		// crypto/replay work (APO-650). The peer's IP is fixed in the static-peer
+		// model the CLI ships; only the port (which hashing rewrites) varies.
+		opts = append(opts, icx.WithOuterSrcValidation())
+	}
+	if n := c.Int("rx-rate-limit"); n > 0 {
+		// Bound the AES-GCM CPU an off-path flood can burn (APO-655).
+		opts = append(opts, icx.WithRXRateLimit(n))
+	}
 
 	h, err := icx.NewHandler(opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create handler: %w", err)
 	}
 
-	allRoutes := []icx.Route{
-		{Src: netip.MustParsePrefix("0.0.0.0/0"), Dst: netip.MustParsePrefix("0.0.0.0/0")},
-		{Src: netip.MustParsePrefix("::/0"), Dst: netip.MustParsePrefix("::/0")},
+	allRoutes, err := parseAllowedRoutes(c.StringSlice("allowed-route"))
+	if err != nil {
+		return err
 	}
 
 	vni := c.Uint("vni")
@@ -435,6 +459,46 @@ func run(c *cli.Context) error {
 		return err
 	}
 	return nil
+}
+
+// parseAllowedRoutes builds the virtual network's allowed inner routes from the
+// --allowed-route flag. Each spec is "srcCIDR=dstCIDR", or a bare "cidr" meaning
+// src==dst. With no specs it falls back to the wildcard routes (0.0.0.0/0 and
+// ::/0) and warns: a wildcard makes the RX cryptokey-routing checks a no-op, so
+// the tunnel performs no L3 source/destination containment of the peer (APO-659).
+func parseAllowedRoutes(specs []string) ([]icx.Route, error) {
+	if len(specs) == 0 {
+		slog.Warn("no --allowed-route set: using wildcard routes (0.0.0.0/0, ::/0) which perform NO L3 containment of the peer; pass --allowed-route to confine inner src/dst (APO-659)")
+		return []icx.Route{
+			{Src: netip.MustParsePrefix("0.0.0.0/0"), Dst: netip.MustParsePrefix("0.0.0.0/0")},
+			{Src: netip.MustParsePrefix("::/0"), Dst: netip.MustParsePrefix("::/0")},
+		}, nil
+	}
+
+	routes := make([]icx.Route, 0, len(specs))
+	var hasWildcard bool
+	for _, spec := range specs {
+		srcStr, dstStr, found := strings.Cut(spec, "=")
+		if !found {
+			dstStr = srcStr // bare CIDR: src == dst
+		}
+		src, err := netip.ParsePrefix(strings.TrimSpace(srcStr))
+		if err != nil {
+			return nil, fmt.Errorf("invalid --allowed-route %q: source: %w", spec, err)
+		}
+		dst, err := netip.ParsePrefix(strings.TrimSpace(dstStr))
+		if err != nil {
+			return nil, fmt.Errorf("invalid --allowed-route %q: destination: %w", spec, err)
+		}
+		if src.Bits() == 0 || dst.Bits() == 0 {
+			hasWildcard = true
+		}
+		routes = append(routes, icx.Route{Src: src, Dst: dst})
+	}
+	if hasWildcard {
+		slog.Warn("an --allowed-route uses a /0 prefix: that side performs NO L3 containment of the peer (APO-659)")
+	}
+	return routes, nil
 }
 
 // startControlPlane builds the QUIC/mTLS control-plane tunnel and performs the
