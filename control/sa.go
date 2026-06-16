@@ -43,6 +43,21 @@ func DeriveMasterKeys(rootSecret []byte) (*MasterKeys, error) {
 	return mk, nil
 }
 
+// Destroy zeroes the master-key material. It is called when the owning session is
+// torn down (see Session.Close) so the RAM-only keys do not linger past the
+// session's life (APO-658). Best-effort: Go's GC may have copied the bytes, so this
+// shrinks rather than eliminates the residency window. Safe to call on a nil
+// receiver and idempotent. After Destroy, DeriveSA over these keys is meaningless;
+// callers must not use a destroyed MasterKeys.
+func (m *MasterKeys) Destroy() {
+	if m == nil {
+		return
+	}
+	for i := range m.keys {
+		clear(m.keys[i][:])
+	}
+}
+
 // MasterKeyIndex returns which master key (0 or 1) an SPI selects: per PSP, the
 // most-significant bit of the SPI.
 func MasterKeyIndex(spi uint32) int { return int(spi >> 31) }

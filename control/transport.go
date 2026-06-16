@@ -176,6 +176,11 @@ func newSession(ctx context.Context, conn *quic.Conn, role Role) (*Session, erro
 		return nil, err
 	}
 	mk, err := DeriveMasterKeys(root)
+	// Wipe the exported root secret as soon as the master keys are derived: it is
+	// the single seed from which every master and SA key flows, so shrinking its
+	// lifetime to this function bounds the disclosure window (APO-658). Go's GC may
+	// have copied it, so this is best-effort defense-in-depth, not a guarantee.
+	clear(root)
 	if err != nil {
 		_ = conn.CloseWithError(appErrNormal, "key derivation failure")
 		return nil, err
@@ -219,8 +224,16 @@ func (s *Session) PeerPublicKey() (*ecdsa.PublicKey, error) {
 // detect session loss promptly rather than waiting for the next rekey tick.
 func (s *Session) Context() context.Context { return s.conn.Context() }
 
-// Close cleanly shuts the session down.
-func (s *Session) Close() error { return s.conn.CloseWithError(appErrNormal, "") }
+// Close cleanly shuts the session down and zeroes the session's master keys
+// (APO-658). Close is only invoked on a session that is being discarded (Tunnel
+// teardown or reconnect, both from the single-goroutine Run loop), and the data
+// plane holds its own copies of the derived [16]byte SA keys rather than
+// references into MasterKeys, so wiping here cannot disturb a live SA.
+func (s *Session) Close() error {
+	err := s.conn.CloseWithError(appErrNormal, "")
+	s.masterKeys.Destroy()
+	return err
+}
 
 // DirectionalSAs is a peer's pair of simplex SAs for one session generation:
 // Tx is what we encrypt outbound with (the peer's RX SPI), Rx is what we

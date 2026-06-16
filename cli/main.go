@@ -360,15 +360,16 @@ func run(c *cli.Context) error {
 	}
 
 	port := c.Int("port")
+	// Scope the XDP redirect to our actual underlay address on the Geneve port.
+	// A wildcard bind (0.0.0.0 / ::) would hand AF_XDP every Geneve/<port> frame
+	// destined to ANY local address on the interface, not just ours (APO-662).
+	// Inbound frames from the peer are destined to this same local underlay IP
+	// (the source we send from), so an exact-address bind both suffices and is
+	// strictly tighter than the wildcard the eBPF falls back to.
 	ingressFilter, err := filter.Geneve(&net.UDPAddr{
-		IP:   net.IPv4zero,
+		IP:   net.IP(localAddr.Addr.AsSlice()),
 		Port: port,
-	},
-		&net.UDPAddr{
-			IP:   net.IPv6zero,
-			Port: port,
-		},
-	)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create ingress filter: %w", err)
 	}
@@ -584,7 +585,19 @@ func startControlPlane(ctx context.Context, c *cli.Context, h *icx.Handler, vni 
 }
 
 // loadIdentity reads and parses this node's identity private key from a PEM file.
+//
+// It refuses a key that group or others can access, the way OpenSSH and WireGuard
+// guard private keys: a world/group-readable identity key is a silent
+// key-disclosure risk (APO-658). `icx genkey` writes the key 0600, so the
+// supported path passes; a too-permissive key fails closed with a remediation hint.
 func loadIdentity(path string) (*control.Identity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat identity key %q: %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return nil, fmt.Errorf("identity key %q has insecure permissions %#o: it is accessible by group/other; run `chmod 600 %s`", path, perm, path)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read identity key %q: %w", path, err)
