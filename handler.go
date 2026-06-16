@@ -226,15 +226,34 @@ func WithClock(c Clock) HandlerOption {
 // Handler processes encapsulated Geneve traffic for one or more virtual
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
+// dstEntry is the per-Dst-prefix routing entry. srcTrie is the data-path
+// longest-prefix lookup over Src prefixes; owners is the exact-prefix ownership
+// index the management plane uses for collision detection (APO-653) and
+// owner-aware removal (APO-654). Both index the same routes by Src prefix; the
+// two stay in lockstep because all mutations go through addRouteLocked /
+// removeRouteLocked under networksByAddressMu.
+type dstEntry struct {
+	srcTrie *iptrie.Trie                     // Src prefix (LPM) -> *VirtualNetwork  (data path)
+	owners  map[netip.Prefix]*VirtualNetwork // exact Src prefix -> owning vnet      (management)
+}
+
 type Handler struct {
-	opts                *handlerOptions
-	networkByID         sync.Map     // Maps VNI to network
-	networksByAddressMu sync.RWMutex // Protects networksByAddress
-	networksByAddress   *iptrie.Trie // Two tier trie: dstAddr -> srcAddr -> network
-	proxyARP            *proxyarp.ProxyARP
-	ndProxy             *ndproxy.NDProxy
-	hdrPool             *sync.Pool
-	clock               Clock
+	opts        *handlerOptions
+	networkByID sync.Map // Maps VNI to network
+	// networksByAddressMu protects both networksByAddress and dstEntries.
+	networksByAddressMu sync.RWMutex
+	// networksByAddress is the data-path lookup: Dst prefix (LPM) -> *dstEntry.
+	// LPM is correct here so a packet matches the most specific Dst route.
+	networksByAddress *iptrie.Trie
+	// dstEntries is the management-plane index: EXACT Dst prefix -> *dstEntry (the
+	// same entries networksByAddress holds). Add/Remove/Update must address a route
+	// by its exact prefix, not by LPM containment, or a nested Dst lands in the
+	// wrong entry (APO-663) — so they go through this map, never networksByAddress.Find.
+	dstEntries map[netip.Prefix]*dstEntry
+	proxyARP   *proxyarp.ProxyARP
+	ndProxy    *ndproxy.NDProxy
+	hdrPool    *sync.Pool
+	clock      Clock
 }
 
 // NewHandler returns a new Handler configured with the given options.
@@ -265,11 +284,66 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 	return &Handler{
 		opts:              &options,
 		networksByAddress: iptrie.NewTrie(),
+		dstEntries:        make(map[netip.Prefix]*dstEntry),
 		proxyARP:          proxyarp.NewProxyARP(options.srcMAC),
 		ndProxy:           ndproxy.NewNDProxy(options.srcMAC),
 		hdrPool:           hdrPool,
 		clock:             options.clock,
 	}, nil
+}
+
+// checkRouteCollisionsLocked returns an error if any of routes would route an
+// exact (Dst, Src) prefix pair already owned by a different virtual network —
+// rather than letting the insert silently overwrite it (APO-653). The caller
+// must hold networksByAddressMu.
+func (h *Handler) checkRouteCollisionsLocked(routes []Route, vnet *VirtualNetwork) error {
+	for _, route := range routes {
+		dst, src := route.Dst.Masked(), route.Src.Masked()
+		if de := h.dstEntries[dst]; de != nil {
+			if owner, ok := de.owners[src]; ok && owner != vnet {
+				return fmt.Errorf("route Src=%s Dst=%s already routed to VNI %d", src, dst, owner.ID)
+			}
+		}
+	}
+	return nil
+}
+
+// addRouteLocked registers route -> vnet in both the data-path trie and the
+// exact-match owner index. It must be called only after checkRouteCollisionsLocked
+// has passed for these routes, so it never clobbers a different vnet's slot. The
+// caller must hold networksByAddressMu.
+func (h *Handler) addRouteLocked(route Route, vnet *VirtualNetwork) {
+	dst, src := route.Dst.Masked(), route.Src.Masked()
+	de := h.dstEntries[dst]
+	if de == nil {
+		de = &dstEntry{
+			srcTrie: iptrie.NewTrie(),
+			owners:  make(map[netip.Prefix]*VirtualNetwork),
+		}
+		h.dstEntries[dst] = de
+		h.networksByAddress.Insert(dst, de)
+	}
+	de.owners[src] = vnet
+	de.srcTrie.Insert(src, vnet)
+}
+
+// removeRouteLocked unregisters route, but only if it is currently owned by vnet
+// (APO-654) — so decommissioning one network never deletes a route a different
+// network still owns. When a Dst entry's last route is removed it is dropped from
+// both indexes so empty nodes do not accumulate (APO-654). The caller must hold
+// networksByAddressMu.
+func (h *Handler) removeRouteLocked(route Route, vnet *VirtualNetwork) {
+	dst, src := route.Dst.Masked(), route.Src.Masked()
+	de := h.dstEntries[dst]
+	if de == nil || de.owners[src] != vnet {
+		return
+	}
+	delete(de.owners, src)
+	de.srcTrie.Remove(src)
+	if len(de.owners) == 0 {
+		delete(h.dstEntries, dst)
+		h.networksByAddress.Remove(dst)
+	}
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
@@ -284,20 +358,21 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, all
 		AllowedRoutes: allowedRoutes,
 	}
 
-	h.networkByID.Store(vni, vnet)
-
-	// Insert all allowed routes for this vnet
 	h.networksByAddressMu.Lock()
-	for _, route := range allowedRoutes {
-		value := h.networksByAddress.Find(route.Dst.Addr())
-		if value == nil {
-			value = iptrie.NewTrie()
-			h.networksByAddress.Insert(route.Dst, value)
-		}
-		srcTrie := value.(*iptrie.Trie)
-		srcTrie.Insert(route.Src, vnet)
+	defer h.networksByAddressMu.Unlock()
+
+	// Reject the whole add if any route would take over a slot already owned by a
+	// different network, instead of silently overwriting it (APO-653). Validate
+	// before mutating so a conflict leaves no partial state.
+	if err := h.checkRouteCollisionsLocked(allowedRoutes, vnet); err != nil {
+		return err
 	}
-	h.networksByAddressMu.Unlock()
+	for _, route := range allowedRoutes {
+		h.addRouteLocked(route, vnet)
+	}
+	// Publish the network only after its routes are installed, so the VNI never
+	// exists with a half-applied routing table.
+	h.networkByID.Store(vni, vnet)
 
 	return nil
 }
@@ -312,15 +387,11 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 
 	h.networkByID.Delete(vni)
 
-	// Remove all allowed routes for this vnet
+	// Remove only the routes this vnet owns, so removing it never blackholes a
+	// different network that shares a Dst prefix (APO-654).
 	h.networksByAddressMu.Lock()
 	for _, route := range vnet.AllowedRoutes {
-		value := h.networksByAddress.Find(route.Dst.Addr())
-		if value != nil {
-			srcTrie := value.(*iptrie.Trie)
-			srcTrie.Remove(route.Src)
-			// Library doesn't expose a way to easily check if the trie is empty.
-		}
+		h.removeRouteLocked(route, vnet)
 	}
 	h.networksByAddressMu.Unlock()
 
@@ -335,30 +406,25 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 	}
 	vnet := v.(*VirtualNetwork)
 
-	// Remove all old allowed routes for this vnet, then insert the new ones.
 	h.networksByAddressMu.Lock()
+	defer h.networksByAddressMu.Unlock()
+
+	// Remove this vnet's current routes, then validate the new set against the
+	// routes that remain (other networks). On conflict, restore the old routes so
+	// the update is atomic — it never leaves the network partially routed or
+	// silently steals another network's slot (APO-653).
 	for _, route := range vnet.AllowedRoutes {
-		value := h.networksByAddress.Find(route.Dst.Addr())
-		if value != nil {
-			srcTrie := value.(*iptrie.Trie)
-			srcTrie.Remove(route.Src)
-			// Library doesn't expose a way to easily check if the trie is empty.
-		}
+		h.removeRouteLocked(route, vnet)
 	}
-
-	// Insert all new allowed routes for this vnet
+	if err := h.checkRouteCollisionsLocked(allowedRoutes, vnet); err != nil {
+		for _, route := range vnet.AllowedRoutes {
+			h.addRouteLocked(route, vnet)
+		}
+		return err
+	}
 	for _, route := range allowedRoutes {
-		value := h.networksByAddress.Find(route.Dst.Addr())
-		if value == nil {
-			value = iptrie.NewTrie()
-			h.networksByAddress.Insert(route.Dst, value)
-		}
-		srcTrie := value.(*iptrie.Trie)
-		srcTrie.Insert(route.Src, vnet)
+		h.addRouteLocked(route, vnet)
 	}
-	h.networksByAddressMu.Unlock()
-
-	// Update vnet state
 	vnet.AllowedRoutes = allowedRoutes
 
 	return nil
@@ -909,22 +975,24 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		}
 	}
 
-	// Find the virtual network by the destination and source addresses.
+	// Find the virtual network by the destination then source address (both LPM).
+	// Hold the read lock across both lookups: networksByAddress and the inner
+	// srcTrie are not safe against a concurrent management-plane mutation, so the
+	// lock must span the whole two-tier lookup, not just the outer Find.
 	h.networksByAddressMu.RLock()
 	value := h.networksByAddress.Find(dstAddr)
-	h.networksByAddressMu.RUnlock()
 	if value == nil {
+		h.networksByAddressMu.RUnlock()
 		slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
 		return 0, false
 	}
-	srcTrie := value.(*iptrie.Trie)
-
-	value = srcTrie.Find(srcAddr)
-	if value == nil {
+	srcValue := value.(*dstEntry).srcTrie.Find(srcAddr)
+	h.networksByAddressMu.RUnlock()
+	if srcValue == nil {
 		slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
 		return 0, false
 	}
-	vnet := value.(*VirtualNetwork)
+	vnet := srcValue.(*VirtualNetwork)
 
 	hdr := h.hdrPool.Get().(*geneve.Header)
 	defer func() {

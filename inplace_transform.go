@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/phemmer/go-iptrie"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 
@@ -436,22 +435,24 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		}
 	}
 
-	// Find the virtual network by the destination and source addresses.
+	// Find the virtual network by the destination then source address (both LPM).
+	// Hold the read lock across both lookups: networksByAddress and the inner
+	// srcTrie are not safe against a concurrent management-plane mutation, so the
+	// lock must span the whole two-tier lookup, not just the outer Find.
 	h.networksByAddressMu.RLock()
 	value := h.networksByAddress.Find(dstAddr)
-	h.networksByAddressMu.RUnlock()
 	if value == nil {
+		h.networksByAddressMu.RUnlock()
 		slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
 		return dropWindowOffset, 0, false
 	}
-	srcTrie := value.(*iptrie.Trie)
-
-	value = srcTrie.Find(srcAddr)
-	if value == nil {
+	srcValue := value.(*dstEntry).srcTrie.Find(srcAddr)
+	h.networksByAddressMu.RUnlock()
+	if srcValue == nil {
 		slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
 		return dropWindowOffset, 0, false
 	}
-	vnet := value.(*VirtualNetwork)
+	vnet := srcValue.(*VirtualNetwork)
 
 	hdr := h.hdrPool.Get().(*geneve.Header)
 	defer func() {
