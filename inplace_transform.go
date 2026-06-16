@@ -72,7 +72,15 @@ const geneveHdrLen = 32
 func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	phyFrame := buf[off : off+length]
 
-	payload, err := udp.Decode(phyFrame, nil, true)
+	// Capture the outer underlay source only when peer-source validation is on
+	// (APO-650); otherwise pass nil so udp.Decode skips the address copy.
+	var outerSrc tcpip.FullAddress
+	var outerSrcPtr *tcpip.FullAddress
+	if h.opts.validateOuterSrc {
+		outerSrcPtr = &outerSrc
+	}
+
+	payload, err := udp.Decode(phyFrame, outerSrcPtr, true)
 	if err != nil {
 		slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
 		return dropWindowOffset, 0
@@ -100,6 +108,17 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		return dropWindowOffset, 0
 	}
 	vnet := value.(*VirtualNetwork)
+
+	// Drop frames whose outer underlay source does not match the configured peer
+	// before any crypto/replay work (APO-650). Only the IP is compared (the UDP
+	// source port is rewritten per packet by source-port hashing). A nil
+	// RemoteAddr under an enabled check fails closed. Mirrors PhyToVirt.
+	if h.opts.validateOuterSrc && (vnet.RemoteAddr == nil || outerSrc.Addr != vnet.RemoteAddr.Addr) {
+		slog.Debug("Dropping frame: outer source does not match configured peer",
+			slog.String("outerSrc", outerSrc.Addr.String()))
+		vnet.Stats.RXDropsBadPeer.Add(1)
+		return dropWindowOffset, 0
+	}
 
 	var nonce []byte
 	var epoch uint32
@@ -156,6 +175,16 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		return dropWindowOffset, 0
 	}
 
+	// Rate-limit the costly AES-GCM Open per network (APO-655). Placed after the
+	// cheap VNI/key/SPI checks so only frames that would otherwise be authenticated
+	// consume budget, and before Open so a flood cannot burn crypto CPU. Mirrors
+	// PhyToVirt.
+	if vnet.rxLimiter != nil && !vnet.rxLimiter.allow(h.clock.Now().UnixNano()) {
+		slog.Debug("Dropping frame: RX rate limit exceeded", slog.Uint64("vni", uint64(hdr.VNI)))
+		vnet.Stats.RXRateLimitDrops.Add(1)
+		return dropWindowOffset, 0
+	}
+
 	txCounter := binary.BigEndian.Uint64(nonce[4:])
 
 	// In-place decap: the ciphertext (payload[hdrLen:]) lives at ctStart within
@@ -206,11 +235,14 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 
 	ipVersion := ipPacket[0] >> 4
 
-	// Get the source address of the decrypted frame.
-	var srcAddr netip.Addr
+	// Get the source and destination addresses of the decrypted frame. Both feed
+	// the cryptokey-routing check below: the inner source against the allowed
+	// route.Dst prefixes (remote side) and the inner destination against the
+	// allowed route.Src prefixes (local side). Mirrors PhyToVirt.
+	var srcAddr, dstAddr netip.Addr
 	switch ipVersion {
 	case header.IPv4Version:
-		// SourceAddressSlice indexes up to IPv4MinimumSize; a decrypted packet
+		// The src/dst accessors index up to IPv4MinimumSize; a decrypted packet
 		// shorter than that (a peer with valid keys can send one) would panic.
 		// Mirrors PhyToVirt.
 		if len(ipPacket) < header.IPv4MinimumSize {
@@ -223,6 +255,12 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv4 address in frame")
+			vnet.Stats.RXInvalidSrc.Add(1)
+			return dropWindowOffset, 0
+		}
+		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv4 destination address in frame")
 			vnet.Stats.RXInvalidSrc.Add(1)
 			return dropWindowOffset, 0
 		}
@@ -240,25 +278,44 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 			vnet.Stats.RXInvalidSrc.Add(1)
 			return dropWindowOffset, 0
 		}
+		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv6 destination address in frame")
+			vnet.Stats.RXInvalidSrc.Add(1)
+			return dropWindowOffset, 0
+		}
 	default:
 		slog.Warn("Unsupported IP version", slog.Int("version", int(ipVersion)))
 		vnet.Stats.RXInvalidSrc.Add(1)
 		return dropWindowOffset, 0
 	}
 
-	// Confirm that the source address is valid for the virtual network.
-	// From our perspective, the source address must be within one of the
-	// allowed destination prefixes for this vnet.
-	var validSrcAddr bool
+	// Confirm the inner addresses are authorized for this virtual network in a
+	// single pass: the source must fall within an allowed route.Dst prefix (the
+	// remote side) and the destination within an allowed route.Src prefix (the
+	// local side). The destination half is the cryptokey-routing check RX
+	// previously omitted (APO-649), confining a peer to the local subnets it is
+	// permitted to deliver to. Mirrors PhyToVirt.
+	var validSrc, validDst bool
 	for _, route := range vnet.AllowedRoutes {
-		if route.Dst.Contains(srcAddr) {
-			validSrcAddr = true
+		if !validSrc && route.Dst.Contains(srcAddr) {
+			validSrc = true
+		}
+		if !validDst && route.Src.Contains(dstAddr) {
+			validDst = true
+		}
+		if validSrc && validDst {
 			break
 		}
 	}
-	if !validSrcAddr {
+	if !validSrc {
 		slog.Debug("Dropping frame with invalid tunnel source address", slog.String("srcAddr", srcAddr.String()))
 		vnet.Stats.RXInvalidSrc.Add(1)
+		return dropWindowOffset, 0
+	}
+	if !validDst {
+		slog.Debug("Dropping frame with invalid tunnel destination address", slog.String("dstAddr", dstAddr.String()))
+		vnet.Stats.RXInvalidDst.Add(1)
 		return dropWindowOffset, 0
 	}
 

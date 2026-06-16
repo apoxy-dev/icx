@@ -52,6 +52,18 @@ type Statistics struct {
 	RXDropsSPIMismatch atomic.Uint64
 	// RXInvalidSrc is the number of received packets with an invalid source address.
 	RXInvalidSrc atomic.Uint64
+	// RXInvalidDst is the number of received packets dropped because the decrypted
+	// inner destination address fell outside every allowed route.Src prefix — the
+	// destination-side half of cryptokey routing that RX previously skipped (APO-649).
+	RXInvalidDst atomic.Uint64
+	// RXDropsBadPeer is the number of received packets dropped because the outer
+	// underlay source IP did not match the configured peer (APO-650). Only counted
+	// when outer-source validation is enabled (WithOuterSrcValidation).
+	RXDropsBadPeer atomic.Uint64
+	// RXRateLimitDrops is the number of received packets dropped before AES-GCM Open
+	// by the per-network RX rate limiter (APO-655). Only counted when a limit is
+	// configured (WithRXRateLimit).
+	RXRateLimitDrops atomic.Uint64
 	// TXPackets is the number of transmitted packets.
 	TXPackets atomic.Uint64
 	// TXBytes is the number of bytes transmitted.
@@ -113,6 +125,11 @@ type VirtualNetwork struct {
 	// session resets the allocator (the receive side emits no nonce, so a reused receive
 	// SPI is harmless: its replay filter is rebuilt with the fresh key).
 	rxEpoch atomic.Uint32
+	// rxLimiter bounds how many frames per second reach the AES-GCM Open on the RX
+	// path, shedding an off-path flood of forgeable VNI/epoch frames before they burn
+	// crypto CPU (APO-655). nil when no limit is configured, in which case the hot
+	// path skips it entirely.
+	rxLimiter *rxRateLimiter
 }
 
 // Clock provides time to the handler. Tests can inject a fake clock.
@@ -135,6 +152,13 @@ type handlerOptions struct {
 	layer3            bool
 	keepAliveInterval *time.Duration
 	clock             Clock
+	// validateOuterSrc, when set, makes the RX path drop any frame whose outer
+	// underlay source IP does not match the receiving network's configured peer
+	// (RemoteAddr) before any crypto/replay work (APO-650).
+	validateOuterSrc bool
+	// rxRateLimitPPS, when > 0, caps how many frames per second per virtual network
+	// may reach the AES-GCM Open on the RX path (APO-655). 0 disables the limiter.
+	rxRateLimitPPS int
 }
 
 func defaultHandlerOptions() handlerOptions {
@@ -219,6 +243,39 @@ func WithClock(c Clock) HandlerOption {
 			c = realClock{}
 		}
 		opts.clock = c
+		return nil
+	}
+}
+
+// WithOuterSrcValidation makes the RX path verify that each frame's outer
+// underlay source IP matches the receiving virtual network's configured peer
+// (RemoteAddr) and drop it otherwise, before any per-packet crypto or replay
+// work (APO-650). Only the IP is checked, not the UDP source port, so it is
+// compatible with source-port hashing (which rewrites the port per packet).
+//
+// This suits the single-static-peer deployment the CLI ships. It is left off by
+// default in the library because a peer behind asymmetric routing/NAT (whose
+// packets arrive from an address other than the one we send to) would otherwise
+// be silently dropped; enable it when the peer's source address is stable.
+func WithOuterSrcValidation() HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.validateOuterSrc = true
+		return nil
+	}
+}
+
+// WithRXRateLimit caps how many frames per second per virtual network may reach
+// the AES-GCM Open on the RX path, bounding the CPU an off-path flood of
+// forgeable VNI/epoch frames can burn (APO-655). pps <= 0 disables the limiter
+// (the default), preserving the zero-overhead datapath; a positive value should
+// be set comfortably above the tunnel's expected legitimate peak, since
+// legitimate and attacker traffic share the per-network budget.
+func WithRXRateLimit(pps int) HandlerOption {
+	return func(opts *handlerOptions) error {
+		if pps < 0 {
+			pps = 0
+		}
+		opts.rxRateLimitPPS = pps
 		return nil
 	}
 }
@@ -356,6 +413,9 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, all
 		ID:            vni,
 		RemoteAddr:    remoteAddr,
 		AllowedRoutes: allowedRoutes,
+	}
+	if h.opts.rxRateLimitPPS > 0 {
+		vnet.rxLimiter = newRxRateLimiter(h.opts.rxRateLimitPPS)
 	}
 
 	h.networksByAddressMu.Lock()
@@ -655,7 +715,15 @@ func (h *Handler) ListVirtualNetworks() []*VirtualNetwork {
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
-	payload, err := udp.Decode(phyFrame, nil, true)
+	// Capture the outer underlay source only when peer-source validation is on
+	// (APO-650); otherwise pass nil so udp.Decode skips the address copy.
+	var outerSrc tcpip.FullAddress
+	var outerSrcPtr *tcpip.FullAddress
+	if h.opts.validateOuterSrc {
+		outerSrcPtr = &outerSrc
+	}
+
+	payload, err := udp.Decode(phyFrame, outerSrcPtr, true)
 	if err != nil {
 		slog.Warn("Failed to decode UDP frame", slog.Any("error", err))
 		return 0
@@ -679,6 +747,17 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 	vnet := value.(*VirtualNetwork)
+
+	// Drop frames whose outer underlay source does not match the configured peer
+	// before any crypto/replay work (APO-650). Only the IP is compared (the UDP
+	// source port is rewritten per packet by source-port hashing). A nil
+	// RemoteAddr under an enabled check fails closed.
+	if h.opts.validateOuterSrc && (vnet.RemoteAddr == nil || outerSrc.Addr != vnet.RemoteAddr.Addr) {
+		slog.Debug("Dropping frame: outer source does not match configured peer",
+			slog.String("outerSrc", outerSrc.Addr.String()))
+		vnet.Stats.RXDropsBadPeer.Add(1)
+		return 0
+	}
 
 	var nonce []byte
 	var epoch uint32
@@ -736,6 +815,15 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		return 0
 	}
 
+	// Rate-limit the costly AES-GCM Open per network (APO-655). Placed after the
+	// cheap VNI/key/SPI checks so only frames that would otherwise be authenticated
+	// consume budget, and before Open so a flood cannot burn crypto CPU.
+	if vnet.rxLimiter != nil && !vnet.rxLimiter.allow(h.clock.Now().UnixNano()) {
+		slog.Debug("Dropping frame: RX rate limit exceeded", slog.Uint64("vni", uint64(hdr.VNI)))
+		vnet.Stats.RXRateLimitDrops.Add(1)
+		return 0
+	}
+
 	txCounter := binary.BigEndian.Uint64(nonce[4:])
 
 	var ipPacket []byte
@@ -784,11 +872,14 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 
 	ipVersion := ipPacket[0] >> 4
 
-	// Get the source address of the decrypted frame.
-	var srcAddr netip.Addr
+	// Get the source and destination addresses of the decrypted frame. Both feed
+	// the cryptokey-routing check below: the inner source against the allowed
+	// route.Dst prefixes (remote side) and the inner destination against the
+	// allowed route.Src prefixes (local side).
+	var srcAddr, dstAddr netip.Addr
 	switch ipVersion {
 	case header.IPv4Version:
-		// SourceAddressSlice indexes up to IPv4MinimumSize; a decrypted packet
+		// The src/dst accessors index up to IPv4MinimumSize; a decrypted packet
 		// shorter than that (a peer with valid keys can send one) would panic.
 		if len(ipPacket) < header.IPv4MinimumSize {
 			slog.Warn("Truncated IPv4 packet after decryption")
@@ -800,6 +891,12 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		srcAddr, ok = netip.AddrFromSlice(ipHdr.SourceAddressSlice())
 		if !ok {
 			slog.Warn("Invalid IPv4 address in frame")
+			vnet.Stats.RXInvalidSrc.Add(1)
+			return 0
+		}
+		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv4 destination address in frame")
 			vnet.Stats.RXInvalidSrc.Add(1)
 			return 0
 		}
@@ -817,25 +914,44 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 			vnet.Stats.RXInvalidSrc.Add(1)
 			return 0
 		}
+		dstAddr, ok = netip.AddrFromSlice(ipHdr.DestinationAddressSlice())
+		if !ok {
+			slog.Warn("Invalid IPv6 destination address in frame")
+			vnet.Stats.RXInvalidSrc.Add(1)
+			return 0
+		}
 	default:
 		slog.Warn("Unsupported IP version", slog.Int("version", int(ipVersion)))
 		vnet.Stats.RXInvalidSrc.Add(1)
 		return 0
 	}
 
-	// Confirm that the source address is valid for the virtual network.
-	// From our perspective, the source address must be within one of the
-	// allowed destination prefixes for this vnet.
-	var validSrcAddr bool
+	// Confirm the inner addresses are authorized for this virtual network in a
+	// single pass: the source must fall within an allowed route.Dst prefix (the
+	// remote side) and the destination within an allowed route.Src prefix (the
+	// local side). The destination half is the cryptokey-routing check RX
+	// previously omitted (APO-649), confining a peer to the local subnets it is
+	// permitted to deliver to.
+	var validSrc, validDst bool
 	for _, route := range vnet.AllowedRoutes {
-		if route.Dst.Contains(srcAddr) {
-			validSrcAddr = true
+		if !validSrc && route.Dst.Contains(srcAddr) {
+			validSrc = true
+		}
+		if !validDst && route.Src.Contains(dstAddr) {
+			validDst = true
+		}
+		if validSrc && validDst {
 			break
 		}
 	}
-	if !validSrcAddr {
+	if !validSrc {
 		slog.Debug("Dropping frame with invalid tunnel source address", slog.String("srcAddr", srcAddr.String()))
 		vnet.Stats.RXInvalidSrc.Add(1)
+		return 0
+	}
+	if !validDst {
+		slog.Debug("Dropping frame with invalid tunnel destination address", slog.String("dstAddr", dstAddr.String()))
+		vnet.Stats.RXInvalidDst.Add(1)
 		return 0
 	}
 
