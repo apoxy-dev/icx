@@ -13,6 +13,7 @@ require (
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/sync v0.16.0
 	golang.org/x/sys v0.35.0
+	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173
 	gvisor.dev/gvisor v0.0.0-20250606001031-fa4c4dd86b43
 )
 
@@ -25,5 +26,6 @@ require (
 	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
