@@ -35,6 +35,7 @@ import (
 	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/queues"
 	"github.com/apoxy-dev/icx/veth"
+	"github.com/apoxy-dev/icx/vtep/afxdp"
 )
 
 func main() {
@@ -441,17 +442,24 @@ func run(c *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create forwarder: %w", err)
 	}
+	// Drive the AF_XDP forwarder through the vtep.Datapath seam rather than calling
+	// forwarder.Start directly: the per-node VTEP is just one Datapath shape (afxdp),
+	// and routing its lifecycle through the seam lets the other drivers (tun, netstack)
+	// reuse the same engine/control wiring. afxdp.Wrap takes ownership of the forwarder
+	// and its in-place, shared-UMEM hot loop unchanged — Run delegates to Start (which
+	// self-closes the forwarder on return), so the node data path stays byte-identical.
+	dp := afxdp.Wrap(fwd)
 
-	// Run the rekey loop and the forwarder under one errgroup sharing a cancel: a signal
-	// (ctx) or a forwarder error stops both. The control plane reconnects indefinitely on
+	// Run the rekey loop and the datapath under one errgroup sharing a cancel: a signal
+	// (ctx) or a datapath error stops both. The control plane reconnects indefinitely on
 	// its own (Tunnel.Run does not return on CP failures), so it does not abort the
-	// forwarder; if it cannot re-establish, the data plane fails closed when the installed
+	// datapath; if it cannot re-establish, the data plane fails closed when the installed
 	// keys expire (see key lifetime below).
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return tun.Run(gctx) })
 	g.Go(func() error {
-		if err := fwd.Start(gctx); err != nil && !errors.Is(err, context.Canceled) {
-			return fmt.Errorf("forwarder: %w", err)
+		if err := dp.Run(gctx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("datapath: %w", err)
 		}
 		return nil
 	})
