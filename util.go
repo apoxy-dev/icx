@@ -21,6 +21,12 @@ func MTU(pathMTU int) int {
 // Calculate Geneve header length with our full set of options.
 func headerLength() int {
 	hdr := geneve.Header{
+		// NumOptions drives MarshalBinary's option loop; without it the two
+		// options below are silently skipped and the header marshals to its
+		// 8-byte base, undercounting encap overhead by 24 bytes and inflating
+		// the advertised MTU (APO-665). Must match the fixed 2-option header
+		// the datapath emits (geneveHdrLen = 32).
+		NumOptions: 2,
 		Options: [geneve.MaxOptions]geneve.Option{
 			{
 				Class:  geneve.ClassExperimental,

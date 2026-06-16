@@ -999,6 +999,20 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
+	// Bound the inner packet so the ciphertext + AEAD tag fit within phyFrame.
+	// Seal appends ptLen+Overhead() bytes after the Geneve header; an oversized
+	// inner packet would otherwise overflow phyFrame (when its capacity exceeds
+	// its length) or force Seal to silently reallocate onto the heap, so the
+	// ciphertext would not land in the frame udp.Encode/the caller transmits.
+	// Drop instead (APO-667).
+	if hdrLen+len(ipPacket)+txCipher.Overhead() > len(payload) {
+		slog.Debug("Dropping oversized inner packet for encap",
+			slog.Int("innerLen", len(ipPacket)),
+			slog.Int("payloadLen", len(payload)))
+		vnet.Stats.TXErrors.Add(1)
+		return 0, false
+	}
+
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
 	// Underlay source selection.
