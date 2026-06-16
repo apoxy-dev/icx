@@ -561,6 +561,22 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	// and the 16-byte tag lands in the tailroom immediately after. The AAD is
 	// the Geneve header we just marshalled directly in front.
 	ptLen := len(ipPacket)
+
+	// Bound the inner packet so the ciphertext + AEAD tag cannot be sealed past
+	// the end of buf. Seal writes ptLen+Overhead() bytes starting at ipStart; an
+	// oversized inner packet would otherwise overflow into the adjacent UMEM
+	// frame (when the caller's buf capacity spans it) or force Seal to silently
+	// reallocate onto the heap — leaving plaintext in the frame the descriptor
+	// still points at. Drop instead (APO-667).
+	if ipStart+ptLen+txCipher.Overhead() > len(buf) {
+		slog.Debug("Dropping oversized inner packet for in-place encap",
+			slog.Int("innerLen", ptLen),
+			slog.Int("ipStart", ipStart),
+			slog.Int("bufLen", len(buf)))
+		vnet.Stats.TXErrors.Add(1)
+		return dropWindowOffset, 0, false
+	}
+
 	aad := buf[geneveStart : geneveStart+hdrLen]
 	encryptedFrameLen := len(txCipher.Seal(buf[ipStart:ipStart], nonce, buf[ipStart:ipStart+ptLen], aad))
 
