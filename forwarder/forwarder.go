@@ -125,6 +125,52 @@ var socketOpts = xsk.Options{
 	TxRingNumDescs:         4096,
 }
 
+// phyBindOpts returns the bind options for the FIRST (phy) socket. On a
+// zero-copy-capable NIC (mlx5/ixgbe), a best-effort bind grabs driver zero-copy
+// and DMA-maps the shared UMEM to the phy, after which the shared virt (veth)
+// bind fails EOPNOTSUPP (APO-800). Pinning the phy to XDP_COPY keeps the UMEM
+// shareable across both sockets, which the in-place handoff datapath requires.
+func phyBindOpts() xsk.Options {
+	so := socketOpts
+	so.ForceCopy = true
+	return so
+}
+
+// txBatchSize mirrors the kernel's copy-mode TX_BATCH_SIZE: xsk_generic_xmit
+// pulls at most this many descriptors off the TX ring per sendto (and never pulls
+// autonomously). flushTx kicks repeatedly because of it.
+const txBatchSize = 32
+
+// maxTxDrainKicks bounds flushTx's kicks per call so even a fully backed-up TX
+// ring (TxRingNumDescs deep) can drain in a single pass without unbounded
+// syscalls. The no-progress break ends the loop early on the common path.
+var maxTxDrainKicks = socketOpts.TxRingNumDescs/txBatchSize + 1
+
+// flushTx drains a socket's copy-mode TX ring by kicking until it empties or the
+// kernel stops accepting descriptors (sndbuf / completion-ring full — the next
+// Complete frees that). Without it, a single post-Transmit kick submits only
+// txBatchSize frames to the driver and the rest of the batch is stranded once the
+// producer goes idle: the ~288-frame copy-mode stall (APO-801). It is a cheap
+// no-op (one ring read) when the TX ring is empty, and elides its kicks when the
+// socket is draining under NEED_WAKEUP.
+func flushTx(s *xsk.Socket) error {
+	for i := 0; i < maxTxDrainKicks; i++ {
+		before := s.NumTransmitted()
+		if before == 0 {
+			return nil
+		}
+		if err := s.Kick(); err != nil {
+			return err
+		}
+		if s.NumTransmitted() >= before {
+			// Kernel accepted nothing this round (back-pressure); the queued
+			// descriptors stay put until a Complete frees sndbuf/CQ space.
+			return nil
+		}
+	}
+	return nil
+}
+
 // minInPlaceHeadroom is the largest outer-header prepend the in-place encap
 // performs: udp.PayloadOffsetIPv6 (62) + the fixed 32-byte Geneve header = 94
 // bytes. The zero-copy datapath rests on the kernel leaving at least this many
@@ -172,6 +218,18 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 	slog.Debug("Creating forwarder",
 		slog.String("phyName", options.phyName),
 		slog.String("virtName", options.virtName))
+
+	// Attach the RX-redirect programs in SKB/generic mode. The shared-UMEM
+	// datapath runs in copy mode (phyBindOpts forces XDP_COPY so the UMEM stays
+	// shareable across the phy and virt sockets — APO-800). On a native-XDP-capable
+	// NIC (e.g. ixgbe) a NATIVE-mode redirect program reconfigures the driver's TX
+	// rings, and copy-mode AF_XDP TX frames then never reach the wire — the driver
+	// silently drops them while still producing completions (proven on real ixgbe:
+	// with a native program nic_tx_delta=0 at 934k "completed"/s; in SKB mode the
+	// same blast egresses 934k pps). SKB mode runs the redirect in the generic XDP
+	// hook, leaving the driver's TX path untouched, and still steers RX into the
+	// AF_XDP sockets — which is all the copy-mode datapath needs. (APO-803.)
+	filter.AttachFlags = unix.XDP_FLAGS_SKB_MODE
 
 	phyLink, err := netlink.LinkByName(options.phyName)
 	if err != nil {
@@ -253,7 +311,7 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 		}
 		f.umems = append(f.umems, umem)
 
-		sk, err := xsk.NewSocket(umem, phyLink.Attrs().Index, queueID, socketOpts)
+		sk, err := xsk.NewSocket(umem, phyLink.Attrs().Index, queueID, phyBindOpts())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create physical XDP socket: %w", err)
 		}
@@ -425,7 +483,31 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 			}
 		}
 
-		if err := poll(phy, virt, 100*time.Millisecond); err != nil {
+		// Drive any queued copy-mode TX out to the driver before sleeping in poll.
+		// The kernel pulls only txBatchSize descriptors per kick and never on its
+		// own, so a batch larger than that — or any tail left after the producer
+		// goes idle — needs repeated kicks or it strands in the ring (APO-801).
+		if err := flushTx(phy); err != nil {
+			return fmt.Errorf("failed to drain phy TX: %w", err)
+		}
+		if err := flushTx(virt); err != nil {
+			return fmt.Errorf("failed to drain virt TX: %w", err)
+		}
+
+		// If either TX ring still holds un-drained descriptors, cap the poll sleep
+		// at 1ms rather than the 100ms idle cap so we loop back promptly to reclaim
+		// completions and keep kicking (copy-mode TX completion has no poll event of
+		// its own — there is nothing to wake us when the COMPLETION ring fills). The
+		// poll MUST actually block for (up to) that 1ms: it is the CPU yield that
+		// lets the softirq/NAPI producing those TX completions run. poll() therefore
+		// does not arm POLLOUT for a not-full TX ring (which the kernel reports
+		// ready at < 50% full, collapsing the sleep to ~0 and starving the
+		// completion softirq — APO-803). Otherwise sleep until RX-readable or 100ms.
+		timeout := 100 * time.Millisecond
+		if phy.NumTransmitted() > 0 || virt.NumTransmitted() > 0 {
+			timeout = time.Millisecond
+		}
+		if err := poll(phy, virt, timeout); err != nil {
 			if errors.Is(err, os.ErrClosed) {
 				return err
 			}
@@ -683,16 +765,19 @@ func poll(phy, virt *xsk.Socket, timeout time.Duration) (err error) {
 	if phy.NumFilled() > 0 {
 		pfds[0].Events |= unix.POLLIN
 	}
-	if phy.NumTransmitted() > 0 {
-		pfds[0].Events |= unix.POLLOUT
-	}
-
 	if virt.NumFilled() > 0 {
 		pfds[1].Events |= unix.POLLIN
 	}
-	if virt.NumTransmitted() > 0 {
-		pfds[1].Events |= unix.POLLOUT
-	}
+
+	// POLLOUT is deliberately NOT armed for an outstanding-but-not-full TX ring.
+	// In copy mode the kernel reports xsk POLLOUT-ready whenever the TX ring is
+	// < 50% full, so arming it here makes poll() return immediately under TX
+	// back-pressure (ring barely full, sndbuf saturated) — defeating the CPU
+	// yield this poll exists to perform and busy-spinning the pinned datapath
+	// thread, which starves the softirq that completes copy-mode TX (APO-803).
+	// We drive the TX ring with explicit kicks (flushTx), not POLLOUT, so the
+	// only thing POLLOUT would buy is a wakeup on TX-ring space — and the timeout
+	// already bounds that.
 
 	for err = unix.EINTR; err == unix.EINTR; {
 		_, err = unix.Poll(pfds[:], int(timeout.Milliseconds()))
