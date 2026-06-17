@@ -127,6 +127,10 @@ func main() {
 				Usage: "Max received frames per second per virtual network admitted to decryption; 0 disables (set above the tunnel's legitimate peak to bound DoS CPU)",
 				Value: 0,
 			},
+			&cli.BoolFlag{
+				Name:  "outer-udp-checksum",
+				Usage: "Compute the outer UDP checksum on an IPv4 underlay (skipped by default: the payload is AES-GCM authenticated and the RX path ignores it). Enable only for middleboxes that drop zero-checksum UDP",
+			},
 			&cli.StringSliceFlag{
 				Name:  "allowed-route",
 				Usage: "Allowed inner route as `srcCIDR=dstCIDR` (or a bare CIDR for src==dst); repeatable. Defaults to wildcard (no L3 containment) with a warning",
@@ -406,6 +410,11 @@ func run(c *cli.Context) error {
 	if n := c.Int("rx-rate-limit"); n > 0 {
 		// Bound the AES-GCM CPU an off-path flood can burn (APO-655).
 		opts = append(opts, icx.WithRXRateLimit(n))
+	}
+	if c.Bool("outer-udp-checksum") {
+		// Compute the outer UDP checksum even on an IPv4 underlay, for middleboxes
+		// that drop the (legal, RX-ignored) zero-checksum default (APO-668).
+		opts = append(opts, icx.WithOuterUDPChecksum())
 	}
 
 	h, err := icx.NewHandler(opts...)
