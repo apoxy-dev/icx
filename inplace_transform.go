@@ -541,13 +541,9 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		return dropWindowOffset, 0, false
 	}
 
-	// Fail closed once the transmit SA expires: RX already drops an expired key, so TX
-	// must stop sealing under one too, or a node whose control plane stopped rekeying
-	// would keep emitting frames under a stale key (APO-656). The control plane installs
-	// a fresh SA well before this fires. Mirrors VirtToPhy.
-	if txCipher.expiresAt.Before(h.clock.Now()) {
-		slog.Warn("Dropping frame: transmit key expired, rotate the key")
-		vnet.Stats.TXDropsExpiredKey.Add(1)
+	// Fail closed once the transmit SA expires (APO-656): see txKeyExpired. Mirrors
+	// VirtToPhy.
+	if h.txKeyExpired(vnet, txCipher, h.clock.Now()) {
 		return dropWindowOffset, 0, false
 	}
 
@@ -645,6 +641,18 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		return dropWindowOffset, 0, false
 	}
 
+	// Hash the inner flow over the PLAINTEXT inner packet BEFORE the in-place Seal
+	// below overwrites buf[ipStart:ipStart+ptLen] with ciphertext. The cross-buffer
+	// VirtToPhy hashes its untouched plaintext input (its Seal targets a disjoint
+	// region), so the in-place twin must capture the plaintext hash here — hashing
+	// after Seal would feed the hash ciphertext that changes every packet, diverging
+	// from the twin and making the source port an unstable per-packet value instead of
+	// a stable function of the inner 5-tuple.
+	var srcPortHash uint16
+	if h.opts.sourcePortHashing {
+		srcPortHash = flowhash.Hash(h.flowHashKey, buf[ipStart:ipStart+ptLen])
+	}
+
 	aad := buf[geneveStart : geneveStart+hdrLen]
 	encryptedFrameLen := len(txCipher.Seal(buf[ipStart:ipStart], nonce, buf[ipStart:ipStart+ptLen], aad))
 
@@ -658,7 +666,7 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 
 	localAddr := *best
 	if h.opts.sourcePortHashing {
-		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(h.flowHashKey, buf[ipStart:ipStart+ptLen]))
+		localAddr.Port = flowhash.MapToEphemeralPort(srcPortHash)
 	}
 
 	// Write the outer Eth/IP/UDP headers into the headroom at phyStart. The
@@ -772,10 +780,11 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 	}
 
 	// Fail closed once the transmit SA expires (APO-656): no point keeping a NAT
-	// mapping warm under a key the peer would reject. Mirrors ToPhy.
-	if txCipher.expiresAt.Before(h.clock.Now()) {
-		slog.Warn("Dropping keep-alive: transmit key expired, rotate the key")
-		vnet.Stats.TXDropsExpiredKey.Add(1)
+	// mapping warm under a key the peer would reject. Mark the network serviced so an
+	// expired key does not leave it perpetually "due" — re-selected, re-logged and
+	// re-counted on every poll. Mirrors ToPhy.
+	if h.txKeyExpired(vnet, txCipher, now) {
+		vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 		return dropWindowOffset, 0
 	}
 

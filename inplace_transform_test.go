@@ -140,7 +140,7 @@ type inplaceEnv struct {
 	layer3     bool
 }
 
-func newInplaceEnv(t *testing.T, tc inplaceTestCase) *inplaceEnv {
+func newInplaceEnv(t *testing.T, tc inplaceTestCase, extra ...HandlerOption) *inplaceEnv {
 	t.Helper()
 
 	virtMAC := tcpip.LinkAddress("\x02\x00\x00\x00\x00\x02")
@@ -154,6 +154,7 @@ func newInplaceEnv(t *testing.T, tc inplaceTestCase) *inplaceEnv {
 	} else {
 		opts = append(opts, WithVirtMAC(virtMAC), WithSourceMAC(srcMAC))
 	}
+	opts = append(opts, extra...)
 	h := newTestHandler(t, opts...)
 
 	vni := uint(100)
@@ -366,6 +367,70 @@ func TestInPlaceEncapByteEquivalence(t *testing.T) {
 			assert.Equal(t, wantInner, gotInner, "round-trip inner packet mismatch")
 		})
 	}
+}
+
+// TestInPlaceEncapByteEquivalenceWithSourcePortHash proves the in-place and
+// cross-buffer encaps stay byte-identical with WithSourcePortHashing enabled — the
+// configuration the CLI ships by default. The outer UDP source port is a hash of the
+// inner packet; VirtToPhyInPlace must hash the PLAINTEXT inner packet (captured before
+// its in-place Seal overwrites that region with ciphertext) exactly as the
+// cross-buffer VirtToPhy does. If it instead hashed the post-Seal ciphertext, the two
+// paths would emit different source ports and the frame bytes would diverge — this is
+// the regression guard for that seal-before-hash bug, which the base equivalence corpus
+// misses because it never enables source-port hashing.
+func TestInPlaceEncapByteEquivalenceWithSourcePortHash(t *testing.T) {
+	for _, tc := range inplaceCorpus() {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			env := newInplaceEnv(t, tc, WithSourcePortHashing())
+			virtFrame := env.buildVirtFrame(t, tc.payloadLen)
+
+			env.pinCounter(0)
+			refPhy := make([]byte, mtu+inplaceScratch)
+			refLen, refHandled := env.h.VirtToPhy(append([]byte(nil), virtFrame...), refPhy)
+			require.False(t, refHandled)
+			require.Greater(t, refLen, 0)
+			refOut := append([]byte(nil), refPhy[:refLen]...)
+
+			buf := make([]byte, mtu+2*inplaceScratch)
+			off := inplaceScratch
+			copy(buf[off:off+len(virtFrame)], virtFrame)
+
+			env.pinCounter(0)
+			gotOff, gotLen, gotHandled := env.h.VirtToPhyInPlace(buf, off, len(virtFrame))
+			require.False(t, gotHandled)
+			require.Greater(t, gotLen, 0)
+			gotOut := buf[gotOff : gotOff+gotLen]
+
+			if !bytes.Equal(gotOut, refOut) {
+				t.Fatalf("encap byte mismatch with source-port hashing (len got=%d ref=%d)\n got=%x\n ref=%x", gotLen, refLen, gotOut, refOut)
+			}
+		})
+	}
+}
+
+// TestVirtToPhyInPlaceDropsExpiredKey covers the in-place TX expiry gate (APO-656)
+// directly: the byte-equivalence oracle installs a live key and so never reaches the
+// expired branch in VirtToPhyInPlace/ToPhyInPlace. Installing an already-expired SA and
+// driving the in-place encap asserts it fails closed and charges TXDropsExpiredKey.
+func TestVirtToPhyInPlaceDropsExpiredKey(t *testing.T) {
+	tc := inplaceTestCase{layer3: true, underlayV6: false, innerV6: false, payloadLen: 16}
+	env := newInplaceEnv(t, tc)
+
+	// Re-install the SA with an expiry already in the past (newInplaceEnv installed a
+	// live one). InstallKeysForTest is the unguarded seam, so a lower-or-reused epoch is fine.
+	key := generateKey(t)
+	require.NoError(t, env.h.InstallKeysForTest(env.vni, 2, key, key, time.Now().Add(-time.Hour)))
+
+	virtFrame := env.buildVirtFrame(t, tc.payloadLen)
+	buf := make([]byte, mtu+2*inplaceScratch)
+	off := inplaceScratch
+	copy(buf[off:off+len(virtFrame)], virtFrame)
+
+	_, gotLen, handled := env.h.VirtToPhyInPlace(buf, off, len(virtFrame))
+	require.False(t, handled)
+	require.Zero(t, gotLen, "in-place TX must fail closed under an expired key")
+	require.Equal(t, uint64(1), env.vnet.Stats.TXDropsExpiredKey.Load(), "drop attributed to TX key expiry")
 }
 
 // TestInPlaceDecapByteEquivalence proves PhyToVirtInPlace produces byte-identical

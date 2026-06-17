@@ -750,6 +750,22 @@ func (h *Handler) ListVirtualNetworks() []*VirtualNetwork {
 	return out
 }
 
+// txKeyExpired reports whether vnet's transmit SA has expired as of now, recording
+// the drop (TXDropsExpiredKey + a debug log) when it has. It is the single
+// fail-closed expiry check shared by all four TX seal sites — VirtToPhy/ToPhy and
+// their in-place twins — so the cross-buffer and in-place datapaths stay identical
+// and cannot drift (APO-656). The log is at Debug, not Warn: once a key expires this
+// fires on every outbound frame, so a Warn would flood at line rate — and by then the
+// peer's RX key has expired too, so the tunnel is already down.
+func (h *Handler) txKeyExpired(vnet *VirtualNetwork, txCipher *transmitCipher, now time.Time) bool {
+	if txCipher.expiresAt.Before(now) {
+		slog.Debug("Dropping frame: transmit key expired, rotate the key")
+		vnet.Stats.TXDropsExpiredKey.Add(1)
+		return true
+	}
+	return false
+}
+
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
@@ -1178,13 +1194,9 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		return 0, false
 	}
 
-	// Fail closed once the transmit SA expires: RX already drops an expired key, so TX
-	// must stop sealing under one too, or a node whose control plane stopped rekeying
-	// would keep emitting frames under a stale key (APO-656). The control plane installs
-	// a fresh SA well before this fires. Mirrors VirtToPhyInPlace.
-	if txCipher.expiresAt.Before(h.clock.Now()) {
-		slog.Warn("Dropping frame: transmit key expired, rotate the key")
-		vnet.Stats.TXDropsExpiredKey.Add(1)
+	// Fail closed once the transmit SA expires (APO-656): see txKeyExpired. Mirrors
+	// VirtToPhyInPlace.
+	if h.txKeyExpired(vnet, txCipher, h.clock.Now()) {
 		return 0, false
 	}
 
@@ -1307,10 +1319,11 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	}
 
 	// Fail closed once the transmit SA expires (APO-656): no point keeping a NAT
-	// mapping warm under a key the peer would reject. Mirrors ToPhyInPlace.
-	if txCipher.expiresAt.Before(h.clock.Now()) {
-		slog.Warn("Dropping keep-alive: transmit key expired, rotate the key")
-		vnet.Stats.TXDropsExpiredKey.Add(1)
+	// mapping warm under a key the peer would reject. Mark the network serviced so an
+	// expired key does not leave it perpetually "due" — re-selected, re-logged and
+	// re-counted on every poll. Mirrors ToPhyInPlace.
+	if h.txKeyExpired(vnet, txCipher, now) {
+		vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 		return 0
 	}
 
