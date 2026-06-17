@@ -269,5 +269,8 @@ func bindFlags(opts Options) uint16 {
 	if opts.ZeroCopy {
 		f |= unix.XDP_ZEROCOPY
 	}
+	if opts.ForceCopy {
+		f |= unix.XDP_COPY
+	}
 	return f
 }

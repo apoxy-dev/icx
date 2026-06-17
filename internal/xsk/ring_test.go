@@ -331,18 +331,21 @@ func TestRingFreeAndAvailable(t *testing.T) {
 		t.Fatalf("freeSlots after 10 = %d, want 6", f)
 	}
 
-	// Kernel (consumer) drains 4. freeSlots is a conservative lower bound: it
-	// refreshes the cached consumer only when it would otherwise read zero, so
-	// it keeps reporting 6 until a refresh is forced. Reporting low is safe (the
-	// producer just fills less aggressively and catches up next call).
+	// Kernel (consumer) drains 4. freeSlots is an accurate query: it does the
+	// acquiring load of the kernel-published consumer EVERY call, so it observes
+	// the drain immediately and reports 10. (The old code only refreshed when the
+	// cached count hit exactly 0, so a partial drain left freeSlots — and the
+	// NumFreeTxSlots/NumFilled/NumTransmitted derived from it — frozen at a stale
+	// value once the producer went idle, starving the forwarder's flow control and
+	// wedging the datapath. APO-803.)
 	*cons = 4
-	if f := r.freeSlots(); f != 6 {
-		t.Fatalf("freeSlots is conservative until refreshed; got %d want 6", f)
+	if f := r.freeSlots(); f != 10 {
+		t.Fatalf("freeSlots after kernel drained 4 = %d, want 10 (always refreshes)", f)
 	}
-	// reserve refreshes when the cached free space is too small for the request,
-	// so asking for more than the cached 6 observes the kernel's progress.
+	// reserve also observes the kernel's progress (it refreshes when the cached
+	// free space is too small for the request).
 	if _, got := r.reserve(16); got != 10 {
-		t.Fatalf("reserve(16) after kernel drained 4 = %d, want 10 (forced refresh)", got)
+		t.Fatalf("reserve(16) after kernel drained 4 = %d, want 10", got)
 	}
 }
 

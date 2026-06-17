@@ -274,6 +274,128 @@ func TestAFXDP_SharedUMEMCrossDev(t *testing.T) {
 	}
 }
 
+// TestAFXDP_TxDrainBeyondBatch exercises the copy-mode TX drain (APO-801) and
+// proves Socket.Kick keeps the ring moving past the kernel's per-sendto batch
+// limit. In copy/generic mode the kernel pulls at most TX_BATCH_SIZE — 32 —
+// descriptors off the TX ring per sendto and never pulls on its own, so the
+// single kick inside Transmit cannot drain a queue larger than 32: the tail stays
+// in the ring, its frames never reach the COMPLETION ring, and once the producer
+// goes idle the pool bleeds out and the datapath wedges (measured on virtio:
+// transmitted=2304 completed=288 — exactly 9 kicks x 32 — then frozen). The fix
+// is to keep kicking (Socket.Kick) until the ring drains. The existing
+// TxCompletion test sends only 8 frames — under the batch limit — so it never
+// exercised this; this one sends well over it.
+//
+// IMPORTANT — environment: the stall manifests only with ASYNCHRONOUS TX
+// completion (real NIC / virtio-net, where the skb is freed later by a TX
+// IRQ/NAPI). On veth the peer consumes and frees the skb synchronously inside the
+// sendto, so a single kick drains the whole ring and the cap never bites — this
+// test then hits the skip below. CI runs on veth, so it self-skips there and is a
+// live guard only where the cap is observable; the virtio reproduction is the
+// real proof (cmd/txblast -drain=false vs -drain=true).
+func TestAFXDP_TxDrainBeyondBatch(t *testing.T) {
+	requireAFXDP(t)
+	ifindex := makeVeth(t, "icxdrain", "icxdrainp")
+
+	// veth has no zero-copy AF_XDP driver, so the socket binds in generic/copy
+	// mode without forcing it (forcing XDP_COPY on veth is EINVAL — see bindFlags).
+	opts := Options{
+		NumFrames:              256,
+		FrameSize:              2048,
+		FillRingNumDescs:       64,
+		CompletionRingNumDescs: 128,
+		RxRingNumDescs:         64,
+		TxRingNumDescs:         128,
+	}
+	umem, err := NewUMEM(opts)
+	if err != nil {
+		t.Fatalf("NewUMEM: %v", err)
+	}
+	t.Cleanup(func() { _ = umem.Close() })
+	s, err := NewSocket(umem, ifindex, 0, opts)
+	if err != nil {
+		t.Fatalf("NewSocket: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	const nTx = 100 // > TX_BATCH_SIZE (32): one kick cannot drain this
+	descs := umem.Alloc(nil, nTx)
+	if len(descs) != nTx {
+		t.Fatalf("Alloc(%d) = %d", nTx, len(descs))
+	}
+	for i := range descs {
+		descs[i].Len = 64
+		f := umem.Frame(descs[i])
+		for j := range f {
+			f[j] = 0xff
+		}
+	}
+
+	freeBefore := umem.NumFreeFrames() // 256 - 100
+	n, err := s.Transmit(descs)        // queues all 100, kicks exactly once
+	if err != nil {
+		t.Fatalf("Transmit: %v", err)
+	}
+	if n != nTx {
+		t.Fatalf("Transmit queued %d of %d (TX ring too small?)", n, nTx)
+	}
+
+	// Reclaim completions for a short window WITHOUT re-kicking. A single kick
+	// drains at most TX_BATCH_SIZE, so completions must plateau below nTx with the
+	// rest still queued on the TX ring — the stall signature.
+	completed := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for completed < nTx && time.Now().Before(deadline) {
+		c := s.Complete(nTx)
+		completed += c
+		if c == 0 {
+			pollFD(t, s.FD(), 50*time.Millisecond)
+		}
+	}
+	if completed >= nTx {
+		t.Skipf("kernel drained all %d frames on a single kick (no TX_BATCH_SIZE cap here); "+
+			"nothing to regress in this environment", nTx)
+	}
+	t.Logf("stall reproduced: after one kick %d/%d completed, %d still queued on TX ring",
+		completed, nTx, s.NumTransmitted())
+
+	// The fix: keep kicking until the ring drains, reclaiming completions so the
+	// kernel's sndbuf/completion ring never wedges. Bounded by a deadline so a
+	// stuck kernel fails the test rather than hanging it.
+	drainDeadline := time.Now().Add(3 * time.Second)
+	for s.NumTransmitted() > 0 && time.Now().Before(drainDeadline) {
+		before := s.NumTransmitted()
+		if err := s.Kick(); err != nil {
+			t.Fatalf("Kick: %v", err)
+		}
+		completed += s.Complete(nTx)
+		if s.NumTransmitted() >= before {
+			// No TX-ring progress this round (transient sndbuf/CQ back-pressure);
+			// let pending completions free space before kicking again.
+			pollFD(t, s.FD(), 50*time.Millisecond)
+		}
+	}
+	if rem := s.NumTransmitted(); rem != 0 {
+		t.Fatalf("TX ring did not drain: %d descriptors still queued after Kick loop", rem)
+	}
+
+	// Reclaim the final completions; every frame must come back to the pool.
+	deadline = time.Now().Add(3 * time.Second)
+	for completed < nTx && time.Now().Before(deadline) {
+		c := s.Complete(nTx)
+		completed += c
+		if c == 0 {
+			pollFD(t, s.FD(), 100*time.Millisecond)
+		}
+	}
+	if completed != nTx {
+		t.Fatalf("after Kick drain: %d/%d completed — drain did not unstall TX", completed, nTx)
+	}
+	if got := umem.NumFreeFrames(); got != freeBefore+nTx {
+		t.Fatalf("pool after full drain = %d, want %d", got, freeBefore+nTx)
+	}
+}
+
 func pollFD(t *testing.T, fd int, d time.Duration) {
 	t.Helper()
 	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT | unix.POLLIN}}

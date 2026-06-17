@@ -5,6 +5,7 @@ package xsk
 import (
 	"errors"
 	"fmt"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -138,6 +139,17 @@ func (s *Socket) Transmit(descs []Desc) (int, error) {
 	return int(got), nil
 }
 
+// Kick wakes the kernel to process this socket's TX ring WITHOUT queueing any new
+// descriptors — the copy-mode TX drain. In copy (generic) mode the kernel pulls
+// at most TX_BATCH_SIZE (32) descriptors off the TX ring per sendto and never
+// pulls on its own, so after a Transmit larger than 32 the tail of the batch is
+// still queued; the producer goroutine MUST keep kicking until the ring drains or
+// those descriptors (and the UMEM frames they reference) are stranded — the pool
+// bleeds out and the datapath wedges after the first burst (APO-801). Returns the
+// same errno class as the implicit kick inside Transmit. When the socket is bound
+// with NEED_WAKEUP and the kernel is already draining, it elides to a no-op.
+func (s *Socket) Kick() error { return s.kick() }
+
 // kick wakes the kernel to process the TX ring, but only if NEED_WAKEUP says it
 // is required (or the socket was not bound with NEED_WAKEUP, in which case we
 // always kick). Recoverable conditions (EINTR retried; EAGAIN/EBUSY benign) are
@@ -160,6 +172,18 @@ func (s *Socket) kick() error {
 			return fmt.Errorf("xsk: sendto kick: %w", errno)
 		}
 	}
+}
+
+// XStats returns the kernel-side XDP_STATISTICS for this socket (rx_dropped,
+// rx_invalid_descs, tx_invalid_descs, rx_ring_full, rx_fill_ring_empty_descs,
+// tx_ring_empty_descs) — the authoritative place to see where the kernel drops.
+func (s *Socket) XStats() unix.XDPStatistics {
+	var st unix.XDPStatistics
+	l := uint32(unsafe.Sizeof(st))
+	_, _, _ = unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(s.fd),
+		uintptr(unix.SOL_XDP), uintptr(unix.XDP_STATISTICS),
+		uintptr(unsafe.Pointer(&st)), uintptr(unsafe.Pointer(&l)), 0)
+	return st
 }
 
 // NeedsRxWakeup reports whether the kernel wants a poll() wakeup to make RX/FILL

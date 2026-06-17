@@ -35,6 +35,12 @@ type Options struct {
 	// it, NewSocket fails rather than silently falling back; callers that want
 	// a fallback should retry with ZeroCopy=false (XDP_COPY).
 	ZeroCopy bool
+	// ForceCopy requests XDP_COPY at bind, pinning the socket to copy mode even
+	// on a zero-copy-capable driver. The shared-UMEM datapath needs the FIRST
+	// (phy) socket pinned to copy so the kernel does not ZC-DMA-map the UMEM to
+	// one netdev, which would make the second (shared) bind fail EOPNOTSUPP. Set
+	// it on the phy socket only — XDP_COPY on the shared bind itself is EINVAL.
+	ForceCopy bool
 }
 
 // DefaultOptions mirror sane high-throughput defaults (icx currently uses

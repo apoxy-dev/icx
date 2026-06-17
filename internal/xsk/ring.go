@@ -137,18 +137,28 @@ func (r *ring) available() uint32 {
 	return avail
 }
 
-// freeSlots reports how many entries the producer side can add without a
-// syscall, refreshing the cached consumer index with an acquiring load.
+// freeSlots reports how many entries the producer side can add, with an
+// acquiring load of the kernel-published consumer index every call.
+//
+// Unlike reserve (which only refreshes when the cached count is too small to
+// satisfy a specific request, the libbpf optimization), this is a standalone
+// QUERY whose result is taken as the accurate current free count — the forwarder
+// derives NumFreeTxSlots / NumFilled / NumTransmitted from it and uses them for
+// flow-control (e.g. bounding virt.Fill by phy.NumFreeTxSlots). The old code only
+// refreshed cachedConsumer when free hit exactly 0, so once the kernel partially
+// drained the ring and the producer went idle, cachedConsumer went stale and the
+// derived counts froze (free reading ~1 forever, NumTransmitted ~size-1 forever)
+// — silently starving the reservation logic and wedging the datapath (APO-803).
+// The kernel only ever advances the consumer (monotonic, frees space), so an
+// unconditional acquiring load can only move free up and never reads torn — it is
+// always correct, and the extra cacheline read per call is negligible next to the
+// wedge it prevents.
 func (r *ring) freeSlots() uint32 {
 	if r.size == 0 {
 		return 0 // absent ring: no slots to produce into, no nil deref
 	}
-	free := r.size - (r.cachedProducer - r.cachedConsumer)
-	if free == 0 {
-		r.cachedConsumer = atomic.LoadUint32(r.consumer)
-		free = r.size - (r.cachedProducer - r.cachedConsumer)
-	}
-	return free
+	r.cachedConsumer = atomic.LoadUint32(r.consumer)
+	return r.size - (r.cachedProducer - r.cachedConsumer)
 }
 
 // needsWakeup reports whether the kernel has asked to be woken (poll for
