@@ -104,16 +104,19 @@ func Create(name string, numQueues, mtu int) (*Handle, error) {
 		return nil, fmt.Errorf("failed to set channels for %s: %w", veth.PeerName, err)
 	}
 
-	off := map[string]bool{
-		"rx-checksum":            false,
-		"tx-checksum-ip-generic": false,
-		"tx-checksum-ipv4":       false,
-		"tx-checksum-ipv6":       false,
-	}
-
-	if err := ethHandle.Change(veth.Name, off); err != nil {
+	// Disable offloads on BOTH ends of the pair. The previous code disabled only
+	// checksum offload, and only on veth.Name — leaving GSO/GRO/TSO/LRO on and the
+	// peer untouched. With segmentation/aggregation offload on, the veth hands the
+	// AF_XDP socket 64 KiB super-frames that overflow the 2 KiB UMEM frame, so bulk
+	// TCP silently drops while small packets/pings survive (APO-802). The XDP path
+	// also needs checksum offload off because the encap works on raw bytes.
+	if err := disableOffloads(ethHandle, veth.Name); err != nil {
 		_ = h.Close()
-		return nil, fmt.Errorf("disable checksum offload on %s: %w", veth.Name, err)
+		return nil, err
+	}
+	if err := disableOffloads(ethHandle, veth.PeerName); err != nil {
+		_ = h.Close()
+		return nil, err
 	}
 
 	if err := netlink.LinkSetUp(link); err != nil {
@@ -127,6 +130,57 @@ func Create(name string, numQueues, mtu int) (*Handle, error) {
 	}
 
 	return h, nil
+}
+
+// offloadsToDisable are the netdev features that must be OFF for the AF_XDP
+// datapath. Checksum offload must be off because the in-place encap rewrites raw
+// bytes; the segmentation/aggregation offloads (GSO/GRO/TSO/LRO/USO) must be off
+// because with them on the stack hands the AF_XDP socket frames far larger than
+// one UMEM frame, which the datapath cannot represent (APO-802). Names are the
+// kernel ethtool feature strings (as in `ethtool -k`), not the short -K flags.
+var offloadsToDisable = []string{
+	// checksum
+	"rx-checksum",
+	"tx-checksum-ip-generic",
+	"tx-checksum-ipv4",
+	"tx-checksum-ipv6",
+	// generic segmentation (gso) and receive (gro) offload
+	"tx-generic-segmentation",
+	"rx-gro",
+	"rx-gro-list",
+	// TCP segmentation offload (tso) leaves
+	"tx-tcp-segmentation",
+	"tx-tcp6-segmentation",
+	"tx-tcp-ecn-segmentation",
+	"tx-tcp-mangleid-segmentation",
+	// UDP segmentation (uso) and large receive (lro) offload
+	"tx-udp-segmentation",
+	"rx-lro",
+}
+
+// disableOffloads turns off every feature in offloadsToDisable that the device
+// actually exposes AND currently has enabled, so an unsupported or already-off
+// leaf (e.g. rx-lro, which veth reports fixed-off) is skipped rather than turned
+// into a hard error. Reading the live feature set keeps this robust across
+// kernels where the available leaves differ.
+func disableOffloads(eth *ethtool.Ethtool, name string) error {
+	have, err := eth.Features(name)
+	if err != nil {
+		return fmt.Errorf("read features for %s: %w", name, err)
+	}
+	off := make(map[string]bool, len(offloadsToDisable))
+	for _, f := range offloadsToDisable {
+		if cur, ok := have[f]; ok && cur {
+			off[f] = false
+		}
+	}
+	if len(off) == 0 {
+		return nil
+	}
+	if err := eth.Change(name, off); err != nil {
+		return fmt.Errorf("disable offloads on %s: %w", name, err)
+	}
+	return nil
 }
 
 func generatePeerName(name string) string {
