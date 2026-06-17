@@ -304,33 +304,47 @@ func WithRXRateLimit(pps int) HandlerOption {
 	}
 }
 
+// roDstEntry is the published, read-only inner node of the routing snapshot: the
+// Src-prefix trie (LPM) for one Dst prefix. It is built fresh on every route
+// change and never mutated after publication, so the data path reads it with no
+// lock.
+type roDstEntry struct {
+	srcTrie *iptrie.Trie // Src prefix (LPM) -> *VirtualNetwork
+}
+
+// routeTable is an immutable snapshot of the data-path routing structure,
+// published via Handler.routes (atomic.Pointer) and read with a single lock-free
+// atomic load on the TX hot path. Writers never mutate a published table: under
+// routesMu they rebuild a fresh one from the dstEntries management index and swap
+// it in (copy-on-write). This removes the per-packet networksByAddressMu.RLock
+// cache-line bounce that serialized the TX route lookup across all NIC-queue
+// goroutines (P12/APO-675); and because a published srcTrie is never mutated, the
+// two-tier lookup stays race-free with zero reader synchronization.
+type routeTable struct {
+	byDst *iptrie.Trie // Dst prefix (LPM) -> *roDstEntry
+}
+
 // Handler processes encapsulated Geneve traffic for one or more virtual
 // networks. It performs encryption/decryption, replay protection, address
 // validation, and translation between physical and virtual frame formats.
-// dstEntry is the per-Dst-prefix routing entry. srcTrie is the data-path
-// longest-prefix lookup over Src prefixes; owners is the exact-prefix ownership
-// index the management plane uses for collision detection (APO-653) and
-// owner-aware removal (APO-654). Both index the same routes by Src prefix; the
-// two stay in lockstep because all mutations go through addRouteLocked /
-// removeRouteLocked under networksByAddressMu.
-type dstEntry struct {
-	srcTrie *iptrie.Trie                     // Src prefix (LPM) -> *VirtualNetwork  (data path)
-	owners  map[netip.Prefix]*VirtualNetwork // exact Src prefix -> owning vnet      (management)
-}
-
 type Handler struct {
 	opts        *handlerOptions
 	networkByID sync.Map // Maps VNI to network
-	// networksByAddressMu protects both networksByAddress and dstEntries.
-	networksByAddressMu sync.RWMutex
-	// networksByAddress is the data-path lookup: Dst prefix (LPM) -> *dstEntry.
-	// LPM is correct here so a packet matches the most specific Dst route.
-	networksByAddress *iptrie.Trie
-	// dstEntries is the management-plane index: EXACT Dst prefix -> *dstEntry (the
-	// same entries networksByAddress holds). Add/Remove/Update must address a route
-	// by its exact prefix, not by LPM containment, or a nested Dst lands in the
-	// wrong entry (APO-663) — so they go through this map, never networksByAddress.Find.
-	dstEntries map[netip.Prefix]*dstEntry
+	// routesMu serializes route-table writers (Add/Remove/UpdateVirtualNetworkRoutes).
+	// It is NEVER taken on the data path — readers load the published snapshot from
+	// `routes` with a single atomic load — so per-packet route lookups never contend
+	// a lock.
+	routesMu sync.Mutex
+	// routes is the lock-free, copy-on-write data-path routing snapshot. Always
+	// non-nil after NewHandler; the TX path resolves a frame with routes.Load() and
+	// two trie Finds, taking no lock (P12/APO-675).
+	routes atomic.Pointer[routeTable]
+	// dstEntries is the management-plane source of truth: EXACT Dst prefix -> (EXACT
+	// Src prefix -> owning vnet). Add/Remove/Update address routes by their exact
+	// prefix, not by LPM containment, so a nested Dst lands in its own entry
+	// (APO-663). Guarded by routesMu and never read by the data path; the published
+	// `routes` snapshot is rebuilt from it on every change.
+	dstEntries map[netip.Prefix]map[netip.Prefix]*VirtualNetwork
 	proxyARP   *proxyarp.ProxyARP
 	ndProxy    *ndproxy.NDProxy
 	hdrPool    *sync.Pool
@@ -374,27 +388,30 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		return nil, fmt.Errorf("failed to seed flow-hash key: %w", err)
 	}
 
-	return &Handler{
-		opts:              &options,
-		networksByAddress: iptrie.NewTrie(),
-		dstEntries:        make(map[netip.Prefix]*dstEntry),
-		proxyARP:          proxyarp.NewProxyARP(options.srcMAC),
-		ndProxy:           ndproxy.NewNDProxy(options.srcMAC),
-		hdrPool:           hdrPool,
-		clock:             options.clock,
-		flowHashKey:       binary.BigEndian.Uint64(seed[:]),
-	}, nil
+	h := &Handler{
+		opts:        &options,
+		dstEntries:  make(map[netip.Prefix]map[netip.Prefix]*VirtualNetwork),
+		proxyARP:    proxyarp.NewProxyARP(options.srcMAC),
+		ndProxy:     ndproxy.NewNDProxy(options.srcMAC),
+		hdrPool:     hdrPool,
+		clock:       options.clock,
+		flowHashKey: binary.BigEndian.Uint64(seed[:]),
+	}
+	// Publish an initial empty routing snapshot so the lock-free data path always
+	// finds a non-nil table to Load.
+	h.routes.Store(&routeTable{byDst: iptrie.NewTrie()})
+	return h, nil
 }
 
 // checkRouteCollisionsLocked returns an error if any of routes would route an
 // exact (Dst, Src) prefix pair already owned by a different virtual network —
 // rather than letting the insert silently overwrite it (APO-653). The caller
-// must hold networksByAddressMu.
+// must hold routesMu.
 func (h *Handler) checkRouteCollisionsLocked(routes []Route, vnet *VirtualNetwork) error {
 	for _, route := range routes {
 		dst, src := route.Dst.Masked(), route.Src.Masked()
-		if de := h.dstEntries[dst]; de != nil {
-			if owner, ok := de.owners[src]; ok && owner != vnet {
+		if owners := h.dstEntries[dst]; owners != nil {
+			if owner, ok := owners[src]; ok && owner != vnet {
 				return fmt.Errorf("route Src=%s Dst=%s already routed to VNI %d", src, dst, owner.ID)
 			}
 		}
@@ -402,42 +419,55 @@ func (h *Handler) checkRouteCollisionsLocked(routes []Route, vnet *VirtualNetwor
 	return nil
 }
 
-// addRouteLocked registers route -> vnet in both the data-path trie and the
-// exact-match owner index. It must be called only after checkRouteCollisionsLocked
-// has passed for these routes, so it never clobbers a different vnet's slot. The
-// caller must hold networksByAddressMu.
+// addRouteLocked registers route -> vnet in the exact-match management index. It
+// must be called only after checkRouteCollisionsLocked has passed for these
+// routes, so it never clobbers a different vnet's slot. The caller must hold
+// routesMu and must republish the data-path snapshot with rebuildRoutesLocked once
+// its batch of route mutations is complete.
 func (h *Handler) addRouteLocked(route Route, vnet *VirtualNetwork) {
 	dst, src := route.Dst.Masked(), route.Src.Masked()
-	de := h.dstEntries[dst]
-	if de == nil {
-		de = &dstEntry{
-			srcTrie: iptrie.NewTrie(),
-			owners:  make(map[netip.Prefix]*VirtualNetwork),
-		}
-		h.dstEntries[dst] = de
-		h.networksByAddress.Insert(dst, de)
+	owners := h.dstEntries[dst]
+	if owners == nil {
+		owners = make(map[netip.Prefix]*VirtualNetwork)
+		h.dstEntries[dst] = owners
 	}
-	de.owners[src] = vnet
-	de.srcTrie.Insert(src, vnet)
+	owners[src] = vnet
 }
 
 // removeRouteLocked unregisters route, but only if it is currently owned by vnet
 // (APO-654) — so decommissioning one network never deletes a route a different
-// network still owns. When a Dst entry's last route is removed it is dropped from
-// both indexes so empty nodes do not accumulate (APO-654). The caller must hold
-// networksByAddressMu.
+// network still owns. When a Dst entry's last route is removed it is dropped so
+// empty nodes do not accumulate (APO-654). The caller must hold routesMu and must
+// republish the data-path snapshot with rebuildRoutesLocked once its batch of
+// route mutations is complete.
 func (h *Handler) removeRouteLocked(route Route, vnet *VirtualNetwork) {
 	dst, src := route.Dst.Masked(), route.Src.Masked()
-	de := h.dstEntries[dst]
-	if de == nil || de.owners[src] != vnet {
+	owners := h.dstEntries[dst]
+	if owners == nil || owners[src] != vnet {
 		return
 	}
-	delete(de.owners, src)
-	de.srcTrie.Remove(src)
-	if len(de.owners) == 0 {
+	delete(owners, src)
+	if len(owners) == 0 {
 		delete(h.dstEntries, dst)
-		h.networksByAddress.Remove(dst)
 	}
+}
+
+// rebuildRoutesLocked rebuilds the immutable data-path routing snapshot from the
+// dstEntries management index and publishes it atomically (copy-on-write). The
+// caller must hold routesMu. Cost is O(total routes); it runs only on
+// management-plane route changes, never on the data path. The freshly built tries
+// share nothing with the previously published snapshot, so any in-flight lock-free
+// reader keeps using the old table safely until its next Load.
+func (h *Handler) rebuildRoutesLocked() {
+	byDst := iptrie.NewTrie()
+	for dst, owners := range h.dstEntries {
+		srcTrie := iptrie.NewTrie()
+		for src, vnet := range owners {
+			srcTrie.Insert(src, vnet)
+		}
+		byDst.Insert(dst, &roDstEntry{srcTrie: srcTrie})
+	}
+	h.routes.Store(&routeTable{byDst: byDst})
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
@@ -455,8 +485,8 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, all
 		vnet.rxLimiter = newRxRateLimiter(h.opts.rxRateLimitPPS)
 	}
 
-	h.networksByAddressMu.Lock()
-	defer h.networksByAddressMu.Unlock()
+	h.routesMu.Lock()
+	defer h.routesMu.Unlock()
 
 	// Reject the whole add if any route would take over a slot already owned by a
 	// different network, instead of silently overwriting it (APO-653). Validate
@@ -467,8 +497,9 @@ func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, all
 	for _, route := range allowedRoutes {
 		h.addRouteLocked(route, vnet)
 	}
-	// Publish the network only after its routes are installed, so the VNI never
-	// exists with a half-applied routing table.
+	// Publish the rebuilt data-path snapshot, then expose the VNI — so the VNI is
+	// never visible with a half-applied routing table.
+	h.rebuildRoutesLocked()
 	h.networkByID.Store(vni, vnet)
 
 	return nil
@@ -486,11 +517,12 @@ func (h *Handler) RemoveVirtualNetwork(vni uint) error {
 
 	// Remove only the routes this vnet owns, so removing it never blackholes a
 	// different network that shares a Dst prefix (APO-654).
-	h.networksByAddressMu.Lock()
+	h.routesMu.Lock()
 	for _, route := range vnet.AllowedRoutes() {
 		h.removeRouteLocked(route, vnet)
 	}
-	h.networksByAddressMu.Unlock()
+	h.rebuildRoutesLocked()
+	h.routesMu.Unlock()
 
 	return nil
 }
@@ -503,13 +535,15 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 	}
 	vnet := v.(*VirtualNetwork)
 
-	h.networksByAddressMu.Lock()
-	defer h.networksByAddressMu.Unlock()
+	h.routesMu.Lock()
+	defer h.routesMu.Unlock()
 
-	// Remove this vnet's current routes, then validate the new set against the
-	// routes that remain (other networks). On conflict, restore the old routes so
-	// the update is atomic — it never leaves the network partially routed or
-	// silently steals another network's slot (APO-653).
+	// Mutate the management index (invisible to the lock-free data path until we
+	// republish). Remove this vnet's current routes, then validate the new set
+	// against the routes that remain (other networks). On conflict, restore the old
+	// routes and return WITHOUT republishing: the data path still sees the original
+	// snapshot, so the update is atomic — it never leaves the network partially
+	// routed or silently steals another network's slot (APO-653).
 	for _, route := range vnet.AllowedRoutes() {
 		h.removeRouteLocked(route, vnet)
 	}
@@ -523,6 +557,9 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 		h.addRouteLocked(route, vnet)
 	}
 	vnet.allowedRoutes.Store(&allowedRoutes)
+	// Publish the new routing table in one atomic swap, so readers transition from
+	// the complete old set to the complete new set with no half-applied state.
+	h.rebuildRoutesLocked()
 
 	return nil
 }
@@ -1145,19 +1182,17 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		}
 	}
 
-	// Find the virtual network by the destination then source address (both LPM).
-	// Hold the read lock across both lookups: networksByAddress and the inner
-	// srcTrie are not safe against a concurrent management-plane mutation, so the
-	// lock must span the whole two-tier lookup, not just the outer Find.
-	h.networksByAddressMu.RLock()
-	value := h.networksByAddress.Find(dstAddr)
+	// Find the virtual network by the destination then source address (both LPM)
+	// via a single lock-free load of the copy-on-write routing snapshot (P12/APO-675).
+	// The published table is immutable — writers swap in a freshly built one — so the
+	// two-tier lookup is race-free with no per-packet RLock.
+	rt := h.routes.Load()
+	value := rt.byDst.Find(dstAddr)
 	if value == nil {
-		h.networksByAddressMu.RUnlock()
 		slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
 		return 0, false
 	}
-	srcValue := value.(*dstEntry).srcTrie.Find(srcAddr)
-	h.networksByAddressMu.RUnlock()
+	srcValue := value.(*roDstEntry).srcTrie.Find(srcAddr)
 	if srcValue == nil {
 		slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
 		return 0, false

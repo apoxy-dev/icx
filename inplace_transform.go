@@ -492,19 +492,19 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		}
 	}
 
-	// Find the virtual network by the destination then source address (both LPM).
-	// Hold the read lock across both lookups: networksByAddress and the inner
-	// srcTrie are not safe against a concurrent management-plane mutation, so the
-	// lock must span the whole two-tier lookup, not just the outer Find.
-	h.networksByAddressMu.RLock()
-	value := h.networksByAddress.Find(dstAddr)
+	// Find the virtual network by the destination then source address (both LPM)
+	// via a single lock-free load of the copy-on-write routing snapshot (P12/APO-675).
+	// The published table is immutable — writers swap in a freshly built one — so the
+	// two-tier lookup is race-free with no per-packet RLock, removing the shared
+	// RWMutex readerCount cache-line bounce that serialized the TX path across all
+	// NIC-queue goroutines.
+	rt := h.routes.Load()
+	value := rt.byDst.Find(dstAddr)
 	if value == nil {
-		h.networksByAddressMu.RUnlock()
 		slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
 		return dropWindowOffset, 0, false
 	}
-	srcValue := value.(*dstEntry).srcTrie.Find(srcAddr)
-	h.networksByAddressMu.RUnlock()
+	srcValue := value.(*roDstEntry).srcTrie.Find(srcAddr)
 	if srcValue == nil {
 		slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
 		return dropWindowOffset, 0, false

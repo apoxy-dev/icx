@@ -1,27 +1,29 @@
 package icx
 
-// Benchmarks that empirically measure whether taking sync.RWMutex.RLock per
-// packet on the route-lookup path is a multi-core scalability bottleneck.
+// Benchmarks that empirically measure the per-packet route-lookup cost as a
+// multi-core scalability question, and lock in the P12/APO-675 fix.
 //
-// BenchmarkRouteLookupRLockParallel exercises the real per-packet path:
-// networksByAddressMu.RLock(); two trie Finds; RUnlock (via RouteLookupForTest,
-// the export_test.go seam used by VirtToPhy). Under b.RunParallel, RWMutex.RLock
-// increments/decrements a shared readerCount atomic on every call; that cache
-// line bounces between cores, so ns/op should RISE as -cpu grows even though
-// readers never block each other.
+// BenchmarkRouteLookupParallel exercises the REAL per-packet path: a single
+// lock-free h.routes.Load() (the copy-on-write snapshot) then two trie Finds, via
+// RouteLookupForTest — the export_test.go seam VirtToPhy/VirtToPhyInPlace share.
+// Because the published table is immutable, readers take no lock, so ns/op should
+// stay roughly flat as -cpu grows.
 //
-// BenchmarkRouteLookupAtomicParallel is the CONTROL: it does the identical two
-// trie Finds behind an atomic.Pointer snapshot load (a lock-free read), so it
-// isolates the RWMutex cost from the raw trie-find cost. It should stay roughly
-// flat (or even improve) as -cpu grows.
+// BenchmarkRouteLookupRLockParallel is the CONTROL preserving the pre-fix shape:
+// the identical two trie Finds wrapped in a sync.RWMutex.RLock/RUnlock. Under
+// b.RunParallel, RWMutex.RLock increments/decrements a shared readerCount atomic
+// on every call; that cache line bounces between cores, so ns/op should RISE as
+// -cpu grows even though readers never block each other. Run both with
+// -cpu=1,2,4,8,16: the gap between the rising control and the flat real path is
+// the contention this fix removed.
 
 import (
 	"fmt"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 
-	"github.com/phemmer/go-iptrie"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
 
@@ -39,9 +41,9 @@ var benchSink atomic.Uint64
 // 10.<a>.<b>.0/24 and Src across 192.168.<c>.0/24, giving numBenchNetworks
 // distinct routes that all coexist in the trie.
 func benchRoute(i int) (srcPfx, dstPfx netip.Prefix, srcAddr, dstAddr netip.Addr) {
-	a := byte(i / 256)        // 0 for i<256
-	b := byte(i % 256)        // 0..255
-	c := byte(i % 256)        // 0..255 — distinct Src /24 per network
+	a := byte(i / 256) // 0 for i<256
+	b := byte(i % 256) // 0..255
+	c := byte(i % 256) // 0..255 — distinct Src /24 per network
 	dstPfx = netip.MustParsePrefix(fmt.Sprintf("10.%d.%d.0/24", a, b))
 	srcPfx = netip.MustParsePrefix(fmt.Sprintf("192.168.%d.0/24", c))
 	// Pick host .7 inside each /24 so the lookup lands on a real route.
@@ -74,11 +76,11 @@ func newBenchHandler(tb testing.TB) *Handler {
 	return h
 }
 
-// BenchmarkRouteLookupRLockParallel measures the real per-packet route lookup,
-// which takes networksByAddressMu.RLock around two trie Finds. Run with
-// -cpu=1,2,4,8(,16): rising ns/op is the signature of RWMutex.RLock cache-line
-// contention on the shared readerCount atomic.
-func BenchmarkRouteLookupRLockParallel(b *testing.B) {
+// BenchmarkRouteLookupParallel measures the real per-packet route lookup after
+// P12: a lock-free routes.Load() snapshot plus two trie Finds (via
+// RouteLookupForTest). Run with -cpu=1,2,4,8(,16): ns/op should stay roughly flat
+// because no per-packet lock is taken.
+func BenchmarkRouteLookupParallel(b *testing.B) {
 	h := newBenchHandler(b)
 
 	// Sanity: confirm a representative lookup resolves before timing.
@@ -92,8 +94,8 @@ func BenchmarkRouteLookupRLockParallel(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		// Per-goroutine counter so each iteration hits a different route
-		// rather than one hot key.
+		// Per-goroutine counter so each iteration hits a different route rather
+		// than one hot key.
 		var n int
 		var sink uint
 		for pb.Next() {
@@ -109,35 +111,30 @@ func BenchmarkRouteLookupRLockParallel(b *testing.B) {
 	})
 }
 
-// BenchmarkRouteLookupAtomicParallel is the CONTROL. It performs the identical
-// two trie Finds (byDst.Find -> *dstEntry, then srcTrie.Find) behind an
-// atomic.Pointer snapshot load with NO mutex. The snapshot is populated from the
-// SAME tries the Handler built, so the per-lookup work is byte-for-byte the same
-// as the RLock benchmark minus the lock. Under -cpu sweep it should stay roughly
-// flat, isolating the raw trie-find cost from the RWMutex cost.
-func BenchmarkRouteLookupAtomicParallel(b *testing.B) {
+// BenchmarkRouteLookupRLockParallel is the CONTROL. It performs the identical two
+// trie Finds against the published snapshot, but wrapped in a shared
+// sync.RWMutex.RLock — the pre-P12 shape. Under -cpu sweep it should RISE as the
+// shared readerCount atomic bounces between cores, isolating the RWMutex cost from
+// the raw trie-find cost the flat BenchmarkRouteLookupParallel measures.
+func BenchmarkRouteLookupRLockParallel(b *testing.B) {
 	h := newBenchHandler(b)
+	// One shared snapshot + one shared RWMutex, exactly as the old per-packet path
+	// loaded a single trie under a single networksByAddressMu.
+	rtbl := h.routes.Load()
+	var mu sync.RWMutex
 
-	// Build the snapshot from the handler's own data-path trie so the control
-	// walks the identical structure. dstEntry (with its srcTrie field) is a
-	// package-internal type, reused directly here.
-	type snapshot struct {
-		byDst *iptrie.Trie
-	}
-	var ptr atomic.Pointer[snapshot]
-	ptr.Store(&snapshot{byDst: h.networksByAddress})
-
-	// Sanity: confirm the lock-free path resolves the same way.
+	// Sanity: confirm the locked path resolves the same way.
 	{
 		_, _, srcAddr, dstAddr := benchRoute(0)
-		snap := ptr.Load()
-		v := snap.byDst.Find(dstAddr)
+		mu.RLock()
+		v := rtbl.byDst.Find(dstAddr)
 		if v == nil {
-			b.Fatalf("setup atomic dst lookup did not resolve")
+			b.Fatalf("setup dst lookup did not resolve")
 		}
-		if sv := v.(*dstEntry).srcTrie.Find(srcAddr); sv == nil {
-			b.Fatalf("setup atomic src lookup did not resolve")
+		if sv := v.(*roDstEntry).srcTrie.Find(srcAddr); sv == nil {
+			b.Fatalf("setup src lookup did not resolve")
 		}
+		mu.RUnlock()
 	}
 
 	b.ReportAllocs()
@@ -147,13 +144,14 @@ func BenchmarkRouteLookupAtomicParallel(b *testing.B) {
 		var sink uint
 		for pb.Next() {
 			_, _, srcAddr, dstAddr := benchRoute(n % numBenchNetworks)
-			snap := ptr.Load()
-			v := snap.byDst.Find(dstAddr)
+			mu.RLock()
+			v := rtbl.byDst.Find(dstAddr)
 			if v != nil {
-				if sv := v.(*dstEntry).srcTrie.Find(srcAddr); sv != nil {
+				if sv := v.(*roDstEntry).srcTrie.Find(srcAddr); sv != nil {
 					sink += sv.(*VirtualNetwork).ID // consume to defeat DCE
 				}
 			}
+			mu.RUnlock()
 			n++
 		}
 		benchSink.Add(uint64(sink))
