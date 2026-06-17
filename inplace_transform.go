@@ -104,7 +104,9 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// Is it a valid VNI?
 	value, exists := h.networkByID.Load(uint(hdr.VNI))
 	if !exists {
-		slog.Debug("Dropping frame with unknown VNI", slog.Uint64("vni", uint64(hdr.VNI)))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame with unknown VNI", slog.Uint64("vni", uint64(hdr.VNI)))
+		}
 		return dropWindowOffset, 0
 	}
 	vnet := value.(*VirtualNetwork)
@@ -114,8 +116,10 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// source port is rewritten per packet by source-port hashing). A nil
 	// RemoteAddr under an enabled check fails closed. Mirrors PhyToVirt.
 	if h.opts.validateOuterSrc && (vnet.RemoteAddr == nil || outerSrc.Addr != vnet.RemoteAddr.Addr) {
-		slog.Debug("Dropping frame: outer source does not match configured peer",
-			slog.String("outerSrc", outerSrc.Addr.String()))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame: outer source does not match configured peer",
+				slog.String("outerSrc", outerSrc.Addr.String()))
+		}
 		vnet.Stats.RXDropsBadPeer.Add(1)
 		return dropWindowOffset, 0
 	}
@@ -123,7 +127,12 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	var nonce []byte
 	var epoch uint32
 	for i := 0; i < hdr.NumOptions; i++ {
-		opt := hdr.Options[i]
+		// Take the option by pointer, not value. A value copy of geneve.Option
+		// embeds a [12]byte Value, and because nonce = opt.Value[:12] is consumed
+		// after the loop by Open, escape analysis would move that copy to the heap
+		// (~2 allocs / received packet, paid even by forged frames that drop before
+		// Open). The pointer keeps nonce backed by the pooled header. (APO-673)
+		opt := &hdr.Options[i]
 		if opt.Class == geneve.ClassExperimental {
 			switch opt.Type {
 			case geneve.OptionTypeTxCounter:
@@ -148,14 +157,18 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	rxCipherAny, ok := vnet.rxCiphers.Load(epoch)
 	if !ok {
 		// Probably a delayed packet with an old key.
-		slog.Debug("No matching RX key for epoch", slog.Uint64("epoch", uint64(epoch)))
+		if debugDropEnabled() {
+			slog.Debug("No matching RX key for epoch", slog.Uint64("epoch", uint64(epoch)))
+		}
 		vnet.Stats.RXDropsNoKey.Add(1)
 		return dropWindowOffset, 0
 	}
 
 	rxCipher := rxCipherAny.(*receiveCipher)
 	if rxCipher.expiresAt.Before(h.clock.Now()) {
-		slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
+		if debugDropEnabled() {
+			slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
+		}
 		vnet.Stats.RXDropsExpiredKey.Add(1)
 		// Delete expired key (to free key material from memory)
 		vnet.rxCiphers.Delete(epoch)
@@ -169,8 +182,10 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// explicit check makes the binding auditable and gives a precise drop reason.
 	// (APO-644). Mirrors PhyToVirt exactly to preserve byte-equivalence.
 	if spi := binary.BigEndian.Uint32(nonce[:4]); spi != epoch {
-		slog.Debug("Dropping frame: nonce SPI does not match key epoch",
-			slog.Uint64("epoch", uint64(epoch)), slog.Uint64("nonceSPI", uint64(spi)))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame: nonce SPI does not match key epoch",
+				slog.Uint64("epoch", uint64(epoch)), slog.Uint64("nonceSPI", uint64(spi)))
+		}
 		vnet.Stats.RXDropsSPIMismatch.Add(1)
 		return dropWindowOffset, 0
 	}
@@ -180,7 +195,9 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// consume budget, and before Open so a flood cannot burn crypto CPU. Mirrors
 	// PhyToVirt.
 	if vnet.rxLimiter != nil && !vnet.rxLimiter.allow(h.clock.Now().UnixNano()) {
-		slog.Debug("Dropping frame: RX rate limit exceeded", slog.Uint64("vni", uint64(hdr.VNI)))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame: RX rate limit exceeded", slog.Uint64("vni", uint64(hdr.VNI)))
+		}
 		vnet.Stats.RXRateLimitDrops.Add(1)
 		return dropWindowOffset, 0
 	}
@@ -210,7 +227,9 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// real peer (whose in-window counters are then rejected as "behind window").
 	if !rxCipher.replayFilter.ValidateCounter(txCounter, replay.RejectAfterMessages) {
 		// Delayed packets can cause some unnecessary noise here.
-		slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
+		if debugDropEnabled() {
+			slog.Debug("Replay filter rejected frame", slog.Uint64("txCounter", txCounter))
+		}
 		vnet.Stats.RXReplayDrops.Add(1)
 		return dropWindowOffset, 0
 	}
@@ -309,12 +328,16 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		}
 	}
 	if !validSrc {
-		slog.Debug("Dropping frame with invalid tunnel source address", slog.String("srcAddr", srcAddr.String()))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame with invalid tunnel source address", slog.String("srcAddr", srcAddr.String()))
+		}
 		vnet.Stats.RXInvalidSrc.Add(1)
 		return dropWindowOffset, 0
 	}
 	if !validDst {
-		slog.Debug("Dropping frame with invalid tunnel destination address", slog.String("dstAddr", dstAddr.String()))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame with invalid tunnel destination address", slog.String("dstAddr", dstAddr.String()))
+		}
 		vnet.Stats.RXInvalidDst.Add(1)
 		return dropWindowOffset, 0
 	}
@@ -391,7 +414,9 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		// eth.Type() would index past the slice and panic. Drop it (the datapath
 		// must never panic on a malformed frame). Mirrors VirtToPhy.
 		if length < header.EthernetMinimumSize {
-			slog.Debug("Dropping runt virtual frame", slog.Int("frameSize", length))
+			if debugDropEnabled() {
+				slog.Debug("Dropping runt virtual frame", slog.Int("frameSize", length))
+			}
 			return dropWindowOffset, 0, false
 		}
 
@@ -428,9 +453,11 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 
 		// Drop non ip frames
 		if ethType != header.IPv4ProtocolNumber && ethType != header.IPv6ProtocolNumber {
-			slog.Debug("Dropping non-IP frame",
-				slog.Int("frameSize", len(virtFrame)),
-				slog.Int("ethType", int(ethType)))
+			if debugDropEnabled() {
+				slog.Debug("Dropping non-IP frame",
+					slog.Int("frameSize", len(virtFrame)),
+					slog.Int("ethType", int(ethType)))
+			}
 			return dropWindowOffset, 0, false
 		}
 
@@ -457,7 +484,9 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 		// (the version nibble says IPv4 but the header is truncated) would panic.
 		// Mirrors VirtToPhy.
 		if len(ipPacket) < header.IPv4MinimumSize {
-			slog.Debug("Dropping truncated IPv4 frame", slog.Int("frameSize", len(ipPacket)))
+			if debugDropEnabled() {
+				slog.Debug("Dropping truncated IPv4 frame", slog.Int("frameSize", len(ipPacket)))
+			}
 			return dropWindowOffset, 0, false
 		}
 		var ok bool
@@ -475,7 +504,9 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	case header.IPv6Version:
 		// Likewise the IPv6 accessors index up to IPv6MinimumSize.
 		if len(ipPacket) < header.IPv6MinimumSize {
-			slog.Debug("Dropping truncated IPv6 frame", slog.Int("frameSize", len(ipPacket)))
+			if debugDropEnabled() {
+				slog.Debug("Dropping truncated IPv6 frame", slog.Int("frameSize", len(ipPacket)))
+			}
 			return dropWindowOffset, 0, false
 		}
 		var ok bool
@@ -501,12 +532,16 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	rt := h.routes.Load()
 	value := rt.byDst.Find(dstAddr)
 	if value == nil {
-		slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame with unknown destination address", slog.String("dstAddr", dstAddr.String()))
+		}
 		return dropWindowOffset, 0, false
 	}
 	srcValue := value.(*roDstEntry).srcTrie.Find(srcAddr)
 	if srcValue == nil {
-		slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame with unknown source address", slog.String("srcAddr", srcAddr.String()))
+		}
 		return dropWindowOffset, 0, false
 	}
 	vnet := srcValue.(*VirtualNetwork)
@@ -633,10 +668,12 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	// reallocate onto the heap — leaving plaintext in the frame the descriptor
 	// still points at. Drop instead (APO-667).
 	if ipStart+ptLen+txCipher.Overhead() > len(buf) {
-		slog.Debug("Dropping oversized inner packet for in-place encap",
-			slog.Int("innerLen", ptLen),
-			slog.Int("ipStart", ipStart),
-			slog.Int("bufLen", len(buf)))
+		if debugDropEnabled() {
+			slog.Debug("Dropping oversized inner packet for in-place encap",
+				slog.Int("innerLen", ptLen),
+				slog.Int("ipStart", ipStart),
+				slog.Int("bufLen", len(buf)))
+		}
 		vnet.Stats.TXErrors.Add(1)
 		return dropWindowOffset, 0, false
 	}
@@ -672,7 +709,7 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	// Write the outer Eth/IP/UDP headers into the headroom at phyStart. The
 	// Geneve header + ciphertext + tag already sit at phyStart+payloadOffset.
 	phyFrame := buf[phyStart:]
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, h.skipOuterUDPChecksum(vnet.RemoteAddr))
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
@@ -863,7 +900,7 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 
 	// Finish outer UDP/IP/Ethernet
 	totalGeneveLen := hdrLen + encLen
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, totalGeneveLen, false)
+	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, totalGeneveLen, h.skipOuterUDPChecksum(vnet.RemoteAddr))
 	if err != nil {
 		slog.Warn("UDP encode failed", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
