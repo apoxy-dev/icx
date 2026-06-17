@@ -34,11 +34,45 @@ const (
 )
 
 // Statistics for a virtual network.
+// cacheLinePad is the assumed cache-line size. The hot per-VNI counters are
+// padded to it so the per-direction forwarder goroutines do not false-share a
+// line (P8/APO-672).
+const cacheLinePad = 64
+
 type Statistics struct {
+	// Hot success counters. Bumped on EVERY successful RX/TX by every per-queue
+	// forwarder goroutine, so each sits on its own cache line: the per-direction
+	// writers no longer false-share, and — being separated from the cold drop/error
+	// counters below — a forged-frame flood hammering a drop counter cannot
+	// invalidate a success-path line (P8/APO-672). The padding costs ~one cache line
+	// per counter per VNI (one Statistics per network, never per packet), which is
+	// negligible, and roughly halves the multi-core RMW cost under load. The residual
+	// per-counter true sharing (many cores bumping the SAME counter) is only removed
+	// by a full per-queue shard, deliberately deferred to avoid changing the exported
+	// Stats read API and the Datapath interface.
+
 	// RXPackets is the number of received packets.
 	RXPackets atomic.Uint64
+	_         [cacheLinePad - 8]byte
 	// RXBytes is the number of bytes received.
 	RXBytes atomic.Uint64
+	_       [cacheLinePad - 8]byte
+	// LastRXUnixNano is the timestamp of the last received packet.
+	LastRXUnixNano atomic.Int64
+	_              [cacheLinePad - 8]byte
+	// TXPackets is the number of transmitted packets.
+	TXPackets atomic.Uint64
+	_         [cacheLinePad - 8]byte
+	// TXBytes is the number of bytes transmitted.
+	TXBytes atomic.Uint64
+	_       [cacheLinePad - 8]byte
+	// LastTXUnixNano is the timestamp of the last transmitted packet.
+	LastTXUnixNano atomic.Int64
+	_              [cacheLinePad - 8]byte
+
+	// Cold counters. Bumped only on the drop/error/keep-alive paths, so they stay
+	// packed together and off the hot success lines above.
+
 	// RXDropsNoKey is the number of received packets dropped due to a missing key.
 	RXDropsNoKey atomic.Uint64
 	// RXDropsExpiredKey is the number of received packets dropped due to an expired key.
@@ -65,20 +99,12 @@ type Statistics struct {
 	// by the per-network RX rate limiter (APO-655). Only counted when a limit is
 	// configured (WithRXRateLimit).
 	RXRateLimitDrops atomic.Uint64
-	// TXPackets is the number of transmitted packets.
-	TXPackets atomic.Uint64
-	// TXBytes is the number of bytes transmitted.
-	TXBytes atomic.Uint64
 	// TXErrors is the number of transmission errors.
 	TXErrors atomic.Uint64
 	// TXDropsExpiredKey is the number of outbound frames dropped because the transmit
 	// SA's key had expired (APO-656). RX enforces key expiry; this makes TX fail closed
 	// symmetrically instead of sealing indefinitely under a stale key.
 	TXDropsExpiredKey atomic.Uint64
-	// LastRXUnixNano is the timestamp of the last received packet.
-	LastRXUnixNano atomic.Int64
-	// LastTXUnixNano is the timestamp of the last transmitted packet.
-	LastTXUnixNano atomic.Int64
 	// LastKeepAliveUnixNano is the timestamp of the last transmitted keep-alive packet.
 	LastKeepAliveUnixNano atomic.Int64
 }
