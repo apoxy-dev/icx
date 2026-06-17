@@ -309,6 +309,54 @@ func TestTunnelBringupFailsClosedOnPinMismatch(t *testing.T) {
 	require.Error(t, initT.Bringup(ctx), "bring-up must fail when the peer does not pin us")
 }
 
+// TestTunnelCloseDuringBringupNoRace pins the data race the Dagger test harness
+// caught: Close (a shutdown path, on its own goroutine) reads sess/ln while the
+// Bringup goroutine's establish writes them. The responder blocks in Accept with
+// no peer dialing, so by the time Close runs, establish has definitely created
+// and stored the listener — the racing pair. Without mu guarding those fields
+// this fails reliably under -race; with it, Close cleanly interrupts Accept.
+func TestTunnelCloseDuringBringupNoRace(t *testing.T) {
+	idA, err := GenerateIdentity()
+	require.NoError(t, err)
+	idB, err := GenerateIdentity()
+	require.NoError(t, err)
+
+	// respID must be the non-initiator (the side that listens/accepts).
+	aInit, err := CanonicalInitiator(idA.PublicKey(), idB.PublicKey())
+	require.NoError(t, err)
+	respID, peerID := idA, idB
+	if aInit {
+		respID, peerID = idB, idA
+	}
+
+	respConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	require.NoError(t, err)
+	defer respConn.Close()
+	peerConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6loopback})
+	require.NoError(t, err)
+	defer peerConn.Close()
+
+	noInstall := func(uint32, uint32, [16]byte, [16]byte) error { return nil }
+	respT, err := NewTunnel(TunnelConfig{
+		Local: respID, PeerPub: peerID.PublicKey(), Conn: respConn,
+		PeerAddr: peerConn.LocalAddr(), RekeyInterval: time.Second,
+	}, noInstall)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = respT.Bringup(ctx) }()
+
+	// Let establish() create the listener and block in Accept (no peer connects),
+	// so its write to ln has happened before Close reads it.
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, respT.Close(), "Close must interrupt Accept cleanly")
+
+	cancel()
+	<-done
+}
+
 // TestTunnelReconnects exercises the reestablish state machine: a session loss
 // mid-run must tear the dead session down and re-establish a fresh one on both ends,
 // resuming rotation, rather than wedging or hot-looping.

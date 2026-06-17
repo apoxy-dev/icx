@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -76,8 +77,9 @@ const (
 // Tunnel runs the control-plane lifecycle for one peer: it establishes the QUIC/mTLS
 // session, performs the initial SA negotiation and install (fail-closed) in Bringup,
 // and then keeps the SAs fresh in Run — the initiator drives rekeys on a timer, the
-// responder serves them from an accept loop. A Tunnel is not safe for concurrent use;
-// Bringup then Run are called once each, in that order.
+// responder serves them from an accept loop. Bringup then Run are called once each, in
+// that order, on a single goroutine; only Close may be called concurrently (e.g. from a
+// shutdown path), and it interrupts an in-flight Bringup/Run.
 type Tunnel struct {
 	local     *Identity
 	peerPub   *ecdsa.PublicKey
@@ -91,6 +93,10 @@ type Tunnel struct {
 	perExchangeTimeout time.Duration
 	reconnectBackoff   time.Duration
 
+	// mu guards ln and sess: Close (any goroutine) races the Bringup/Run goroutine
+	// that (re)establishes them. It is never held across the blocking
+	// Dial/Accept/NegotiateSAs — those run on a local copy taken under the lock.
+	mu   sync.Mutex
 	ln   *Listener // responder only; persists across reconnects
 	sess *Session
 }
@@ -248,7 +254,11 @@ func (t *Tunnel) runResponder(ctx context.Context) error {
 // result. installSAs swallows an install rejection (returns nil) so it does not look
 // like a transport failure; a non-nil error here means the wire exchange failed.
 func (t *Tunnel) negotiateAndInstall(ctx context.Context) error {
-	sas, err := t.sess.NegotiateSAs(ctx, AESGCM128)
+	sess := t.getSess()
+	if sess == nil {
+		return errors.New("control: no live session")
+	}
+	sas, err := sess.NegotiateSAs(ctx, AESGCM128)
 	if err != nil {
 		return err
 	}
@@ -291,21 +301,25 @@ func (t *Tunnel) establish(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		t.sess = sess
+		t.setSess(sess)
 		return nil
 	}
-	if t.ln == nil {
-		ln, err := Listen(t.conn, t.local, t.peerPub)
+	ln := t.getLn()
+	if ln == nil {
+		var err error
+		ln, err = Listen(t.conn, t.local, t.peerPub)
 		if err != nil {
 			return err
 		}
-		t.ln = ln
+		t.setLn(ln)
 	}
-	sess, err := t.ln.Accept(ctx)
+	// Accept on the local copy, not t.ln: a concurrent Close closes this listener
+	// to interrupt us, which surfaces here as an Accept error.
+	sess, err := ln.Accept(ctx)
 	if err != nil {
 		return err
 	}
-	t.sess = sess
+	t.setSess(sess)
 	return nil
 }
 
@@ -355,16 +369,47 @@ func (t *Tunnel) reestablish(ctx context.Context) error {
 // sessionDone returns the current session's done channel, or nil (which blocks
 // forever in a select) if there is no live session.
 func (t *Tunnel) sessionDone() <-chan struct{} {
-	if t.sess == nil {
+	sess := t.getSess()
+	if sess == nil {
 		return nil
 	}
-	return t.sess.Context().Done()
+	return sess.Context().Done()
+}
+
+// getSess/setSess/getLn/setLn are the only places sess/ln are touched outside the
+// swap-and-close in closeSession/Close; all of them hold mu so a concurrent Close
+// never races establish.
+func (t *Tunnel) getSess() *Session {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.sess
+}
+
+func (t *Tunnel) setSess(s *Session) {
+	t.mu.Lock()
+	t.sess = s
+	t.mu.Unlock()
+}
+
+func (t *Tunnel) getLn() *Listener {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ln
+}
+
+func (t *Tunnel) setLn(l *Listener) {
+	t.mu.Lock()
+	t.ln = l
+	t.mu.Unlock()
 }
 
 func (t *Tunnel) closeSession() {
-	if t.sess != nil {
-		_ = t.sess.Close()
-		t.sess = nil
+	t.mu.Lock()
+	sess := t.sess
+	t.sess = nil
+	t.mu.Unlock()
+	if sess != nil {
+		_ = sess.Close()
 	}
 }
 
@@ -374,13 +419,16 @@ func isFatalCP(err error) bool {
 	return errors.Is(err, ErrSPIExhausted)
 }
 
-// Close releases the session and (responder) the listener. It is idempotent.
+// Close releases the session and (responder) the listener. It is idempotent and
+// safe to call concurrently with an in-flight Bringup/Run, which it interrupts.
 func (t *Tunnel) Close() error {
 	t.closeSession()
-	if t.ln != nil {
-		err := t.ln.Close()
-		t.ln = nil
-		return err
+	t.mu.Lock()
+	ln := t.ln
+	t.ln = nil
+	t.mu.Unlock()
+	if ln != nil {
+		return ln.Close()
 	}
 	return nil
 }
