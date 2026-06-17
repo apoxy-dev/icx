@@ -11,11 +11,20 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-// defaultXdpFlags are the flags passed when attaching the XDP program to an
+// AttachFlags are the flags passed when attaching the XDP program to an
 // interface. Zero lets the kernel choose the attach mode (native driver XDP if
 // the driver supports it, otherwise generic/SKB), matching the behaviour icx
 // inherited from github.com/slavc/xdp.
-const defaultXdpFlags = 0
+//
+// IMPORTANT: on drivers that support native XDP (e.g. ixgbe), the kernel's
+// default (native) attach RECONFIGURES the NIC's TX rings, and copy-mode AF_XDP
+// TX frames then never egress — the driver silently drops them while still
+// producing completions (proven on ixgbe: nic_tx_delta=0). The shared-UMEM
+// forwarder runs in copy mode (it cannot use driver zero-copy — see
+// forwarder.phyBindOpts), so it sets this to XDP_FLAGS_SKB_MODE, which leaves the
+// driver's TX path untouched and lets the generic-XDP hook still redirect RX into
+// the AF_XDP sockets. A future driver-zero-copy datapath would use native mode.
+var AttachFlags = 0
 
 // Program is a loaded XDP redirect program plus the maps that steer packets into
 // AF_XDP sockets. It owns the eBPF program (xdp_sock_prog), the per-queue config
@@ -106,7 +115,7 @@ func attachProgram(ifindex int, prog *ebpf.Program) error {
 	if err != nil {
 		return fmt.Errorf("link by index %d: %w", ifindex, err)
 	}
-	if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), defaultXdpFlags); err != nil {
+	if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), AttachFlags); err != nil {
 		return fmt.Errorf("attach XDP program to ifindex %d: %w", ifindex, err)
 	}
 	return nil
@@ -122,12 +131,18 @@ func removeProgram(ifindex int) error {
 	if !isXdpAttached(link) {
 		return nil
 	}
-	if err := netlink.LinkSetXdpFd(link, -1); err != nil {
+	// Detach with the SAME mode flags the program was attached with. A program in
+	// the generic/SKB slot (AttachFlags == XDP_FLAGS_SKB_MODE) is NOT removed by a
+	// flags=0 detach (that targets the native slot), so LinkSetXdpFd(link, -1)
+	// would silently no-op and the poll below would spin forever — hanging Close
+	// (and leaking the program). Passing AttachFlags removes the right slot.
+	if err := netlink.LinkSetXdpFdWithFlags(link, -1, AttachFlags); err != nil {
 		return fmt.Errorf("detach XDP program from ifindex %d: %w", ifindex, err)
 	}
-	// The detach is asynchronous; poll until the link reports no XDP program so
-	// a subsequent Attach does not race the teardown.
-	for {
+	// The detach is asynchronous; poll (bounded) until the link reports no XDP
+	// program so a subsequent Attach does not race the teardown. The bound turns a
+	// stuck detach into a loud error instead of an unbounded hang.
+	for i := 0; i < 50; i++ {
 		link, err = netlink.LinkByIndex(ifindex)
 		if err != nil {
 			return fmt.Errorf("link by index %d: %w", ifindex, err)
@@ -135,8 +150,9 @@ func removeProgram(ifindex int) error {
 		if !isXdpAttached(link) {
 			return nil
 		}
-		time.Sleep(time.Second)
+		time.Sleep(100 * time.Millisecond)
 	}
+	return fmt.Errorf("XDP program still attached to ifindex %d after detach", ifindex)
 }
 
 func isXdpAttached(link netlink.Link) bool {
