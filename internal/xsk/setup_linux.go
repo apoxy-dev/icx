@@ -253,8 +253,49 @@ func NewSocket(umem *UMEM, ifindex, queueID int, opts Options) (*Socket, error) 
 		return nil, fmt.Errorf("xsk: bind ifindex=%d queue=%d shared=%v: %w", ifindex, queueID, !first, err)
 	}
 
+	if err = applyBusyPoll(fd, opts); err != nil {
+		return nil, err
+	}
+
 	ok = true
 	return s, nil
+}
+
+// applyBusyPoll enables socket busy polling on fd when opts.BusyPoll > 0. With
+// busy poll, a poll()/recvmsg() on this socket drives the bound netdev's NAPI
+// inline on the calling core (the AF_XDP analogue of a DPDK poll-mode driver)
+// instead of waiting for the NIC IRQ's RX softirq to run on its own core, which
+// removes the IRQ-core contention a pinned datapath thread otherwise hits
+// (APO-670). It is a no-op when busy poll is disabled, so the default datapath is
+// untouched.
+//
+// Requires Linux >= 5.11: SO_PREFER_BUSY_POLL/SO_BUSY_POLL_BUDGET do not exist on
+// older kernels and the setsockopt fails ENOPROTOOPT — which fails NewSocket,
+// because the caller explicitly asked for a feature the kernel lacks rather than
+// silently getting a non-busy-polled socket. The per-netdev
+// napi_defer_hard_irqs/gro_flush_timeout knobs that make the hard-IRQ deferral
+// actually engage are the caller's responsibility (the forwarder sets them).
+func applyBusyPoll(fd int, opts Options) error {
+	if opts.BusyPoll <= 0 {
+		return nil
+	}
+	// Order per the kernel's Documentation/networking/af_xdp.rst busy-poll
+	// example: prefer-busy-poll first, then the busy-poll timeout, then the
+	// per-pass budget.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PREFER_BUSY_POLL, 1); err != nil {
+		return fmt.Errorf("xsk: setsockopt SO_PREFER_BUSY_POLL (busy poll needs kernel >= 5.11): %w", err)
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL, opts.BusyPoll); err != nil {
+		return fmt.Errorf("xsk: setsockopt SO_BUSY_POLL=%d: %w", opts.BusyPoll, err)
+	}
+	budget := opts.BusyPollBudget
+	if budget <= 0 {
+		budget = DefaultBusyPollBudget
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL_BUDGET, budget); err != nil {
+		return fmt.Errorf("xsk: setsockopt SO_BUSY_POLL_BUDGET=%d: %w", budget, err)
+	}
+	return nil
 }
 
 func bindFlags(opts Options) uint16 {

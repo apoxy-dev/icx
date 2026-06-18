@@ -41,7 +41,29 @@ type Options struct {
 	// one netdev, which would make the second (shared) bind fail EOPNOTSUPP. Set
 	// it on the phy socket only — XDP_COPY on the shared bind itself is EINVAL.
 	ForceCopy bool
+
+	// BusyPoll, when > 0, enables socket busy polling on the socket (Linux >=
+	// 5.11): a poll()/recvmsg() on this fd drives the bound netdev's NAPI inline
+	// on the calling core, instead of waiting for the NIC IRQ's RX softirq to run
+	// on its own (IRQ-affined) core. It is the AF_XDP analogue of a DPDK poll-mode
+	// driver and removes the IRQ-core contention a pinned datapath thread
+	// otherwise hits (APO-670). The value is the SO_BUSY_POLL timeout in
+	// microseconds (a value around 20 is typical). The per-netdev
+	// napi_defer_hard_irqs/gro_flush_timeout knobs that make the IRQ deferral
+	// actually engage are set out of band (the forwarder does it); without them
+	// busy poll still runs but the hard IRQ keeps firing in parallel.
+	BusyPoll int
+	// BusyPollBudget caps how many packets one busy-poll NAPI pass processes
+	// (SO_BUSY_POLL_BUDGET). Zero uses DefaultBusyPollBudget when BusyPoll > 0,
+	// and is ignored entirely when BusyPoll == 0.
+	BusyPollBudget int
 }
+
+// DefaultBusyPollBudget is the SO_BUSY_POLL_BUDGET used when BusyPoll is enabled
+// but BusyPollBudget is left zero. It mirrors NAPI_POLL_WEIGHT (the per-poll
+// packet budget the kernel uses for ordinary softirq NAPI) and the value in the
+// kernel's Documentation/networking/af_xdp.rst busy-poll example.
+const DefaultBusyPollBudget = 64
 
 // DefaultOptions mirror sane high-throughput defaults (icx currently uses
 // NumFrames=8192, FrameSize=2048, all rings=4096).
@@ -75,6 +97,12 @@ func (o Options) validate() error {
 	}
 	if o.NumFrames <= 0 {
 		return fmt.Errorf("xsk: NumFrames must be > 0, got %d", o.NumFrames)
+	}
+	if o.BusyPoll < 0 {
+		return fmt.Errorf("xsk: BusyPoll must be >= 0 (microseconds), got %d", o.BusyPoll)
+	}
+	if o.BusyPollBudget < 0 {
+		return fmt.Errorf("xsk: BusyPollBudget must be >= 0, got %d", o.BusyPollBudget)
 	}
 	// Floor for forward progress: enough frames to prime the FILL ring and still
 	// have a TX batch. Fill/Alloc handle a short pool gracefully (they return

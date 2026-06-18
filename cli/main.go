@@ -131,6 +131,21 @@ func main() {
 				Name:  "outer-udp-checksum",
 				Usage: "Compute the outer UDP checksum on an IPv4 underlay (skipped by default: the payload is AES-GCM authenticated and the RX path ignores it). Enable only for middleboxes that drop zero-checksum UDP",
 			},
+			&cli.BoolFlag{
+				Name:  "cpu-pin",
+				Usage: "Pin each per-queue datapath goroutine to a distinct CPU from the process's affinity mask (cuts cross-core churn on the busy poll loop). Disable on oversubscribed or shared hosts",
+				Value: true,
+			},
+			&cli.IntFlag{
+				Name:  "busy-poll",
+				Usage: "Enable AF_XDP socket busy polling: the datapath thread drives the NIC's NAPI inline on its own core (DPDK-poll-mode style) instead of via the NIC IRQ softirq, removing the IRQ-core contention that can collapse a pinned datapath (--cpu-pin). Value is the SO_BUSY_POLL timeout in microseconds; 0 disables. Also sets (and restores) napi_defer_hard_irqs/gro_flush_timeout on the NICs. Burns the core at 100%; use only on a dedicated datapath host (needs kernel >= 5.11)",
+				Value: 0,
+			},
+			&cli.IntFlag{
+				Name:  "busy-poll-budget",
+				Usage: "Packets processed per busy-poll NAPI pass (SO_BUSY_POLL_BUDGET); only used when --busy-poll > 0",
+				Value: 64,
+			},
 			&cli.StringSliceFlag{
 				Name:  "allowed-route",
 				Usage: "Allowed inner route as `srcCIDR=dstCIDR` (or a bare CIDR for src==dst); repeatable. Defaults to wildcard (no L3 containment) with a warning",
@@ -448,6 +463,8 @@ func run(c *cli.Context) error {
 		forwarder.WithVirtName(vethDev.Peer.Attrs().Name),
 		forwarder.WithPhyFilter(ingressFilter),
 		forwarder.WithPcapWriter(pcapWriter),
+		forwarder.WithCPUPinning(c.Bool("cpu-pin")),
+		forwarder.WithBusyPoll(c.Int("busy-poll"), c.Int("busy-poll-budget")),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create forwarder: %w", err)

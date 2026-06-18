@@ -407,3 +407,60 @@ func pollFD(t *testing.T, fd int, d time.Duration) {
 		return
 	}
 }
+
+// TestAFXDP_BusyPollSockopts asserts NewSocket applies the three busy-poll
+// setsockopts to the fd when Options.BusyPoll > 0, that an unset BusyPollBudget
+// falls back to DefaultBusyPollBudget, and that the default (BusyPoll == 0) path
+// leaves the socket without busy poll. On a kernel without busy poll (< 5.11) the
+// setsockopt fails ENOPROTOOPT and NewSocket surfaces it, so the test skips.
+func TestAFXDP_BusyPollSockopts(t *testing.T) {
+	requireAFXDP(t)
+	ifindex := makeVeth(t, "icxbp0", "icxbp0p")
+
+	umem, err := NewUMEM(smallOpts())
+	if err != nil {
+		t.Fatalf("NewUMEM: %v", err)
+	}
+	t.Cleanup(func() { _ = umem.Close() })
+
+	opts := smallOpts()
+	opts.BusyPoll = 25 // microseconds; leave BusyPollBudget zero -> Default
+	s, err := NewSocket(umem, ifindex, 0, opts)
+	if err != nil {
+		if errors.Is(err, unix.ENOPROTOOPT) {
+			t.Skipf("busy poll unsupported on this kernel: %v", err)
+		}
+		t.Fatalf("NewSocket(BusyPoll=25): %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	fd := s.FD()
+	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PREFER_BUSY_POLL); err != nil || v != 1 {
+		t.Fatalf("SO_PREFER_BUSY_POLL = %d (err %v), want 1", v, err)
+	}
+	if v, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL); err != nil || v != 25 {
+		t.Fatalf("SO_BUSY_POLL = %d (err %v), want 25", v, err)
+	}
+	// SO_BUSY_POLL_BUDGET is gettable on kernels that have the setter; tolerate a
+	// getter that does not (older 5.11.x) rather than fail spuriously.
+	if v, gerr := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_BUSY_POLL_BUDGET); gerr == nil && v != DefaultBusyPollBudget {
+		t.Fatalf("SO_BUSY_POLL_BUDGET = %d, want default %d", v, DefaultBusyPollBudget)
+	}
+
+	// A socket created with busy poll OFF (its own netdev + UMEM) must carry no
+	// busy-poll timeout — the default datapath is untouched.
+	offIf := makeVeth(t, "icxbp1", "icxbp1p")
+	offUmem, err := NewUMEM(smallOpts())
+	if err != nil {
+		t.Fatalf("NewUMEM(off): %v", err)
+	}
+	t.Cleanup(func() { _ = offUmem.Close() })
+	off, err := NewSocket(offUmem, offIf, 0, smallOpts())
+	if err != nil {
+		t.Fatalf("NewSocket(busy poll off): %v", err)
+	}
+	t.Cleanup(func() { _ = off.Close() })
+	if v, err := unix.GetsockoptInt(off.FD(), unix.SOL_SOCKET, unix.SO_BUSY_POLL); err != nil || v != 0 {
+		t.Fatalf("busy-poll-off SO_BUSY_POLL = %d (err %v), want 0", v, err)
+	}
+}

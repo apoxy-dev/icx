@@ -9,8 +9,11 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,16 +59,21 @@ type Handler interface {
 type ForwarderOption func(*forwarderOptions) error
 
 type forwarderOptions struct {
-	phyName    string
-	virtName   string
-	phyFilter  *filter.Program
-	pcapWriter *pcapgo.Writer
+	phyName        string
+	virtName       string
+	phyFilter      *filter.Program
+	pcapWriter     *pcapgo.Writer
+	pinCPU         bool
+	numQueues      int
+	busyPoll       int
+	busyPollBudget int
 }
 
 func defaultForwarderOptions() forwarderOptions {
 	return forwarderOptions{
 		phyName:  "eth0",
 		virtName: "tun0",
+		pinCPU:   true,
 	}
 }
 
@@ -106,6 +114,56 @@ func WithPhyFilter(prog *filter.Program) ForwarderOption {
 	}
 }
 
+// WithCPUPinning controls whether each per-queue datapath goroutine pins its
+// (LockOSThread'd) OS thread to a distinct CPU drawn from the process's allowed
+// affinity mask. Enabled by default: the per-queue loops are long-lived busy
+// pollers, so keeping each one resident on one core cuts the cross-core cache and
+// scheduler churn the unpinned default incurred (APO-670). Disable it on
+// oversubscribed or shared hosts where the dedicated-core assumption does not
+// hold.
+func WithCPUPinning(enabled bool) ForwarderOption {
+	return func(o *forwarderOptions) error {
+		o.pinCPU = enabled
+		return nil
+	}
+}
+
+// WithNumQueues overrides the number of per-queue datapath sockets to create,
+// instead of deriving it from the NIC's reported channel count. A non-positive
+// value (the default) keeps the auto-derived count. This is needed on devices
+// whose ethtool channel count exceeds the number of AF_XDP-bindable queues — for
+// example SR-IOV VFs, which advertise the PF's max channels but only expose a
+// couple of real queues, so binding the surplus queues fails with EINVAL.
+func WithNumQueues(n int) ForwarderOption {
+	return func(o *forwarderOptions) error {
+		o.numQueues = n
+		return nil
+	}
+}
+
+// WithBusyPoll enables AF_XDP socket busy polling on every datapath socket. usecs
+// is the SO_BUSY_POLL timeout in microseconds (around 20 is typical); usecs <= 0
+// leaves busy poll disabled (the default). budget caps how many packets one
+// busy-poll NAPI pass processes (SO_BUSY_POLL_BUDGET); budget <= 0 uses
+// xsk.DefaultBusyPollBudget.
+//
+// Busy polling makes the forwarder's own poll() drive the NIC's NAPI inline, on
+// the datapath thread's core, instead of relying on the NIC IRQ's RX softirq
+// running on a separate (IRQ-affined) core. Combined with the per-netdev
+// napi_defer_hard_irqs/gro_flush_timeout knobs this also sets (and restores on
+// Close), it is the AF_XDP equivalent of a DPDK poll-mode driver: the RX path no
+// longer needs the IRQ core at all. That removes the contention which made a
+// naively pinned datapath thread (WithCPUPinning) collapse ~10x when it landed on
+// the NIC RX softirq core (APO-670). Like CPU pinning, busy poll burns the core
+// at 100%, so enable it only on a dedicated datapath host. Requires Linux >= 5.11.
+func WithBusyPoll(usecs, budget int) ForwarderOption {
+	return func(o *forwarderOptions) error {
+		o.busyPoll = usecs
+		o.busyPollBudget = budget
+		return nil
+	}
+}
+
 // socketOpts are the per-socket ring sizes and the shared-UMEM frame-pool size.
 // One UMEM per queue now backs BOTH the phy and virt sockets (the zero-copy
 // datapath: a frame received on one interface is transformed in place and
@@ -125,15 +183,88 @@ var socketOpts = xsk.Options{
 	TxRingNumDescs:         4096,
 }
 
-// phyBindOpts returns the bind options for the FIRST (phy) socket. On a
+// phySockOpts returns the bind options for the FIRST (phy) socket. On a
 // zero-copy-capable NIC (mlx5/ixgbe), a best-effort bind grabs driver zero-copy
 // and DMA-maps the shared UMEM to the phy, after which the shared virt (veth)
 // bind fails EOPNOTSUPP (APO-800). Pinning the phy to XDP_COPY keeps the UMEM
 // shareable across both sockets, which the in-place handoff datapath requires.
-func phyBindOpts() xsk.Options {
+// Busy poll (if enabled) applies to the phy socket too — it is the NIC RX path
+// whose softirq otherwise contends with a pinned datapath thread (APO-670).
+func (f *Forwarder) phySockOpts() xsk.Options {
 	so := socketOpts
 	so.ForceCopy = true
+	so.BusyPoll = f.busyPoll
+	so.BusyPollBudget = f.busyPollBudget
 	return so
+}
+
+// virtSockOpts returns the bind options for the virt (veth) socket, which shares
+// the phy's UMEM. It carries the same busy-poll setting so both ends of the
+// in-place handoff drive their NAPI inline on the datapath thread's core.
+func (f *Forwarder) virtSockOpts() xsk.Options {
+	so := socketOpts
+	so.BusyPoll = f.busyPoll
+	so.BusyPollBudget = f.busyPollBudget
+	return so
+}
+
+// napiDeferHardIRQs and napiGROFlushTimeoutNS are the per-netdev NAPI-defer knob
+// values busy poll sets, mirroring the kernel's Documentation/networking/af_xdp.rst
+// busy-poll example: defer up to 2 hard IRQs and hold GRO for 200µs, which is the
+// window in which the application's busy poll is expected to drive the next NAPI
+// run instead of the hard IRQ re-arming.
+const (
+	napiDeferHardIRQs     = 2
+	napiGROFlushTimeoutNS = 200000
+)
+
+// enableNapiDefer sets dev's napi_defer_hard_irqs and gro_flush_timeout sysfs
+// knobs so socket busy poll takes NAPI over from the hard IRQ: with them set the
+// kernel stops re-arming the NIC's hard IRQ after a NAPI run and instead waits for
+// the application's busy poll to drive the next one — moving the RX softirq off
+// its own IRQ-affined core onto the datapath thread's core. Without them
+// SO_PREFER_BUSY_POLL still busy-polls, but the hard IRQ keeps firing in parallel
+// and the IRQ-core contention busy poll is meant to remove (APO-670) persists.
+//
+// Best-effort: a read/write failure is logged, not fatal (the per-socket
+// setsockopts are the real contract; this is host tuning, and some virtual
+// netdevs do not expose the knobs). The returned closure restores the prior values
+// on Close so the forwarder does not permanently retune the host NIC.
+func enableNapiDefer(dev string) func() {
+	var restores []func()
+	for _, knob := range []struct {
+		name string
+		val  int
+	}{
+		{"napi_defer_hard_irqs", napiDeferHardIRQs},
+		{"gro_flush_timeout", napiGROFlushTimeoutNS},
+	} {
+		path := filepath.Join("/sys/class/net", dev, knob.name)
+		prior, err := os.ReadFile(path)
+		if err != nil {
+			slog.Warn("busy-poll: cannot read NAPI-defer knob (leaving unchanged)",
+				slog.String("dev", dev), slog.String("knob", knob.name), slog.Any("error", err))
+			continue
+		}
+		if err := os.WriteFile(path, []byte(strconv.Itoa(knob.val)), 0o644); err != nil {
+			slog.Warn("busy-poll: cannot set NAPI-defer knob; busy poll will run but the hard IRQ keeps firing",
+				slog.String("dev", dev), slog.String("knob", knob.name), slog.Any("error", err))
+			continue
+		}
+		priorVal := strings.TrimSpace(string(prior))
+		restorePath := path
+		restores = append(restores, func() {
+			if err := os.WriteFile(restorePath, []byte(priorVal), 0o644); err != nil {
+				slog.Warn("busy-poll: failed to restore NAPI-defer knob",
+					slog.String("path", restorePath), slog.String("value", priorVal), slog.Any("error", err))
+			}
+		})
+	}
+	return func() {
+		for _, r := range restores {
+			r()
+		}
+	}
 }
 
 // txBatchSize mirrors the kernel's copy-mode TX_BATCH_SIZE: xsk_generic_xmit
@@ -204,6 +335,16 @@ type Forwarder struct {
 	// between them possible. Each is Closed exactly once, after both its sockets.
 	umems     []*xsk.UMEM
 	closeOnce sync.Once
+	// pinCPU pins each per-queue goroutine's OS thread to a distinct CPU (APO-670).
+	pinCPU bool
+	// busyPoll (>0) enables AF_XDP socket busy poll at this SO_BUSY_POLL timeout in
+	// microseconds; busyPollBudget caps the per-pass NAPI budget (APO-670).
+	busyPoll       int
+	busyPollBudget int
+	// napiDeferRestore holds closures that put the per-netdev NAPI-defer sysfs
+	// knobs back to their pre-forwarder values on Close, so enabling busy poll does
+	// not permanently retune the host NIC. Empty when busy poll is disabled.
+	napiDeferRestore []func()
 }
 
 // NewForwarder creates a new Forwarder with the given handler and options.
@@ -251,17 +392,43 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 		return nil, fmt.Errorf("failed to get number of queues for virtual device %s: %w", options.virtName, err)
 	}
 
+	// Allow capping the queue count below what the NICs report (e.g. SR-IOV VFs that
+	// advertise the PF's max channels but only expose a couple of AF_XDP-bindable
+	// queues). Applied before the equality check so an over-reporting phy can be
+	// paired with a smaller virt.
+	if options.numQueues > 0 {
+		if options.numQueues > phyNumQueues || options.numQueues > virtNumQueues {
+			return nil, fmt.Errorf("WithNumQueues(%d) exceeds device queue counts (phy %d, virt %d)",
+				options.numQueues, phyNumQueues, virtNumQueues)
+		}
+		phyNumQueues = options.numQueues
+		virtNumQueues = options.numQueues
+	}
+
 	if phyNumQueues != virtNumQueues {
 		return nil, fmt.Errorf("physical and virtual interfaces must have the same number of queues, got %d and %d",
 			phyNumQueues, virtNumQueues)
 	}
 
 	f := &Forwarder{
-		handler:    handler,
-		phyFilter:  options.phyFilter,
-		pcapWriter: options.pcapWriter,
-		phyLink:    phyLink,
-		virtLink:   virtLink,
+		handler:        handler,
+		phyFilter:      options.phyFilter,
+		pcapWriter:     options.pcapWriter,
+		phyLink:        phyLink,
+		virtLink:       virtLink,
+		pinCPU:         options.pinCPU,
+		busyPoll:       options.busyPoll,
+		busyPollBudget: options.busyPollBudget,
+	}
+
+	// Defer the NIC's hard IRQ to the application's busy poll (and restore on
+	// Close). Done before any socket binds so the very first RX is already driven
+	// by busy poll rather than a softirq on the IRQ core. Best-effort per knob; the
+	// per-socket setsockopts in NewSocket are the hard contract.
+	if f.busyPoll > 0 {
+		f.napiDeferRestore = append(f.napiDeferRestore,
+			enableNapiDefer(phyLink.Attrs().Name),
+			enableNapiDefer(virtLink.Attrs().Name))
 	}
 
 	// Any error after this point must release everything created so far. closeInternal
@@ -311,7 +478,7 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 		}
 		f.umems = append(f.umems, umem)
 
-		sk, err := xsk.NewSocket(umem, phyLink.Attrs().Index, queueID, phyBindOpts())
+		sk, err := xsk.NewSocket(umem, phyLink.Attrs().Index, queueID, f.phySockOpts())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create physical XDP socket: %w", err)
 		}
@@ -334,7 +501,7 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 	// Each virt socket shares its queue's phy UMEM (already bound above), binding
 	// with XDP_SHARED_UMEM against the now-bound registration fd.
 	for queueID := 0; queueID < virtNumQueues; queueID++ {
-		sk, err := xsk.NewSocket(f.umems[queueID], virtLink.Attrs().Index, queueID, socketOpts)
+		sk, err := xsk.NewSocket(f.umems[queueID], virtLink.Attrs().Index, queueID, f.virtSockOpts())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create virtual XDP socket: %w", err)
 		}
@@ -405,6 +572,12 @@ func (f *Forwarder) closeInternal() error {
 		}
 	}
 
+	// Put the NIC's NAPI-defer knobs back the way busy poll found them, so a
+	// forwarder that enabled busy poll does not leave the host NIC retuned.
+	for _, restore := range f.napiDeferRestore {
+		restore()
+	}
+
 	return errors.Join(errs...)
 }
 
@@ -421,9 +594,19 @@ func (f *Forwarder) Close() (err error) {
 func (f *Forwarder) Start(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 
+	// Snapshot the allowed CPU mask ONCE here, on the (unpinned) caller's thread,
+	// so every per-queue goroutine pins against the same full set. Reading it
+	// inside each goroutine would be fragile: a worker thread the Go runtime
+	// recycles from an already-pinned one would see a narrowed mask and mis-spread.
+	// nil (pinning off or mask unreadable) leaves all queues unpinned (APO-670).
+	var pinCPUs []int
+	if f.pinCPU {
+		pinCPUs = allowedCPUs()
+	}
+
 	for queueID := range f.phy {
 		g.Go(func() error {
-			return f.processFrames(ctx, queueID)
+			return f.processFrames(ctx, queueID, pinCPUs)
 		})
 	}
 
@@ -442,9 +625,54 @@ func (f *Forwarder) Start(ctx context.Context) error {
 	return nil
 }
 
-func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
+// allowedCPUs returns the sorted CPU indices in the process's affinity mask
+// (cgroup cpuset / taskset-aware), or nil if it cannot be read. Called once,
+// before any thread is pinned, so it reflects the full inherited mask.
+func allowedCPUs() []int {
+	var set unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &set); err != nil {
+		slog.Warn("CPU pinning skipped: cannot read CPU affinity", slog.Any("error", err))
+		return nil
+	}
+	var cpus []int
+	for i := 0; i < len(set)*64; i++ {
+		if set.IsSet(i) {
+			cpus = append(cpus, i)
+		}
+	}
+	if len(cpus) == 0 {
+		return nil
+	}
+	return cpus
+}
+
+// pinThreadToCPU pins the calling OS thread (already locked to this goroutine via
+// runtime.LockOSThread) to cpus[queueID mod len], so a per-queue datapath loop
+// keeps its UMEM rings and working set resident on one core instead of migrating
+// between them — cutting the cross-core cache traffic and scheduler churn the
+// unpinned busy loop otherwise incurred (APO-670). cpus is the snapshot from
+// allowedCPUs, so the target is always inside the inherited cpuset (container
+// safe). Best-effort: a failure is logged and the thread left unpinned, never
+// failing the datapath.
+func pinThreadToCPU(queueID int, cpus []int) {
+	cpu := cpus[queueID%len(cpus)]
+	var set unix.CPUSet
+	set.Set(cpu)
+	if err := unix.SchedSetaffinity(0, &set); err != nil {
+		slog.Warn("CPU pinning failed",
+			slog.Int("queueID", queueID), slog.Int("cpu", cpu), slog.Any("error", err))
+		return
+	}
+	slog.Debug("Pinned queue goroutine to CPU",
+		slog.Int("queueID", queueID), slog.Int("cpu", cpu))
+}
+
+func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []int) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	if len(pinCPUs) > 0 {
+		pinThreadToCPU(queueID, pinCPUs)
+	}
 
 	phy := f.phy[queueID]
 	virt := f.virt[queueID]
@@ -522,29 +750,40 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int) error {
 			virt.Complete(numCompleted)
 		}
 
-		// Emit any scheduled frame (e.g. keep-alive) once per loop, built in place
-		// in a freshly allocated frame and transmitted on phy.
-		if phy.NumFreeTxSlots() > 0 {
-			if schedScratch = umem.Alloc(schedScratch[:0], 1); len(schedScratch) == 1 {
-				base, _ := frameBaseOff(schedScratch[0].Addr)
-				buf := umem.FrameFull(schedScratch[0])
-				outOff, outLen := f.handler.ToPhyInPlace(buf, 0)
-				if buf != nil && outLen > 0 {
-					schedScratch[0].Addr = base + uint64(outOff)
-					schedScratch[0].Len = uint32(outLen)
-					if f.pcapWriter != nil {
-						f.writePcap(umem.Frame(schedScratch[0]))
-					}
-					if n, err := phy.Transmit(schedScratch); err != nil {
-						return fmt.Errorf("failed to transmit scheduled frame: %w", err)
-					} else if n < 1 {
-						umem.Free(schedScratch)
-						slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
-					}
-				} else {
-					// Nothing to send; return the unused frame to the pool.
-					umem.Free(schedScratch)
-				}
+		// Emit every scheduled frame (keep-alive) that is due this pass, built in
+		// place in a freshly allocated frame and transmitted on phy. ToPhyInPlace
+		// returns at most ONE network's keep-alive per call, so emitting once per loop
+		// served N due networks only one-per-poll — up to N x the idle poll quantum
+		// (100ms) of latency on the Nth network's keep-alive, long enough to let its
+		// NAT mapping lapse on an otherwise idle queue (APO-679). Drain until nothing
+		// is due (outLen == 0) or the phy TX ring fills: the loop is bounded by the
+		// number of due networks and the free TX slots, and a network that cannot send
+		// (no installed/expired key, counter overflow) yields outLen == 0, so it stops
+		// the drain rather than spinning.
+		for phy.NumFreeTxSlots() > 0 {
+			schedScratch = umem.Alloc(schedScratch[:0], 1)
+			if len(schedScratch) != 1 {
+				break // pool momentarily exhausted; retry next loop
+			}
+			base, _ := frameBaseOff(schedScratch[0].Addr)
+			buf := umem.FrameFull(schedScratch[0])
+			outOff, outLen := f.handler.ToPhyInPlace(buf, 0)
+			if buf == nil || outLen == 0 {
+				// Nothing more due; return the unused frame to the pool and stop.
+				umem.Free(schedScratch)
+				break
+			}
+			schedScratch[0].Addr = base + uint64(outOff)
+			schedScratch[0].Len = uint32(outLen)
+			if f.pcapWriter != nil {
+				f.writePcap(umem.Frame(schedScratch[0]))
+			}
+			if n, err := phy.Transmit(schedScratch); err != nil {
+				return fmt.Errorf("failed to transmit scheduled frame: %w", err)
+			} else if n < 1 {
+				umem.Free(schedScratch)
+				slog.Warn("Dropped scheduled-to-phy frame", slog.Int("queueID", queueID))
+				break // TX ring full; resume the drain next loop
 			}
 		}
 
