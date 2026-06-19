@@ -72,9 +72,15 @@ func (p *Program) Register(queueID int, fd int) error {
 
 // Unregister disables redirect for queueID and drops its XSKMAP entry. qidconf is
 // cleared first so the program stops redirecting before the socket fd is removed.
+//
+// qidconf_map is a BPF_MAP_TYPE_ARRAY, whose elements cannot be deleted (the
+// kernel returns EINVAL); the disable is therefore a Put(queueID, 0), not a
+// Delete. The previous Delete always errored on the array map and returned before
+// ever clearing the XSKMAP entry, leaving the socket fd a live redirect target —
+// so per-queue teardown never actually unregistered anything.
 func (p *Program) Unregister(queueID int) error {
-	if err := p.Queues.Delete(uint32(queueID)); err != nil {
-		return fmt.Errorf("failed to delete qidconf_map entry: %w", err)
+	if err := p.Queues.Put(uint32(queueID), uint32(0)); err != nil {
+		return fmt.Errorf("failed to clear qidconf_map entry: %w", err)
 	}
 	if err := p.Sockets.Delete(uint32(queueID)); err != nil {
 		return fmt.Errorf("failed to delete xsks_map entry: %w", err)

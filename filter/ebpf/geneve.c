@@ -135,7 +135,18 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	if (parse_genevehdr(&nh, data_end, &geneve) < 0)
 		return XDP_PASS;
 
-	return bpf_redirect_map(&xsks_map, index, XDP_PASS);
+	// This frame matched a registered bind (our underlay addr:port) and parsed as
+	// Geneve, so it is encrypted-datapath traffic destined for an AF_XDP socket.
+	// The third arg is the action bpf_redirect_map returns when xsks_map has no
+	// socket for this rx_queue_index — i.e. the frame was RSS-hashed to a queue the
+	// forwarder did not bind (e.g. WithNumQueues capped below the NIC's RSS
+	// fan-out). Returning XDP_DROP keeps such a stray encrypted frame off the host
+	// kernel stack: with XDP_PASS it silently left the encrypted datapath into the
+	// host (a multiqueue-only leak), whereas dropping it at the NIC is the correct
+	// fail-closed behavior for datapath traffic with nowhere to go. Non-Geneve and
+	// non-bound-port traffic already returns XDP_PASS at the checks above, so this
+	// only affects frames addressed to our own bind.
+	return bpf_redirect_map(&xsks_map, index, XDP_DROP);
 }
 
 char _license[] SEC("license") = "GPL";
