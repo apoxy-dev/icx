@@ -103,8 +103,7 @@ func TestForwarderOuterSrcValidation(t *testing.T) {
 		forwarder.WithVirtName(virtDev.Peer.Attrs().Name),
 	)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, fwd.Close()) })
-	go func() { _ = fwd.Start(t.Context()) }()
+	runForwarder(t, fwd)
 
 	// Distinct canary payloads so a leaked bad frame is unmistakable on virt. The
 	// handlers are L2: VirtToPhy takes the full Ethernet frame, while the decapped

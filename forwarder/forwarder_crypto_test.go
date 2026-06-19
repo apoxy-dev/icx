@@ -119,9 +119,7 @@ func TestForwarderCryptoRoundTrip(t *testing.T) {
 		forwarder.WithVirtName(virtDev.Peer.Attrs().Name),
 	)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, fwd.Close()) })
-
-	go func() { _ = fwd.Start(t.Context()) }()
+	runForwarder(t, fwd)
 
 	// The inner virtual frame: [Ethernet][IPv4][UDP][canary payload]. Inner src
 	// and dst both sit inside the route prefix so encap routing and decap source

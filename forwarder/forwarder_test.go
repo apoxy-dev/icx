@@ -83,14 +83,10 @@ func TestForwarder(t *testing.T) {
 		forwarder.WithPcapWriter(pcapWriter),
 	)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, fwd.Close())
-	})
 
-	// Start the forwarder.
-	go func() {
-		require.NoError(t, fwd.Start(t.Context()))
-	}()
+	// Start the forwarder (cancel + wait-for-Start-to-self-close on cleanup; see
+	// runForwarder — a t.Cleanup(fwd.Close()) races the live datapath goroutines).
+	runForwarder(t, fwd)
 
 	// Create a network namespace.
 	execIP(t, "netns", "add", nsName)

@@ -356,6 +356,20 @@ func NewForwarder(handler Handler, opts ...ForwarderOption) (*Forwarder, error) 
 		}
 	}
 
+	// The forwarder's virtual interface is an L2 device (a veth): its in-place
+	// transforms write Ethernet-framed packets to/from it. A handler in layer3
+	// mode (WithLayer3VirtFrames) instead emits a raw IP packet on decap, which
+	// the veth silently drops — the datapath wedges to zero with no error. Reject
+	// it at construction rather than blackholing at runtime. An L3 peer (the
+	// userspace vtep/tun datapath) still interoperates with this forwarder on the
+	// wire: both modes encrypt the same inner IP packet, so use an L2 handler here
+	// regardless of the remote peer's local framing.
+	if l3, ok := handler.(interface{ IsLayer3() bool }); ok && l3.IsLayer3() {
+		return nil, fmt.Errorf("forwarder requires an L2 handler: its virtual interface is an Ethernet veth, " +
+			"but the handler is configured for layer3 (WithLayer3VirtFrames); drop WithLayer3VirtFrames " +
+			"(L3 peers such as the userspace vtep/tun datapath still interoperate on the wire)")
+	}
+
 	slog.Debug("Creating forwarder",
 		slog.String("phyName", options.phyName),
 		slog.String("virtName", options.virtName))
@@ -760,7 +774,15 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []in
 		// number of due networks and the free TX slots, and a network that cannot send
 		// (no installed/expired key, counter overflow) yields outLen == 0, so it stops
 		// the drain rather than spinning.
-		for phy.NumFreeTxSlots() > 0 {
+		//
+		// Only queue 0 runs the drain. Keep-alives are a per-handler concern, not a
+		// per-queue one, and ToPhyInPlace's due-check (LastKeepAliveUnixNano.Load)
+		// and its serviced-store are not atomic across goroutines — so running this
+		// in all N processFrames goroutines made each due network's keep-alive egress
+		// up to N times per interval and burn N transmit-counter values toward the
+		// rekey threshold (APO-670). Gating to one queue restores exactly one
+		// keep-alive per network per interval regardless of queue count.
+		for queueID == 0 && phy.NumFreeTxSlots() > 0 {
 			schedScratch = umem.Alloc(schedScratch[:0], 1)
 			if len(schedScratch) != 1 {
 				break // pool momentarily exhausted; retry next loop
