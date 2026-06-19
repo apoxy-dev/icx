@@ -165,7 +165,7 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	}
 
 	rxCipher := rxCipherAny.(*receiveCipher)
-	if rxCipher.expiresAt.Before(h.clock.Now()) {
+	if rxCipher.expiry().Before(h.clock.Now()) {
 		if debugDropEnabled() {
 			slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
 		}

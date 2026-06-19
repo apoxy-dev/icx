@@ -121,9 +121,24 @@ type Route struct {
 // Receiver cipher state.
 type receiveCipher struct {
 	cipher.AEAD
-	expiresAt    time.Time
+	// expiresAt is the receive SA's expiry as Unix nanoseconds, held atomically
+	// because installKeys grace-clamps it in place on an already-published
+	// *receiveCipher while the N per-queue decap goroutines read it concurrently
+	// through the rxCiphers sync.Map (which synchronizes only the slot pointer, not
+	// the pointee). A bare time.Time is three machine words whose non-atomic
+	// read/write tears, yielding an arbitrary .Before() result — a live graced key
+	// spuriously dropped (and Deleted) or an expired key admitted — under any
+	// rekey-under-load (APO-670). Every install stores a real future time; the zero
+	// value is never a valid expiry. Use expiry()/setExpiry() rather than touching
+	// the field directly so the UnixNano convention stays in one place.
+	expiresAt    atomic.Int64
 	replayFilter replay.Filter
 }
+
+// expiry returns the receive SA's expiry. setExpiry records it. Both go through
+// the atomic so the control-plane grace-clamp never tears against datapath reads.
+func (r *receiveCipher) expiry() time.Time     { return time.Unix(0, r.expiresAt.Load()) }
+func (r *receiveCipher) setExpiry(t time.Time) { r.expiresAt.Store(t.UnixNano()) }
 
 // Transmit cipher state.
 type transmitCipher struct {
@@ -288,6 +303,17 @@ func WithLayer3VirtFrames() HandlerOption {
 		return nil
 	}
 }
+
+// IsLayer3 reports whether the handler emits and expects raw L3 (IP) virtual
+// frames (WithLayer3VirtFrames), as opposed to the default L2 (Ethernet) frames.
+//
+// The AF_XDP forwarder uses this to reject an L3 handler at construction: its
+// virtual interface is an L2 device (a veth), so an in-place L3 decap would
+// write a raw IP packet onto the veth — which the veth silently drops. An L3
+// peer (e.g. the userspace vtep/tun datapath, which drives a real TUN device)
+// interoperates with the forwarder on the wire regardless, because both modes
+// encrypt the same inner IP packet; only the local virtual framing differs.
+func (h *Handler) IsLayer3() bool { return h.opts.layer3 }
 
 // WithKeepAliveInterval configures the handler to send keep-alive packets
 // on each virtual network at the given interval. If nil or zero, no keep-alives
@@ -772,8 +798,8 @@ func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, 
 		if prevCipherAny, ok := vnet.rxCiphers.Load(prevRxSPI); ok {
 			if prevCipher, ok := prevCipherAny.(*receiveCipher); ok {
 				graceExpiry := h.clock.Now().Add(keyGracePeriod)
-				if prevCipher.expiresAt.After(graceExpiry) {
-					prevCipher.expiresAt = graceExpiry
+				if prevCipher.expiry().After(graceExpiry) {
+					prevCipher.setExpiry(graceExpiry)
 				}
 			}
 		}
@@ -784,7 +810,7 @@ func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, 
 	now := h.clock.Now()
 	vnet.rxCiphers.Range(func(key, value any) bool {
 		cipher := value.(*receiveCipher)
-		if cipher.expiresAt.Before(now) {
+		if cipher.expiry().Before(now) {
 			vnet.rxCiphers.Delete(key)
 		}
 		return true
@@ -811,10 +837,9 @@ func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, 
 	// Install RX before TX (make-before-break): store the receive cipher and record the
 	// currently-installed receive SPI (rxEpoch) first, so we can decrypt the peer's
 	// new-generation frames before we start emitting our own under the new transmit SPI.
-	vnet.rxCiphers.Store(rxSPI, &receiveCipher{
-		AEAD:      rxCipher,
-		expiresAt: expiresAt,
-	})
+	rc := &receiveCipher{AEAD: rxCipher}
+	rc.setExpiry(expiresAt)
+	vnet.rxCiphers.Store(rxSPI, rc)
 	vnet.rxEpoch.Store(rxSPI)
 
 	// A fresh transmitCipher resets the TX counter to zero for the new transmit SPI.
@@ -964,7 +989,7 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	}
 
 	rxCipher := rxCipherAny.(*receiveCipher)
-	if rxCipher.expiresAt.Before(h.clock.Now()) {
+	if rxCipher.expiry().Before(h.clock.Now()) {
 		if debugDropEnabled() {
 			slog.Debug("Epoch key expired", slog.Uint64("epoch", uint64(epoch)))
 		}
