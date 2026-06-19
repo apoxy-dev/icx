@@ -18,8 +18,11 @@ func NumQueues(link netlink.Link) (int, error) {
 	}
 	defer ethHandle.Close()
 
-	// Netlink returns the maximum number of RX and TX queues for the interface.
-	// Not the current number of queues in use.
+	// ethtool GetChannels returns the CURRENT configured RX/TX/combined channel
+	// counts for the interface (the Channels struct also carries MaxRx/MaxTx/
+	// MaxCombined for the maxima, which we do not use). On a driver that does not
+	// implement get-channels it returns ENOTSUP, which we tolerate and fall back to
+	// the netdev's allocated NumRxQueues/NumTxQueues below.
 	channels, err := ethHandle.GetChannels(link.Attrs().Name)
 	if err != nil && !errors.Is(err, unix.ENOTSUP) {
 		return -1, fmt.Errorf("failed to get channels: %w", err)
