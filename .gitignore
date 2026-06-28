@@ -36,3 +36,10 @@ go.work.sum
 
 # Packet captures
 *.pcap
+
+# Compiled cmd/ binaries dropped in the repo root by `go build ./cmd/...`
+# (root-anchored so they never shadow the cmd/<name>/ source dirs)
+/icxbench
+/icxbench-tun
+/txblast
+/udpgen
