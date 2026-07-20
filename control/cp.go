@@ -18,22 +18,23 @@ import (
 // SAInstaller, so the CLI stays thin and the wiring is unit-testable off Linux.
 //
 // Data-plane SA model (PSP, per-direction): the handler installs two simplex SAs per
-// generation (handler.go: UpdateVirtualNetworkSAs), each selected by its own
-// role-partitioned SPI. NegotiateSAs gives each peer a DirectionalSAs{Rx, Tx} where Rx
-// is the SPI this peer allocated (our receive SPI) and Tx is the peer's receive SPI
-// (what we transmit to). Both peers derive every key locally from the shared master
-// keys, so nothing but the SPIs crosses the wire. Each direction therefore has its own
-// nonce space, separated by the SPI itself (the role bit) on top of the distinct
-// per-direction key.
+// generation (handler.go: UpdateVirtualNetworkSecret), each selected by its own
+// role-partitioned SPI, and derives each direction's AEAD key itself from the session
+// master key and the SPI. NegotiateSAs gives each peer a DirectionalSAs{Master, RxSPI,
+// TxSPI} where RxSPI is the SPI this peer allocated (our receive SPI) and TxSPI is the
+// peer's receive SPI (what we transmit to). Both handlers derive every key locally, so
+// nothing but the SPIs crosses the wire — and no finished key even crosses the
+// control-plane/data-plane boundary. Each direction has its own nonce space, separated
+// by the SPI itself (the role bit) on top of the distinct per-direction key.
 //
 // No persisted epoch state is needed for recovery. The per-session SPI allocator resets
 // on every (re)connect, so a fresh session's SPIs start low again — but that is SAFE
 // because every reconnect is a fresh ECDHE handshake (no 0-RTT, no resumption; enforced
 // in transport.go) yielding fresh master keys, so a reused SPI value derives a different
-// key and the data-plane nonce never repeats. The handler's install guard therefore
-// accepts the reset SPI (it rejects only a re-install of the currently-live transmit
-// SPI), which makes a transient reconnect and a one-sided restart of either peer recover
-// seamlessly with zero on-disk state.
+// key and the data-plane nonce never repeats. The handler's install guard scopes its
+// TX-SPI monotonicity check to an unchanged master, so it accepts the reset SPI under
+// the fresh master — which makes a transient reconnect and a one-sided restart of
+// either peer recover seamlessly with zero on-disk state.
 
 // CanonicalInitiator reports whether the local node is the control-plane initiator
 // — the peer that dials. The role is elected deterministically from the two pinned
@@ -59,14 +60,16 @@ func CanonicalInitiator(localPub, peerPub *ecdsa.PublicKey) (bool, error) {
 	return bytes.Compare(l, p) < 0, nil
 }
 
-// SAInstaller installs a negotiated SA generation into the data plane. rxSPI is our
-// receive SPI (we decrypt inbound frames under it); txSPI is the peer's receive SPI (we
-// encrypt outbound frames to it); rxKey/txKey are the 16-byte AES-128 keys for those
-// directions. The installer owns the key lifetime/expiry and is expected to enforce the
-// handler's fail-closed guards (non-zero, strictly increasing per-direction SPIs,
-// rxKey != txKey). A returned error is treated as a rejected rotation, not a session
+// SAInstaller installs a negotiated SA generation into the data plane. master is the
+// session master key both directions derive from; rxSPI is our receive SPI (we decrypt
+// inbound frames under it); txSPI is the peer's receive SPI (we encrypt outbound frames
+// to it). The installer hands these to the handler, which derives the per-direction
+// AES-GCM keys itself (UpdateVirtualNetworkSecret) — no key material crosses this
+// boundary. The installer owns the key lifetime/expiry; the handler enforces the
+// fail-closed guards (reserved SPIs, distinct SPIs, TX SPI monotonicity under an
+// unchanged master). A returned error is treated as a rejected rotation, not a session
 // failure.
-type SAInstaller func(rxSPI, txSPI uint32, rxKey, txKey [16]byte) error
+type SAInstaller func(master [MasterKeyLen]byte, rxSPI, txSPI uint32) error
 
 // Default lifecycle timings; overridable on Tunnel for tests.
 const (
@@ -265,30 +268,25 @@ func (t *Tunnel) negotiateAndInstall(ctx context.Context) error {
 	return t.installSAs(sas)
 }
 
-// installSAs validates the negotiated SAs fail-closed (AES-GCM-128, 16-byte keys) and hands
-// the two per-direction SPIs/keys to the installer. Every session derives fresh keys
-// (fresh ECDHE; see transport.go), so the handler accepts the install even when the
+// installSAs validates the negotiated SAs fail-closed (AES-GCM-128 only in this build)
+// and hands the master key plus the two per-direction SPIs to the installer; the
+// data-plane handler derives the AEAD keys itself. Every session derives fresh master
+// keys (fresh ECDHE; see transport.go), so the handler accepts the install even when the
 // per-session allocator reset the SPIs to a low value after a reconnect. An install
-// rejection is swallowed as defense-in-depth (e.g. the handler refusing to reset its
-// currently-live transmit SPI): the previously installed keys keep forwarding and the
-// data plane fails closed on their own expiry.
+// rejection is swallowed as defense-in-depth (e.g. the handler refusing to regress its
+// currently-live transmit SPI under an unchanged master): the previously installed keys
+// keep forwarding and the data plane fails closed on their own expiry.
 func (t *Tunnel) installSAs(sas *DirectionalSAs) error {
-	if sas.Tx.Version != AESGCM128 || sas.Rx.Version != AESGCM128 {
-		return fmt.Errorf("control: only the AES-GCM-128 cipher suite is supported in this build (tx=%d rx=%d)", sas.Tx.Version, sas.Rx.Version)
+	if sas.Version != AESGCM128 {
+		return fmt.Errorf("control: only the AES-GCM-128 cipher suite is supported in this build (got %d)", sas.Version)
 	}
-	if len(sas.Rx.Key) != 16 || len(sas.Tx.Key) != 16 {
-		return fmt.Errorf("control: expected 16-byte SA keys (rx=%d tx=%d)", len(sas.Rx.Key), len(sas.Tx.Key))
-	}
-	var rxKey, txKey [16]byte
-	copy(rxKey[:], sas.Rx.Key)
-	copy(txKey[:], sas.Tx.Key)
-	if err := t.install(sas.Rx.SPI, sas.Tx.SPI, rxKey, txKey); err != nil {
+	if err := t.install(sas.Master, sas.RxSPI, sas.TxSPI); err != nil {
 		slog.Warn("control: SA install rejected; keeping current keys until they expire",
-			slog.Uint64("rxSPI", uint64(sas.Rx.SPI)), slog.Uint64("txSPI", uint64(sas.Tx.SPI)), slog.Any("error", err))
+			slog.Uint64("rxSPI", uint64(sas.RxSPI)), slog.Uint64("txSPI", uint64(sas.TxSPI)), slog.Any("error", err))
 		return nil
 	}
 	slog.Debug("control: installed SA generation",
-		slog.Uint64("rxSPI", uint64(sas.Rx.SPI)), slog.Uint64("txSPI", uint64(sas.Tx.SPI)))
+		slog.Uint64("rxSPI", uint64(sas.RxSPI)), slog.Uint64("txSPI", uint64(sas.TxSPI)))
 	return nil
 }
 

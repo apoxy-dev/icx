@@ -19,6 +19,7 @@ import (
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/forwarder"
 	"github.com/apoxy-dev/icx/permissions"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
 
@@ -71,22 +72,25 @@ func TestForwarderCryptoMultiQueue(t *testing.T) {
 	prefix := netip.MustParsePrefix("10.99.0.0/24")
 	routes := []icx.Route{{Src: prefix, Dst: prefix}}
 
-	var abKey, encapRx, hTx [16]byte
-	copy(abKey[:], []byte("icx-mq-rndtrip-k"))
-	copy(encapRx[:], []byte("icx-mq-encap-rx!"))
-	copy(hTx[:], []byte("icx-mq-decap-tx!"))
+	var master [32]byte
+	copy(master[:], []byte("icx-mq-master-secret-000000000!!"))
+	rxH, txH, err := psp.EpochSPIs(psp.Initiator, 1)
+	require.NoError(t, err)
+	rxE, txE, err := psp.EpochSPIs(psp.Responder, 1)
+	require.NoError(t, err)
 	expires := time.Now().Add(time.Hour)
 
-	// The forwarder's handler: decapsulates inbound frames with rxKey=abKey.
+	// The forwarder's handler: decapsulates inbound frames under its own receive
+	// SPI (== the offline peer's transmit SPI, derived from the shared master).
 	h, err := icx.NewHandler(
 		icx.WithLocalAddr(localUnderlay),
 		icx.WithVirtMAC(virtMAC),
 	)
 	require.NoError(t, err)
 	require.NoError(t, h.AddVirtualNetwork(vni, remoteUnderlay, routes))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, abKey, hTx, expires))
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxH, txH, expires))
 
-	// Offline peer that mints genuinely-encrypted frames with txKey=abKey. Source-
+	// Offline peer that mints genuinely-encrypted frames under the mirrored role. Source-
 	// port hashing makes each inner flow take a distinct outer UDP source port, so
 	// the veth spreads the frames across the phy's RX queues.
 	encapH, err := icx.NewHandler(
@@ -96,7 +100,7 @@ func TestForwarderCryptoMultiQueue(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NoError(t, encapH.AddVirtualNetwork(vni, remoteUnderlay, routes))
-	require.NoError(t, encapH.UpdateVirtualNetworkKeys(vni, 1, encapRx, abKey, expires))
+	require.NoError(t, encapH.UpdateVirtualNetworkSecret(vni, master, rxE, txE, expires))
 
 	// No WithPhyFilter: use the production default phy filter (filter.Geneve on UDP
 	// 6081), so this test also exercises the geneve.c XDP program — the production

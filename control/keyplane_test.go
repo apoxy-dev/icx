@@ -186,14 +186,17 @@ func TestKeyPlaneGrantDerivesMatchingSAs(t *testing.T) {
 	if !ok {
 		t.Fatalf("granter has no record for VNI %d", grantA.VNI)
 	}
-	if !bytes.Equal(grantA.SAs.Tx.Key, recA.sas.Rx.Key) {
-		t.Fatal("initiator TX key != responder RX key")
+	if grantA.SAs.Master != recA.sas.Master {
+		t.Fatal("worker and responder derived different session masters")
 	}
-	if !bytes.Equal(grantA.SAs.Rx.Key, recA.sas.Tx.Key) {
-		t.Fatal("initiator RX key != responder TX key")
+	if grantA.SAs.TxSPI != recA.sas.RxSPI {
+		t.Fatal("initiator TX SPI != responder RX SPI")
 	}
-	if bytes.Equal(grantA.SAs.Tx.Key, grantA.SAs.Rx.Key) {
-		t.Fatal("tx and rx keys collided")
+	if grantA.SAs.RxSPI != recA.sas.TxSPI {
+		t.Fatal("initiator RX SPI != responder TX SPI")
+	}
+	if grantA.SAs.TxSPI == grantA.SAs.RxSPI {
+		t.Fatal("tx and rx SPIs collided")
 	}
 	if recA.addr != addrA {
 		t.Fatalf("granter saw addr %v, want %v", recA.addr, addrA)
@@ -202,11 +205,11 @@ func TestKeyPlaneGrantDerivesMatchingSAs(t *testing.T) {
 		t.Fatal("granter did not see worker A's identity key")
 	}
 
-	// Cross-session: the two grants must not share keys (distinct sessions ⇒
-	// distinct master keys; distinct SPIs regardless).
+	// Cross-session: the two grants must not share key material (distinct sessions
+	// ⇒ distinct master keys; distinct SPIs regardless).
 	recB, _ := granter.record(grantB.VNI)
-	if bytes.Equal(recA.sas.Rx.Key, recB.sas.Rx.Key) {
-		t.Fatal("two workers derived the same RX key")
+	if recA.sas.Master == recB.sas.Master {
+		t.Fatal("two workers derived the same session master")
 	}
 }
 
@@ -241,7 +244,7 @@ func TestKeyPlaneConcurrentGrants(t *testing.T) {
 			t.Fatalf("duplicate VNI %d", grants[i].VNI)
 		}
 		vnis[grants[i].VNI] = struct{}{}
-		for _, spi := range []uint32{grants[i].SAs.Tx.SPI, grants[i].SAs.Rx.SPI} {
+		for _, spi := range []uint32{grants[i].SAs.TxSPI, grants[i].SAs.RxSPI} {
 			if _, dup := spis[spi]; dup {
 				t.Fatalf("duplicate SPI %d", spi)
 			}

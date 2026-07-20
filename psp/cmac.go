@@ -1,13 +1,9 @@
-// Package control implements ICX's key-establishment control plane (a QUIC/mTLS
-// channel) and the PSP-model key derivation that turns an authenticated,
-// forward-secret session into per-Security-Association AEAD keys for the
-// existing Geneve/AF_XDP data plane.
-//
 // This file implements AES-CMAC (NIST SP 800-38B / RFC 4493), the
 // pseudorandom function underlying the PSP SP 800-108 key-derivation function
 // (see kdf.go). CMAC is built directly on the FIPS-validated crypto/aes block
 // cipher so the whole derivation stays inside the Go FIPS 140-3 module.
-package control
+
+package psp
 
 import (
 	"crypto/aes"

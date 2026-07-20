@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 
 	"github.com/apoxy-dev/icx"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/vtep/tun"
 )
 
@@ -69,23 +70,28 @@ func main() {
 	if *index < 0 || *index > 15 {
 		log.Fatalf("--index must be 0..15 (got %d)", *index)
 	}
-	// Per-tunnel keys: distinct last byte ('A'+index) keeps every VTEP's SA key
-	// (and thus every (key,nonce) pair, given each VTEP counts from 0) unique even
-	// though all share epoch 1 — required when N VTEPs fan into one AF_XDP peer.
-	var rxKey, txKey [16]byte
-	copy(rxKey[:], []byte("icxbench-rxkey-0!"))
-	copy(txKey[:], []byte("icxbench-txkey-0!"))
-	rxKey[15] = byte('A' + *index)
-	txKey[15] = byte('A' + *index)
+	// Per-tunnel deterministic master secret: distinct last byte ('A'+index) keeps
+	// every VTEP's derivation space (and thus every (key,nonce) pair, given each
+	// VTEP counts from 0) unique even though all share epoch 1 — required when N
+	// VTEPs fan into one AF_XDP peer. The handler derives the per-direction keys
+	// from (master, SPI); --swap-keys selects the mirrored role on the decap side.
+	var master [32]byte
+	copy(master[:], []byte("icxbench-master-secret-000000000"))
+	master[31] = byte('A' + *index)
+	role := psp.Initiator
 	if *swapKeys {
-		rxKey, txKey = txKey, rxKey
+		role = psp.Responder
+	}
+	rxSPI, txSPI, err := psp.EpochSPIs(role, 1)
+	if err != nil {
+		log.Fatalf("EpochSPIs: %v", err)
 	}
 	vni := uint(0x1000 + *index)
 	if err := h.AddVirtualNetwork(vni, remote, routes); err != nil {
 		log.Fatalf("AddVirtualNetwork: %v", err)
 	}
-	if err := h.UpdateVirtualNetworkKeys(vni, 1, rxKey, txKey, time.Now().Add(24*time.Hour)); err != nil {
-		log.Fatalf("UpdateVirtualNetworkKeys: %v", err)
+	if err := h.UpdateVirtualNetworkSecret(vni, master, rxSPI, txSPI, time.Now().Add(24*time.Hour)); err != nil {
+		log.Fatalf("UpdateVirtualNetworkSecret: %v", err)
 	}
 
 	dp, err := tun.Open(tun.OpenConfig{

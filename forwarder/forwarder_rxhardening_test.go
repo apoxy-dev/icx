@@ -19,6 +19,7 @@ import (
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
 	"github.com/apoxy-dev/icx/permissions"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
 
@@ -75,10 +76,10 @@ func TestForwarderOuterSrcValidation(t *testing.T) {
 	prefix := netip.MustParsePrefix("10.99.0.0/24")
 	routes := []icx.Route{{Src: prefix, Dst: prefix}}
 
-	var abKey, encapRx, hTx [16]byte
-	copy(abKey[:], []byte("icx-s7-roundtr!!"))
-	copy(encapRx[:], []byte("icx-s7-encap-rx!"))
-	copy(hTx[:], []byte("icx-s7-decap-tx!"))
+	var master [32]byte
+	copy(master[:], []byte("icx-s7-master-secret-00000000!!!"))
+	rxH, txH, err := psp.EpochSPIs(psp.Initiator, 1)
+	require.NoError(t, err)
 	expires := time.Now().Add(time.Hour)
 
 	// The forwarder's handler: decapsulates with rxKey=abKey and ENFORCES the
@@ -90,12 +91,12 @@ func TestForwarderOuterSrcValidation(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NoError(t, h.AddVirtualNetwork(vni, peerUnderlay, routes))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, abKey, hTx, expires))
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxH, txH, expires))
 
 	// goodEncap mints frames sourced from peerUnderlay (== h's RemoteAddr).
-	goodEncap := mintHandler(t, peerUnderlay, localUnderlay, vni, routes, encapRx, abKey, expires)
+	goodEncap := mintHandler(t, peerUnderlay, localUnderlay, vni, routes, master, expires)
 	// badEncap mints frames sourced from wrongUnderlay (a non-peer).
-	badEncap := mintHandler(t, wrongUnderlay, localUnderlay, vni, routes, encapRx, abKey, expires)
+	badEncap := mintHandler(t, wrongUnderlay, localUnderlay, vni, routes, master, expires)
 
 	fwd, err := forwarder.NewForwarder(h,
 		forwarder.WithPhyName(phyDev.Peer.Attrs().Name),
@@ -194,7 +195,7 @@ func TestForwarderOuterSrcValidation(t *testing.T) {
 
 // mintHandler builds an offline peer handler that mints encrypted frames sourced
 // from `local`, addressed to `remote`, sharing the given VNI/routes/keys.
-func mintHandler(t *testing.T, local, remote *tcpip.FullAddress, vni uint, routes []icx.Route, rxKey, txKey [16]byte, expires time.Time) *icx.Handler {
+func mintHandler(t *testing.T, local, remote *tcpip.FullAddress, vni uint, routes []icx.Route, master [32]byte, expires time.Time) *icx.Handler {
 	t.Helper()
 	h, err := icx.NewHandler(
 		icx.WithLocalAddr(local),
@@ -202,7 +203,9 @@ func mintHandler(t *testing.T, local, remote *tcpip.FullAddress, vni uint, route
 	)
 	require.NoError(t, err)
 	require.NoError(t, h.AddVirtualNetwork(vni, remote, routes))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, rxKey, txKey, expires))
+	rxSPI, txSPI, err := psp.EpochSPIs(psp.Responder, 1)
+	require.NoError(t, err)
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxSPI, txSPI, expires))
 	return h
 }
 

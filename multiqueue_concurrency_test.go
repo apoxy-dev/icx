@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/apoxy-dev/icx/geneve"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/udp"
 )
 
@@ -317,10 +318,11 @@ func TestMultiQueueDecapDuringRekeyRace(t *testing.T) {
 	// Install epoch 2: installKeys grace-clamps epoch-1's expiresAt in place while
 	// the readers are reading it. The readers keep reading epoch-1 during the grace
 	// window, so post-clamp reads with no happens-before edge are flagged too.
-	var rxK, txK [16]byte
-	_, _ = crand.Read(rxK[:])
-	_, _ = crand.Read(txK[:])
-	require.NoError(t, env.h.UpdateVirtualNetworkKeys(env.vni, 2, rxK, txK, time.Now().Add(time.Hour)))
+	var master [32]byte
+	_, _ = crand.Read(master[:])
+	rxSPI, txSPI, err := psp.EpochSPIs(psp.Initiator, 2)
+	require.NoError(t, err)
+	require.NoError(t, env.h.UpdateVirtualNetworkSecret(env.vni, master, rxSPI, txSPI, time.Now().Add(time.Hour)))
 
 	time.Sleep(20 * time.Millisecond) // let readers iterate across the clamp
 	atomic.StoreInt64(&stop, 1)
@@ -354,11 +356,16 @@ func TestMultiQueueRekeyUnderLoad(t *testing.T) {
 		defer rotWg.Done()
 		epoch := uint32(2) // epoch 1 is the initial install from newInplaceEnv
 		for atomic.LoadInt64(&stop) == 0 {
-			var rxK, txK [16]byte
-			_, _ = crand.Read(rxK[:])
-			_, _ = crand.Read(txK[:])
-			// Production path: rejects equal rx/tx keys and non-monotone epoch.
-			_ = env.h.UpdateVirtualNetworkKeys(env.vni, epoch, rxK, txK, time.Now().Add(time.Hour))
+			var master [32]byte
+			_, _ = crand.Read(master[:])
+			// Production path: the handler derives distinct per-direction keys from
+			// (master, role-partitioned SPI); a fresh master per rotation models the
+			// control plane's fresh-session keys.
+			rxSPI, txSPI, err := psp.EpochSPIs(psp.Initiator, epoch)
+			if err != nil {
+				break
+			}
+			_ = env.h.UpdateVirtualNetworkSecret(env.vni, master, rxSPI, txSPI, time.Now().Add(time.Hour))
 			epoch++
 		}
 	}()

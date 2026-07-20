@@ -581,8 +581,8 @@ func startControlPlane(ctx context.Context, c *cli.Context, h *icx.Handler, vni 
 		keyLifetime = 24 * time.Hour
 	}
 
-	installer := func(rxSPI, txSPI uint32, rxKey, txKey [16]byte) error {
-		return h.UpdateVirtualNetworkSAs(vni, rxSPI, txSPI, rxKey, txKey, time.Now().Add(keyLifetime))
+	installer := func(master [32]byte, rxSPI, txSPI uint32) error {
+		return h.UpdateVirtualNetworkSecret(vni, master, rxSPI, txSPI, time.Now().Add(keyLifetime))
 	}
 
 	tun, err := control.NewTunnel(control.TunnelConfig{

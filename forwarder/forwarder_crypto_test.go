@@ -19,6 +19,7 @@ import (
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
 	"github.com/apoxy-dev/icx/permissions"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
 
@@ -31,10 +32,11 @@ import (
 // virt interface, byte-for-byte.
 //
 // Construction (two peer handlers — the production model, since
-// UpdateVirtualNetworkKeys rejects equal rx/tx keys):
-//   - encapH mints genuinely-encrypted frames OFFLINE with VirtToPhy using
-//     txKey == abKey; the forwarder's handler h decapsulates them in place with
-//     rxKey == abKey. Both share one VNI and a route whose Src and Dst cover the
+// UpdateVirtualNetworkSecret rejects rxSPI == txSPI):
+//   - encapH mints genuinely-encrypted frames OFFLINE with VirtToPhy under the
+//     mirrored psp role, so its transmit SPI (and derived key) equals the
+//     forwarder handler h's receive SPI, and h decapsulates them in place.
+//     Both share one VNI and a route whose Src and Dst cover the
 //     inner addresses, so encap routing and decap source validation both pass
 //     (decap looks the vnet up by VNI and validates the inner source against
 //     route.Dst; it does NOT check the outer underlay source).
@@ -83,34 +85,37 @@ func TestForwarderCryptoRoundTrip(t *testing.T) {
 	prefix := netip.MustParsePrefix("10.99.0.0/24")
 	routes := []icx.Route{{Src: prefix, Dst: prefix}}
 
-	// Two handlers model the two real peers. The A->B direction key (abKey) is
-	// shared, but each peer's own rx/tx keys differ — UpdateVirtualNetworkKeys
-	// rejects equal rx/tx keys, since in the shared-epoch nonce layout the key is
-	// the only thing separating the two directions' nonce spaces.
-	var abKey, encapRx, hTx [16]byte
-	copy(abKey[:], []byte("icx-roundtrip-k!"))
-	copy(encapRx[:], []byte("icx-encap-rxkey!"))
-	copy(hTx[:], []byte("icx-decap-txkey!"))
+	// Two handlers model the two real peers: one shared master secret with
+	// mirrored psp.EpochSPIs roles, so h's receive SPI equals encapH's transmit
+	// SPI and both derive the same A->B key while the two directions stay on
+	// distinct role-partitioned SPIs.
+	var master [32]byte
+	copy(master[:], []byte("icx-roundtrip-master-secret-00!!"))
+	rxH, txH, err := psp.EpochSPIs(psp.Initiator, 1)
+	require.NoError(t, err)
+	rxE, txE, err := psp.EpochSPIs(psp.Responder, 1)
+	require.NoError(t, err)
 	expires := time.Now().Add(time.Hour)
 
-	// h: the forwarder's handler. It decapsulates inbound frames with rxKey=abKey.
+	// h: the forwarder's handler. It decapsulates inbound frames under its own
+	// receive SPI (== encapH's transmit SPI).
 	h, err := icx.NewHandler(
 		icx.WithLocalAddr(localUnderlay),
 		icx.WithVirtMAC(virtMAC),
 	)
 	require.NoError(t, err)
 	require.NoError(t, h.AddVirtualNetwork(vni, remoteUnderlay, routes))
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, abKey, hTx, expires))
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxH, txH, expires))
 
-	// encapH: an offline peer used only to mint genuinely-encrypted frames with
-	// txKey=abKey (so h can decrypt them); it is never wired to the forwarder.
+	// encapH: an offline peer used only to mint genuinely-encrypted frames under
+	// the mirrored role (so h can decrypt them); it is never wired to the forwarder.
 	encapH, err := icx.NewHandler(
 		icx.WithLocalAddr(localUnderlay),
 		icx.WithVirtMAC(virtMAC),
 	)
 	require.NoError(t, err)
 	require.NoError(t, encapH.AddVirtualNetwork(vni, remoteUnderlay, routes))
-	require.NoError(t, encapH.UpdateVirtualNetworkKeys(vni, 1, encapRx, abKey, expires))
+	require.NoError(t, encapH.UpdateVirtualNetworkSecret(vni, master, rxE, txE, expires))
 
 	// Build the forwarder with the REAL handler (not the identity pipe).
 	fwd, err := forwarder.NewForwarder(h,

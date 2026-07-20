@@ -328,14 +328,13 @@ func TestInboundOversizedDecapNoPanic(t *testing.T) {
 	hB := newPeerHandler(t, lo, 6081, lo, 6081, vni)
 
 	const spiAB, spiBA = uint32(0x0A0A0A0A), uint32(0x0B0B0B0B)
-	var keyAB, keyBA [16]byte
-	for i := range keyAB {
-		keyAB[i] = 0xAA
-		keyBA[i] = 0xBB
+	var master [32]byte
+	for i := range master {
+		master[i] = 0xAB
 	}
 	exp := time.Now().Add(time.Hour)
-	require.NoError(t, hA.UpdateVirtualNetworkSAs(vni, spiBA, spiAB, keyBA, keyAB, exp))
-	require.NoError(t, hB.UpdateVirtualNetworkSAs(vni, spiAB, spiBA, keyAB, keyBA, exp))
+	require.NoError(t, hA.UpdateVirtualNetworkSecret(vni, master, spiBA, spiAB, exp))
+	require.NoError(t, hB.UpdateVirtualNetworkSecret(vni, master, spiAB, spiBA, exp))
 
 	// 4000-byte inner packet: far above the 1280 clamp + the old inbound buffer.
 	largeInner := makeSizedInnerIPv4(t, 4000)
@@ -379,17 +378,17 @@ func TestDatapathIntegrationRoundTrip(t *testing.T) {
 	hA := newPeerHandler(t, lo, portA, lo, portB, vni)
 	hB := newPeerHandler(t, lo, portB, lo, portA, vni)
 
-	// Directional SAs: A's TX SPI/key == B's RX SPI/key and vice versa. The keys
-	// differ per direction (the production seam rejects equal rx/tx keys).
+	// Directional SAs: A's TX SPI == B's RX SPI and vice versa; both handlers
+	// derive the per-direction keys from the shared master, and the distinct SPIs
+	// keep the two directions' keys distinct (the seam rejects rxSPI == txSPI).
 	const spiAB, spiBA = uint32(0x0A0A0A0A), uint32(0x0B0B0B0B)
-	var keyAB, keyBA [16]byte
-	for i := range keyAB {
-		keyAB[i] = 0xAA
-		keyBA[i] = 0xBB
+	var master [32]byte
+	for i := range master {
+		master[i] = 0xAB
 	}
 	exp := time.Now().Add(time.Hour)
-	require.NoError(t, hA.UpdateVirtualNetworkSAs(vni, spiBA, spiAB, keyBA, keyAB, exp))
-	require.NoError(t, hB.UpdateVirtualNetworkSAs(vni, spiAB, spiBA, keyAB, keyBA, exp))
+	require.NoError(t, hA.UpdateVirtualNetworkSecret(vni, master, spiBA, spiAB, exp))
+	require.NoError(t, hB.UpdateVirtualNetworkSecret(vni, master, spiAB, spiBA, exp))
 
 	uuA, err := newUDPUnderlay(connA)
 	require.NoError(t, err)

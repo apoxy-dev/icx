@@ -40,37 +40,36 @@ func TestCanonicalInitiator(t *testing.T) {
 	require.Error(t, err)
 }
 
-// validV0SAs returns a role-partitioned, AESGCM128 DirectionalSAs with distinct
-// 16-byte keys, as NegotiateSAs would produce.
+// validV0SAs returns a role-partitioned, AESGCM128 DirectionalSAs with a fixed
+// master, as NegotiateSAs would produce.
 func validV0SAs() *DirectionalSAs {
 	iSPI, _ := MakeSPI(0, Initiator, 1)
 	rSPI, _ := MakeSPI(0, Responder, 1)
-	rx := make([]byte, 16)
-	tx := make([]byte, 16)
-	for i := range rx {
-		rx[i] = byte(i)
-		tx[i] = byte(i + 100)
+	var master [MasterKeyLen]byte
+	for i := range master {
+		master[i] = byte(i)
 	}
 	return &DirectionalSAs{
-		Tx: &SA{SPI: rSPI, Key: tx, Version: AESGCM128},
-		Rx: &SA{SPI: iSPI, Key: rx, Version: AESGCM128},
+		Master:  master,
+		RxSPI:   iSPI,
+		TxSPI:   rSPI,
+		Version: AESGCM128,
 	}
 }
 
 func TestInstallSAsRejectsNonV0(t *testing.T) {
-	tn := &Tunnel{install: func(uint32, uint32, [16]byte, [16]byte) error {
+	tn := &Tunnel{install: func([MasterKeyLen]byte, uint32, uint32) error {
 		t.Fatal("installer must not be called for a non-AES-GCM-128 SA")
 		return nil
 	}}
 	sas := validV0SAs()
-	sas.Tx.Version = AESGCM256
-	sas.Tx.Key = make([]byte, 32)
+	sas.Version = AESGCM256
 	require.Error(t, tn.installSAs(sas))
 }
 
 func TestInstallSAsSwallowsRotationRejection(t *testing.T) {
 	called := false
-	tn := &Tunnel{install: func(uint32, uint32, [16]byte, [16]byte) error {
+	tn := &Tunnel{install: func([MasterKeyLen]byte, uint32, uint32) error {
 		called = true
 		// Mimic the handler's monotonicity guard rejecting a regressed per-direction SPI.
 		return errors.New("rx SPI must be monotonically increasing")
@@ -133,33 +132,34 @@ func twoTunnels(t *testing.T, instInit, instResp SAInstaller, rekey time.Duratio
 	return initT, respT, cleanup
 }
 
-// guardInstaller is an SAInstaller that mirrors the handler's relaxed TX anti-reset
-// guard (handler.go: UpdateVirtualNetworkSAs) — it rejects only a re-install of the
-// currently-live transmit SA, i.e. the same transmit SPI AND the same key — so tests can
-// detect a spurious rejection rather than the no-op epochRecorder which accepts everything.
-// The key comparison matters: across a reconnect the allocator resets and the transmit SPI
-// can collide with the still-live one, but under a fresh key, which is safe and must be
-// accepted. Because every control-plane generation carries a fresh key, the guard should
-// never reject in normal operation, even across a reconnect that resets SPIs to a low value.
+// guardInstaller is an SAInstaller that mirrors the handler's master-scoped TX
+// nonce-safety guard (handler.go: UpdateVirtualNetworkSecret) — it rejects a transmit
+// SPI at or below the currently-live one under an UNCHANGED master — so tests can
+// detect a spurious rejection rather than the no-op epochRecorder which accepts
+// everything. The master comparison matters: across a reconnect the allocator resets
+// and the transmit SPI can collide with or regress below the still-live one, but under
+// a fresh session master, which is safe and must be accepted. Because every
+// control-plane session carries a fresh master, the guard should never reject in
+// normal operation, even across a reconnect that resets SPIs to a low value.
 type guardInstaller struct {
 	mu        sync.Mutex
-	curTx     uint32   // currently-live transmit SPI (0 = none)
-	curTxKey  [16]byte // currently-live transmit key
-	installed []uint32 // accepted receive SPIs, in order
+	curTx     uint32             // currently-live transmit SPI (0 = none)
+	curMaster [MasterKeyLen]byte // currently-live master
+	installed []uint32           // accepted receive SPIs, in order
 	rejects   int
 }
 
 func newGuardInstaller() *guardInstaller { return &guardInstaller{} }
 
-func (g *guardInstaller) install(rxSPI, txSPI uint32, _, txKey [16]byte) error {
+func (g *guardInstaller) install(master [MasterKeyLen]byte, rxSPI, txSPI uint32) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.curTx != 0 && txSPI == g.curTx && txKey == g.curTxKey {
+	if g.curTx != 0 && master == g.curMaster && txSPI <= g.curTx {
 		g.rejects++
-		return errors.New("tx SA is already live")
+		return errors.New("tx SPI must strictly increase under an unchanged master")
 	}
 	g.curTx = txSPI
-	g.curTxKey = txKey
+	g.curMaster = master
 	g.installed = append(g.installed, rxSPI)
 	return nil
 }
@@ -172,10 +172,10 @@ func (g *guardInstaller) snapshot() (installed []uint32, rejects int) {
 
 // installRec captures one per-direction SA generation for assertions: the receive SPI
 // (this peer's own data-plane epoch) and transmit SPI (the peer's receive SPI), plus
-// both keys.
+// the session master both directions derive from.
 type installRec struct {
 	rxSPI, txSPI uint32
-	rxKey, txKey [16]byte
+	master       [MasterKeyLen]byte
 }
 
 // epochRecorder is a thread-safe SAInstaller that records the per-direction generations
@@ -187,10 +187,10 @@ type epochRecorder struct {
 
 func newEpochRecorder() *epochRecorder { return &epochRecorder{} }
 
-func (r *epochRecorder) install(rxSPI, txSPI uint32, rxKey, txKey [16]byte) error {
+func (r *epochRecorder) install(master [MasterKeyLen]byte, rxSPI, txSPI uint32) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.recs = append(r.recs, installRec{rxSPI: rxSPI, txSPI: txSPI, rxKey: rxKey, txKey: txKey})
+	r.recs = append(r.recs, installRec{rxSPI: rxSPI, txSPI: txSPI, master: master})
 	return nil
 }
 
@@ -225,11 +225,11 @@ func TestTunnelBringupAndRekey(t *testing.T) {
 	require.NotEqual(t, ir[0].rxSPI, rr[0].rxSPI, "peers must allocate distinct receive SPIs")
 	require.Equal(t, ir[0].rxSPI, rr[0].txSPI, "initiator rx SPI must equal responder tx SPI")
 	require.Equal(t, ir[0].txSPI, rr[0].rxSPI, "initiator tx SPI must equal responder rx SPI")
-	// Cross-derivation: initiator TX key == responder RX key and vice versa.
-	require.Equal(t, ir[0].txKey, rr[0].rxKey, "initiator tx key != responder rx key")
-	require.Equal(t, ir[0].rxKey, rr[0].txKey, "initiator rx key != responder tx key")
-	// Within a peer, the two directions use distinct keys.
-	require.NotEqual(t, ir[0].rxKey, ir[0].txKey)
+	// Cross-derivation: both peers hold the same session master, so the matching
+	// SPIs above imply the handler-derived keys match by construction; the two
+	// directions' keys differ because the SPIs differ.
+	require.Equal(t, ir[0].master, rr[0].master, "peers must derive the same session master")
+	require.NotZero(t, ir[0].master, "session master must be non-zero")
 
 	// Run both peers and let the initiator drive a few rekeys.
 	runCh := make(chan error, 2)
@@ -283,7 +283,7 @@ func TestTunnelBringupFailsClosedOnPinMismatch(t *testing.T) {
 	require.NoError(t, err)
 	defer initConn.Close()
 
-	mustNotInstall := func(uint32, uint32, [16]byte, [16]byte) error {
+	mustNotInstall := func([MasterKeyLen]byte, uint32, uint32) error {
 		t.Fatal("keys must never be installed on a pin failure")
 		return nil
 	}
@@ -336,7 +336,7 @@ func TestTunnelCloseDuringBringupNoRace(t *testing.T) {
 	require.NoError(t, err)
 	defer peerConn.Close()
 
-	noInstall := func(uint32, uint32, [16]byte, [16]byte) error { return nil }
+	noInstall := func([MasterKeyLen]byte, uint32, uint32) error { return nil }
 	respT, err := NewTunnel(TunnelConfig{
 		Local: respID, PeerPub: peerID.PublicKey(), Conn: respConn,
 		PeerAddr: peerConn.LocalAddr(), RekeyInterval: time.Second,

@@ -27,6 +27,7 @@ import (
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
+	"github.com/apoxy-dev/icx/psp"
 )
 
 func main() {
@@ -112,21 +113,28 @@ func main() {
 		}
 		dstPrefix := netip.PrefixFrom(netip.AddrFrom4([4]byte{10, byte(i + 1), 0, 0}), 24)
 		routes := []icx.Route{{Src: srcPrefix, Dst: dstPrefix}}
-		var rxKey, txKey [16]byte
-		copy(rxKey[:], []byte("icxbench-rxkey-0!"))
-		copy(txKey[:], []byte("icxbench-txkey-0!"))
-		rxKey[15] = byte('A' + i)
-		txKey[15] = byte('A' + i)
-		// The peer/decap VTEP runs with --swap-keys so its rx key equals our tx key.
+		// Per-tunnel deterministic master secret: distinct last byte ('A'+i) keeps
+		// every tunnel's derivation space unique even though all share epoch 1 —
+		// required when N tunnels fan into one AF_XDP peer. The handler derives the
+		// per-direction keys from (master, SPI); the peer/decap VTEP runs with
+		// --swap-keys so its role mirrors ours and its rx SPI equals our tx SPI.
+		var master [32]byte
+		copy(master[:], []byte("icxbench-master-secret-000000000"))
+		master[31] = byte('A' + i)
+		role := psp.Initiator
 		if *swapKeys {
-			rxKey, txKey = txKey, rxKey
+			role = psp.Responder
+		}
+		rxSPI, txSPI, err := psp.EpochSPIs(role, 1)
+		if err != nil {
+			log.Fatalf("EpochSPIs: %v", err)
 		}
 		vni := uint(0x1000 + i)
 		if err := h.AddVirtualNetwork(vni, remote, routes); err != nil {
 			log.Fatalf("AddVirtualNetwork %d: %v", vni, err)
 		}
-		if err := h.UpdateVirtualNetworkKeys(vni, 1, rxKey, txKey, expires); err != nil {
-			log.Fatalf("UpdateVirtualNetworkKeys %d: %v", vni, err)
+		if err := h.UpdateVirtualNetworkSecret(vni, master, rxSPI, txSPI, expires); err != nil {
+			log.Fatalf("UpdateVirtualNetworkSecret %d: %v", vni, err)
 		}
 		// Bind this tunnel's port (IPv4 wildcard) so the XDP ingress filter redirects
 		// Geneve on dst port 6081+i to AF_XDP (the default filter binds only 6081). The

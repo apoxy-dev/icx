@@ -1,4 +1,4 @@
-package control
+package psp
 
 import (
 	"bytes"
@@ -86,8 +86,8 @@ func TestDeriveSAKey_PSPSpec(t *testing.T) {
 			if want := unhex(t, c.want); !bytes.Equal(got, want) {
 				t.Fatalf("SA key mismatch\n got %x\nwant %x", got, want)
 			}
-			if len(got) != c.version.keyLen() {
-				t.Fatalf("key length = %d, want %d", len(got), c.version.keyLen())
+			if len(got) != c.version.KeyLen() {
+				t.Fatalf("key length = %d, want %d", len(got), c.version.KeyLen())
 			}
 		})
 	}

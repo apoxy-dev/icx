@@ -112,24 +112,35 @@ func TestControlSessionHandshakeAndSANegotiation(t *testing.T) {
 	}
 	rSAs := r.sas
 
-	// Cross-match: what the initiator transmits with == what the responder
-	// receives with, and vice versa. This holds only if both derived the same
-	// master keys and agreed on SPIs.
-	if !bytes.Equal(iSAs.Tx.Key, rSAs.Rx.Key) {
-		t.Fatal("initiator TX key != responder RX key")
+	// Cross-match: both peers must carry the same session master, and what the
+	// initiator transmits to must be what the responder receives under, and vice
+	// versa. With a shared master and matching SPIs, the (handler-side) derived
+	// keys match by construction — deriveDirectional already asserted tx != rx on
+	// the transient derived keys.
+	if iSAs.Master != rSAs.Master {
+		t.Fatal("peers derived different session masters")
 	}
-	if !bytes.Equal(iSAs.Rx.Key, rSAs.Tx.Key) {
-		t.Fatal("initiator RX key != responder TX key")
-	}
-	// Within each peer, tx and rx must differ (no key/SPI collision).
-	if bytes.Equal(iSAs.Tx.Key, iSAs.Rx.Key) {
-		t.Fatal("initiator tx and rx keys collided")
-	}
-	if iSAs.Tx.SPI != rSAs.Rx.SPI || iSAs.Rx.SPI != rSAs.Tx.SPI {
+	if iSAs.TxSPI != rSAs.RxSPI || iSAs.RxSPI != rSAs.TxSPI {
 		t.Fatal("SPIs did not cross-match between peers")
 	}
-	if MasterKeyIndex(iSAs.Tx.SPI) != activeMasterKeyIndex {
-		t.Fatalf("tx SPI selects master key %d, want %d", MasterKeyIndex(iSAs.Tx.SPI), activeMasterKeyIndex)
+	// Within each peer, tx and rx must differ (role partition).
+	if iSAs.TxSPI == iSAs.RxSPI {
+		t.Fatal("initiator tx and rx SPIs collided")
+	}
+	// And the derivation over the cross-matched inputs is byte-identical.
+	iTx, err := DeriveSAKey(iSAs.Master[:], iSAs.TxSPI, iSAs.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rRx, err := DeriveSAKey(rSAs.Master[:], rSAs.RxSPI, rSAs.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(iTx, rRx) {
+		t.Fatal("initiator TX key != responder RX key")
+	}
+	if MasterKeyIndex(iSAs.TxSPI) != activeMasterKeyIndex {
+		t.Fatalf("tx SPI selects master key %d, want %d", MasterKeyIndex(iSAs.TxSPI), activeMasterKeyIndex)
 	}
 }
 

@@ -82,7 +82,7 @@ func baseTLSConfig(local *Identity, authorize PeerAuthorizer) (*tls.Config, erro
 		// MUST be a full ECDHE handshake so each session derives FRESH master keys: that
 		// freshness is the data plane's nonce-uniqueness foundation (the per-direction
 		// install guard accepts a reset/regressed SPI precisely because its key is fresh
-		// — see handler.UpdateVirtualNetworkSAs). A resumed session could reuse keying
+		// — see handler.UpdateVirtualNetworkSecret). A resumed session could reuse keying
 		// material and, paired with a reset SPI, repeat a (key, nonce) pair. The server
 		// also never issues tickets; newSession additionally asserts !DidResume/!0-RTT.
 		SessionTicketsDisabled: true,

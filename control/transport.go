@@ -158,7 +158,7 @@ func newSession(ctx context.Context, conn *quic.Conn, role Role) (*Session, erro
 	// Enforce a FRESH ECDHE handshake: refuse a resumed session or 0-RTT. The data
 	// plane's nonce-uniqueness guarantee rests on every session deriving fresh master
 	// keys (so a reset/regressed SPI is always paired with a fresh key — see
-	// handler.UpdateVirtualNetworkSAs). Resumption is already disabled in the TLS config
+	// handler.UpdateVirtualNetworkSecret). Resumption is already disabled in the TLS config
 	// (SessionTicketsDisabled), so this is a fail-closed backstop against a silent
 	// regression rather than an expected path.
 	if tlsState.DidResume {
@@ -233,12 +233,18 @@ func (s *Session) Context() context.Context { return s.conn.Context() }
 // done at derivation time in newSession, where its lifetime is provably local.
 func (s *Session) Close() error { return s.conn.CloseWithError(appErrNormal, "") }
 
-// DirectionalSAs is a peer's pair of simplex SAs for one session generation:
-// Tx is what we encrypt outbound with (the peer's RX SPI), Rx is what we
-// decrypt inbound with (our own RX SPI).
+// DirectionalSAs is a peer's pair of simplex SAs for one session generation,
+// expressed as derivation inputs rather than finished keys: the data-plane
+// handler derives each direction's AEAD key itself from the master key and the
+// SPI (handler.UpdateVirtualNetworkSecret), so no key material leaves the
+// control plane. TxSPI is what we encrypt outbound to (the peer's RX SPI),
+// RxSPI is what we decrypt inbound under (our own RX SPI); Master is the
+// session master key both derive from.
 type DirectionalSAs struct {
-	Tx *SA
-	Rx *SA
+	Master  [MasterKeyLen]byte
+	RxSPI   uint32
+	TxSPI   uint32
+	Version ICXVersion
 }
 
 // NegotiateSAs runs the SA-setup exchange over a fresh QUIC stream and returns
@@ -259,7 +265,7 @@ type DirectionalSAs struct {
 // (≤ MaxIncomingStreams); a surplus initiator call blocks until a matching
 // responder call or the ctx deadline.
 func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalSAs, error) {
-	if !v.valid() {
+	if !v.Valid() {
 		return nil, fmt.Errorf("control: unsupported cipher suite %d", v)
 	}
 	myRxSPI, err := s.rxAlloc.Allocate(activeMasterKeyIndex)
@@ -323,6 +329,10 @@ func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) 
 	if RoleOf(peer.RxSPI) == s.role {
 		return nil, errors.New("control: peer SPI collides with the local role partition (SPI spoofing)")
 	}
+	// Derive both keys transiently as a belt-and-suspenders check — the role
+	// partition guarantees distinct SPIs, but assert on the derived keys too. The
+	// data plane re-derives from (Master, SPI) itself; these transient copies never
+	// leave this function.
 	rx, err := s.masterKeys.DeriveSA(myRxSPI, v)
 	if err != nil {
 		return nil, fmt.Errorf("control: derive rx SA: %w", err)
@@ -334,5 +344,13 @@ func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) 
 	if bytes.Equal(tx.Key, rx.Key) {
 		return nil, errors.New("control: tx and rx SA keys collided")
 	}
-	return &DirectionalSAs{Tx: tx, Rx: rx}, nil
+	// Both SPIs select the active master-key index (validated above for the
+	// peer's, allocated at it for ours), so a single master key covers both
+	// directions. Master-key rotation must extend this to carry per-SPI masters.
+	return &DirectionalSAs{
+		Master:  s.masterKeys.keys[activeMasterKeyIndex],
+		RxSPI:   myRxSPI,
+		TxSPI:   peer.RxSPI,
+		Version: v,
+	}, nil
 }

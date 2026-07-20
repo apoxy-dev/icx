@@ -12,6 +12,7 @@ import (
 
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/control"
+	"github.com/apoxy-dev/icx/psp"
 )
 
 // This file proves the control-plane → data-plane bridge end to end under per-direction
@@ -88,16 +89,13 @@ func newPeerHandler(t *testing.T, vni uint, local, remote tcpip.Address) *icx.Ha
 }
 
 // installDirectional installs a peer's negotiated directional SAs into its handler via
-// the real guarded per-direction seam the production installer calls: rxSPI is our own
-// receive SPI, txSPI is the peer's receive SPI (what we transmit to).
+// the real guarded derivation seam the production installer calls: rxSPI is our own
+// receive SPI, txSPI is the peer's receive SPI (what we transmit to). The handler
+// derives both AEAD keys itself from the session master.
 func installDirectional(t *testing.T, h *icx.Handler, vni uint, sas *control.DirectionalSAs) {
 	t.Helper()
-	require.Len(t, sas.Rx.Key, 16)
-	require.Len(t, sas.Tx.Key, 16)
-	var rx, tx [16]byte
-	copy(rx[:], sas.Rx.Key)
-	copy(tx[:], sas.Tx.Key)
-	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, sas.Rx.SPI, sas.Tx.SPI, rx, tx, time.Now().Add(time.Hour)))
+	require.Equal(t, control.AESGCM128, sas.Version)
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, sas.Master, sas.RxSPI, sas.TxSPI, time.Now().Add(time.Hour)))
 }
 
 func TestControlPlanePerDirectionGeneveRoundTrip(t *testing.T) {
@@ -105,10 +103,11 @@ func TestControlPlanePerDirectionGeneveRoundTrip(t *testing.T) {
 
 	// Per-direction SPIs: each peer's transmit SPI is the other's receive SPI, and the
 	// two directions are distinct (role-partitioned), so each direction owns its own
-	// nonce space — there is no shared epoch.
-	require.NotEqual(t, iSAs.Rx.SPI, iSAs.Tx.SPI, "the two directions must use distinct SPIs")
-	require.Equal(t, iSAs.Tx.SPI, rSAs.Rx.SPI, "initiator tx SPI must equal responder rx SPI")
-	require.Equal(t, iSAs.Rx.SPI, rSAs.Tx.SPI, "initiator rx SPI must equal responder tx SPI")
+	// nonce space — there is no shared epoch. Both peers hold the same session master.
+	require.NotEqual(t, iSAs.RxSPI, iSAs.TxSPI, "the two directions must use distinct SPIs")
+	require.Equal(t, iSAs.TxSPI, rSAs.RxSPI, "initiator tx SPI must equal responder rx SPI")
+	require.Equal(t, iSAs.RxSPI, rSAs.TxSPI, "initiator rx SPI must equal responder tx SPI")
+	require.Equal(t, iSAs.Master, rSAs.Master, "both peers derive from the same session master")
 
 	const vni = 0x424344
 	addrA := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4())
@@ -164,11 +163,13 @@ func TestInstallResetsTxCounterPerEpoch(t *testing.T) {
 	addrB := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4())
 	h := newPeerHandler(t, vni, addrA, addrB)
 
-	var rx, tx [16]byte
-	for i := range rx {
-		rx[i], tx[i] = byte(i), byte(255-i)
+	var master [32]byte
+	for i := range master {
+		master[i] = byte(i)
 	}
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 100, rx, tx, time.Now().Add(time.Hour)))
+	rxSPI, txSPI, err := psp.EpochSPIs(psp.Initiator, 100)
+	require.NoError(t, err)
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxSPI, txSPI, time.Now().Add(time.Hour)))
 	c, ok := h.TxCounterForTest(vni)
 	require.True(t, ok)
 	require.Zero(t, c, "fresh install starts at counter 0")
@@ -181,13 +182,12 @@ func TestInstallResetsTxCounterPerEpoch(t *testing.T) {
 	c, _ = h.TxCounterForTest(vni)
 	require.Equal(t, uint64(1), c, "first frame uses counter 1")
 
-	// Install a NEW, higher epoch (as a rekey or a seeded post-restart generation
-	// would). The counter MUST reset to zero — no carryover.
-	var rx2, tx2 [16]byte
-	for i := range rx2 {
-		rx2[i], tx2[i] = byte(i+1), byte(254-i)
-	}
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 200, rx2, tx2, time.Now().Add(time.Hour)))
+	// Install a NEW, higher epoch under the SAME master (an in-connection rekey).
+	// The advanced SPI is a fresh KDF context — a fresh key — and the counter MUST
+	// reset to zero with no carryover.
+	rxSPI2, txSPI2, err := psp.EpochSPIs(psp.Initiator, 200)
+	require.NoError(t, err)
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, master, rxSPI2, txSPI2, time.Now().Add(time.Hour)))
 	c, _ = h.TxCounterForTest(vni)
 	require.Zero(t, c, "a new epoch must start a fresh zero counter (no carryover → no nonce reuse)")
 
@@ -198,15 +198,16 @@ func TestInstallResetsTxCounterPerEpoch(t *testing.T) {
 	require.Equal(t, uint64(1), c, "first frame under the new epoch counts from 1 again")
 }
 
-// TestSharedEpochCollapseMismatchDropsTraffic shows WHY per-direction SPIs are needed:
-// if the two directions are collapsed onto a single epoch but each peer picks its OWN
-// receive SPI for it (a naive shared-epoch bridge), the epochs disagree — they are
-// role-partitioned — so the sender transmits under an SPI the receiver never installed
-// and every frame misses the receiver's rxCiphers. The production path avoids this by
-// installing the genuine per-direction SPIs (TestControlPlanePerDirectionGeneveRoundTrip).
-func TestSharedEpochCollapseMismatchDropsTraffic(t *testing.T) {
+// TestSameRoleMismatchDropsTraffic shows WHY the SPI role partition matters: a
+// shared-epoch collapse onto one SPI for both directions is now structurally rejected
+// (rxSPI == txSPI fails the install guard), and the remaining misuse — both peers
+// deriving with the SAME role instead of mirrored ones — makes the sender transmit
+// under an SPI the receiver never installed, so every frame misses the receiver's
+// rxCiphers. The production paths avoid this by negotiating per-direction SPIs
+// (TestControlPlanePerDirectionGeneveRoundTrip) or mirroring roles via psp.EpochSPIs.
+func TestSameRoleMismatchDropsTraffic(t *testing.T) {
 	iSAs, rSAs := negotiateLoopback(t)
-	require.NotEqual(t, iSAs.Rx.SPI, rSAs.Rx.SPI, "the two receive SPIs are role-partitioned and distinct")
+	require.NotEqual(t, iSAs.RxSPI, rSAs.RxSPI, "the two receive SPIs are role-partitioned and distinct")
 
 	const vni = 0x515253
 	addrA := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4())
@@ -214,16 +215,18 @@ func TestSharedEpochCollapseMismatchDropsTraffic(t *testing.T) {
 	hI := newPeerHandler(t, vni, addrA, addrB)
 	hR := newPeerHandler(t, vni, addrB, addrA)
 
-	// Collapse both directions onto each peer's OWN receive SPI via the single-epoch
-	// UpdateVirtualNetworkKeys seam. hI then transmits under iSAs.Rx.SPI, which hR
-	// (installed under rSAs.Rx.SPI) does not have.
-	var iRx, iTx, rRx, rTx [16]byte
-	copy(iRx[:], iSAs.Rx.Key)
-	copy(iTx[:], iSAs.Tx.Key)
-	copy(rRx[:], rSAs.Rx.Key)
-	copy(rTx[:], rSAs.Tx.Key)
-	require.NoError(t, hI.UpdateVirtualNetworkKeys(vni, iSAs.Rx.SPI, iRx, iTx, time.Now().Add(time.Hour)))
-	require.NoError(t, hR.UpdateVirtualNetworkKeys(vni, rSAs.Rx.SPI, rRx, rTx, time.Now().Add(time.Hour)))
+	// The single-SPI collapse cannot even be installed: equal SPIs would derive equal
+	// keys for both directions, so the guard rejects the shape outright.
+	require.Error(t, hI.UpdateVirtualNetworkSecret(vni, iSAs.Master, iSAs.RxSPI, iSAs.RxSPI, time.Now().Add(time.Hour)),
+		"rxSPI == txSPI must be rejected")
+
+	// Both peers derive with the same role (a misconfigured symmetric bridge): each
+	// installs its RX under the Initiator-role SPI while transmitting to the
+	// Responder-role SPI, which neither ever installed for receive.
+	rxI, txI, err := psp.EpochSPIs(psp.Initiator, 7)
+	require.NoError(t, err)
+	require.NoError(t, hI.UpdateVirtualNetworkSecret(vni, iSAs.Master, rxI, txI, time.Now().Add(time.Hour)))
+	require.NoError(t, hR.UpdateVirtualNetworkSecret(vni, rSAs.Master, rxI, txI, time.Now().Add(time.Hour)))
 
 	ip := makeIPv4UDPPacket()
 	phy := make([]byte, 1500)
@@ -232,7 +235,7 @@ func TestSharedEpochCollapseMismatchDropsTraffic(t *testing.T) {
 	require.NotZero(t, n)
 	require.False(t, loop)
 	m := hR.PhyToVirt(phy[:n], out)
-	require.Zero(t, m, "a shared-epoch collapse onto disagreeing epochs misses the receiver's rxCiphers and drops")
+	require.Zero(t, m, "same-role derivation transmits under an SPI the receiver never installed and drops")
 
 	vnR, ok := hR.GetVirtualNetwork(vni)
 	require.True(t, ok)

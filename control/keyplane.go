@@ -72,8 +72,8 @@ var ErrGrantRejected = errors.New("control: key request rejected by responder")
 // control plane — the responder's KeyGranter gives it meaning.
 type keyRequest struct {
 	Version ICXVersion
-	RxSPI      uint32
-	Addr       netip.Addr
+	RxSPI   uint32
+	Addr    netip.Addr
 }
 
 const keyRequestLen = 1 + 1 + 1 + 4 + 16 // protoVer + type + pspVer + rxSPI + addr
@@ -101,7 +101,7 @@ func parseKeyRequest(b []byte) (keyRequest, error) {
 	}
 	return keyRequest{
 		Version: ICXVersion(b[2]),
-		RxSPI:      binary.BigEndian.Uint32(b[3:7]),
+		RxSPI:   binary.BigEndian.Uint32(b[3:7]),
 		// Unmap so a native IPv4 overlay address round-trips to itself rather
 		// than to its ::ffff: 4-in-6 form, which compares unequal and would make
 		// the granter see a different address than the initiator announced.
@@ -112,10 +112,10 @@ func parseKeyRequest(b []byte) (keyRequest, error) {
 // keyGrant is the responder half: its own RX SPI and the allocated VNI, or a
 // non-OK status with both fields zero.
 type keyGrant struct {
-	Status     grantStatus
+	Status  grantStatus
 	Version ICXVersion
-	RxSPI      uint32
-	VNI        uint32
+	RxSPI   uint32
+	VNI     uint32
 }
 
 const keyGrantLen = 1 + 1 + 1 + 1 + 4 + 4 // protoVer + type + status + pspVer + rxSPI + vni
@@ -142,10 +142,10 @@ func parseKeyGrant(b []byte) (keyGrant, error) {
 		return keyGrant{}, fmt.Errorf("control: expected key grant, got message type %d", b[1])
 	}
 	return keyGrant{
-		Status:     grantStatus(b[2]),
+		Status:  grantStatus(b[2]),
 		Version: ICXVersion(b[3]),
-		RxSPI:      binary.BigEndian.Uint32(b[4:8]),
-		VNI:        binary.BigEndian.Uint32(b[8:12]),
+		RxSPI:   binary.BigEndian.Uint32(b[4:8]),
+		VNI:     binary.BigEndian.Uint32(b[8:12]),
 	}, nil
 }
 
@@ -220,7 +220,7 @@ func (s *Session) RequestKeys(ctx context.Context, v ICXVersion, addr netip.Addr
 	if s.role != Initiator {
 		return nil, errors.New("control: RequestKeys requires the initiator role")
 	}
-	if !v.valid() {
+	if !v.Valid() {
 		return nil, fmt.Errorf("control: unsupported PSP version %d", v)
 	}
 	if !addr.IsValid() {
@@ -343,8 +343,9 @@ func (s *Session) roundTrip(ctx context.Context, payload []byte) ([]byte, error)
 }
 
 // KeyGranter is the responder's policy seam. Grant must atomically allocate a
-// VNI for addr and install the responder-side SAs (sas.Rx decrypts traffic
-// arriving FROM the peer's network, sas.Tx encrypts traffic sent back TO it)
+// VNI for addr and install the responder-side SAs (sas.RxSPI decrypts traffic
+// arriving FROM the peer's network, sas.TxSPI encrypts traffic sent back TO it;
+// the handler derives both keys from sas.Master)
 // before returning; a returned error rejects the request and installs
 // nothing. Release must uninstall the VNI's SAs and start its quarantine, and
 // should be idempotent — an explicit release and the session-teardown sweep can
@@ -449,7 +450,7 @@ func (s *Session) handleKeyRequest(stream *quic.Stream, frame []byte, peerPub *e
 		reject(grantRejected)
 		return
 	}
-	if !req.Version.valid() || !req.Addr.IsValid() {
+	if !req.Version.Valid() || !req.Addr.IsValid() {
 		reject(grantRejected)
 		return
 	}

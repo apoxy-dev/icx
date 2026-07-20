@@ -13,6 +13,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 
 	"github.com/apoxy-dev/icx"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/udp"
 )
 
@@ -308,10 +309,15 @@ func TestKeyRotation(t *testing.T) {
 	require.Equal(t, ip, out[:m])
 }
 
-// TestUpdateVirtualNetworkKeysGuards exercises the two fail-closed guards on the
-// production key-install seam: the epoch (SPI) must strictly increase, and the
-// rx/tx keys must differ.
-func TestUpdateVirtualNetworkKeysGuards(t *testing.T) {
+// TestUpdateVirtualNetworkSecretGuards exercises the fail-closed guards on the derived-key
+// install seam. Reserved SPIs (low 31 bits zero) and rxSPI == txSPI (which would derive
+// equal keys for both directions) are always rejected. The TX nonce-safety guard is
+// scoped by master secret: under an UNCHANGED master the txSPI must strictly increase
+// (re-installing at or below the live SPI would reset the from-zero counter into an
+// already-used (key, nonce) space), while a DIFFERENT master accepts any SPI — a fresh
+// master is a fresh derivation space, which is exactly the transient-reconnect case
+// (the peer's allocator reset to low SPI values under a fresh session).
+func TestUpdateVirtualNetworkSecretGuards(t *testing.T) {
 	localAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()), Port: 1234}
 	peerAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()), Port: 4321}
 
@@ -322,96 +328,113 @@ func TestUpdateVirtualNetworkKeysGuards(t *testing.T) {
 	prefix := netip.MustParsePrefix("192.168.1.0/24")
 	require.NoError(t, h.AddVirtualNetwork(vni, peerAddr, []icx.Route{{Src: prefix, Dst: prefix}}))
 
-	var k1, k2 [16]byte
-	copy(k1[:], []byte("aaaaaaaaaaaaaaaa"))
-	copy(k2[:], []byte("bbbbbbbbbbbbbbbb"))
+	var mA, mB [32]byte
+	copy(mA[:], []byte("master-secret-A-aaaaaaaaaaaaaaaa"))
+	copy(mB[:], []byte("master-secret-B-bbbbbbbbbbbbbbbb"))
 	exp := time.Now().Add(time.Hour)
 
-	// Equal rx/tx keys are rejected even on the first install.
-	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k1, exp),
-		"equal rx/tx keys must be rejected")
+	// Reserved SPIs (low 31 bits zero) are rejected in either direction — including
+	// the master-key-selector MSB alone.
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 0, 20, exp), "rx SPI 0 must be rejected")
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 10, 0, exp), "tx SPI 0 must be rejected")
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 0x80000000, 20, exp),
+		"an SPI with only the MSB set is still reserved (low 31 bits zero)")
 
-	// epoch 0 (reserved SPI) is rejected.
-	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 0, k1, k2, exp),
-		"epoch 0 (reserved SPI) must be rejected")
+	// Equal SPIs are rejected: both directions would derive the same key.
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 20, 20, exp),
+		"rxSPI == txSPI must be rejected")
 
-	// Distinct keys with a fresh, non-zero epoch succeed.
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 1, k1, k2, exp))
+	// First install with distinct per-direction SPIs succeeds. Live tx SPI is now 20.
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, mA, 10, 20, exp))
 
-	// Reinstalling the same epoch is rejected (must strictly increase).
-	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 1, k2, k1, exp),
-		"same epoch must be rejected (monotonicity)")
+	// Under the UNCHANGED master, a txSPI at or below the live one is rejected —
+	// including the identical re-install, regardless of the rx side.
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 10, 20, exp),
+		"re-installing the identical live tx SA must be rejected")
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 99, 20, exp),
+		"same master + same tx SPI is unsafe no matter the rx SPI")
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 3, 5, exp),
+		"same master + lower tx SPI must be rejected (monotonicity)")
 
-	// A higher epoch with distinct keys succeeds.
-	require.NoError(t, h.UpdateVirtualNetworkKeys(vni, 3, k2, k1, exp))
+	// Under the same master a strictly higher txSPI succeeds; the rx SPI may repeat
+	// (the receive side never emits a nonce, so there is no rx monotonicity guard).
+	// Live tx SPI is now 21.
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, mA, 10, 21, exp),
+		"same master + higher tx SPI with a reused rx SPI is accepted")
 
-	// A non-zero epoch lower than the current one is rejected (monotonicity).
-	require.Error(t, h.UpdateVirtualNetworkKeys(vni, 2, k1, k2, exp),
-		"lower epoch must be rejected (monotonicity)")
+	// A DIFFERENT master accepts regressed SPIs — reconnect recovery: the fresh
+	// master makes the low SPIs a fresh derivation space.
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, mB, 3, 5, exp),
+		"a fresh master accepts regressed SPIs (reconnect recovery)")
+
+	// And switching BACK to a previously-used master is treated as changed again —
+	// the guard compares fingerprints, not history. This mirrors the control plane,
+	// where a master is never resurrected; the SPI just has to differ from the live
+	// generation's constraint set.
+	require.NoError(t, h.UpdateVirtualNetworkSecret(vni, mA, 10, 21, exp),
+		"a master change resets the monotonicity scope")
 }
 
-// TestUpdateVirtualNetworkSAsGuards exercises the control-plane install seam directly.
-// Because every control-plane generation carries a FRESH per-session key, this path does
-// NOT enforce SPI monotonicity: a reconnect resets the allocator to a low SPI and that
-// reset SPI must be re-accepted under its fresh key. The only fail-closed guards are
-// non-zero SPIs, distinct rx/tx keys, and a TX anti-reset check that refuses to re-install
-// the CURRENTLY-live transmit SA — same SPI AND same key (the one in-process action that
-// would reset a live counter under an unchanged key). A colliding SPI under a FRESH key,
-// which is exactly the transient-reconnect case, is accepted.
-func TestUpdateVirtualNetworkSAsGuards(t *testing.T) {
-	localAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()), Port: 1234}
-	peerAddr := &tcpip.FullAddress{Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()), Port: 4321}
+// TestDerivedKeysInterop proves two handlers sharing a master secret with mirrored
+// psp.EpochSPIs roles derive matching per-direction keys — Geneve frames round-trip in
+// both directions — and pins the handler's internal derivation to the PSP spec KDF by
+// decrypting its output with a raw key derived via psp.DeriveSAKey in the test.
+func TestDerivedKeysInterop(t *testing.T) {
+	const vni = 0x7777
+	addrA := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4())
+	addrB := tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4())
+	hA := newPeerHandler(t, vni, addrA, addrB)
+	hB := newPeerHandler(t, vni, addrB, addrA)
 
-	h, err := icx.NewHandler(icx.WithLocalAddr(localAddr), icx.WithLayer3VirtFrames())
-	require.NoError(t, err)
-
-	const vni = 0x9a9a
-	prefix := netip.MustParsePrefix("192.168.1.0/24")
-	require.NoError(t, h.AddVirtualNetwork(vni, peerAddr, []icx.Route{{Src: prefix, Dst: prefix}}))
-
-	var k1, k2, k3, k4 [16]byte
-	copy(k1[:], []byte("aaaaaaaaaaaaaaaa"))
-	copy(k2[:], []byte("bbbbbbbbbbbbbbbb"))
-	copy(k3[:], []byte("cccccccccccccccc"))
-	copy(k4[:], []byte("dddddddddddddddd"))
+	var master [32]byte
+	copy(master[:], []byte("interop-master-secret-0123456789"))
 	exp := time.Now().Add(time.Hour)
 
-	// Either direction's SPI being zero (reserved) is rejected.
-	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 0, 20, k1, k2, exp), "rx SPI 0 must be rejected")
-	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 10, 0, k1, k2, exp), "tx SPI 0 must be rejected")
+	rxA, txA, err := psp.EpochSPIs(psp.Initiator, 42)
+	require.NoError(t, err)
+	rxB, txB, err := psp.EpochSPIs(psp.Responder, 42)
+	require.NoError(t, err)
+	require.Equal(t, txA, rxB, "mirrored roles: A transmits to B's receive SPI")
+	require.Equal(t, rxA, txB, "mirrored roles: B transmits to A's receive SPI")
 
-	// Equal rx/tx keys are rejected even on the first install.
-	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k1, k1, exp), "equal rx/tx keys must be rejected")
+	require.NoError(t, hA.UpdateVirtualNetworkSecret(vni, master, rxA, txA, exp))
+	require.NoError(t, hB.UpdateVirtualNetworkSecret(vni, master, rxB, txB, exp))
 
-	// First install with distinct per-direction SPIs and distinct keys succeeds.
-	// Live transmit SA is now (SPI 20, key k2).
-	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k1, k2, exp))
+	ip := makeIPv4UDPPacket()
+	phy := make([]byte, 1500)
+	out := make([]byte, 1500)
 
-	// Re-installing the IDENTICAL live transmit SA (same SPI AND same key) is rejected —
-	// that is the one action that would reset a live counter under its own key. The rx side
-	// is irrelevant to this guard.
-	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k1, k2, exp),
-		"re-installing the identical live tx SA must be rejected")
-	require.Error(t, h.UpdateVirtualNetworkSAs(vni, 99, 20, k3, k2, exp),
-		"the live tx SA is keyed by (SPI, key); a different rx SPI does not make it safe")
+	// A -> B and B -> A round-trip through two independent handler derivations.
+	n, loop := hA.VirtToPhy(ip, phy)
+	require.NotZero(t, n)
+	require.False(t, loop)
+	m := hB.PhyToVirt(phy[:n], out)
+	require.NotZero(t, m, "B must decrypt A's traffic from the shared master")
+	require.Equal(t, ip, out[:m])
 
-	// The SAME transmit SPI under a FRESH key is accepted — this is the transient-reconnect
-	// case (the allocator reset to a colliding SPI value, but the master key is fresh, so the
-	// from-zero counter is a fresh nonce space). Live tx SA is now (SPI 20, key k4).
-	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 10, 20, k3, k4, exp),
-		"a colliding tx SPI under a fresh key is accepted (reconnect recovery)")
+	n, loop = hB.VirtToPhy(ip, phy)
+	require.NotZero(t, n)
+	require.False(t, loop)
+	m = hA.PhyToVirt(phy[:n], out)
+	require.NotZero(t, m, "A must decrypt B's traffic from the shared master")
+	require.Equal(t, ip, out[:m])
 
-	// A reused (non-increasing) RX SPI is accepted — the receive side never emits a nonce,
-	// so a repeated receive SPI under a fresh key is harmless. Here rx stays at 10 while tx
-	// advances to 21; live tx SA is now (21, k2).
-	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 10, 21, k1, k2, exp),
-		"a reused rx SPI is accepted (no rx monotonicity guard)")
+	// Spec conformance: a THIRD handler installed with raw keys derived in the test
+	// via psp.DeriveSAKey must decrypt hA's output byte-for-byte — the handler's
+	// internal derivation IS the PSP KDF, not merely self-consistent.
+	hC := newPeerHandler(t, vni, addrB, addrA)
+	keyAtoB, err := psp.DeriveSAKey(master[:], txA, psp.AESGCM128)
+	require.NoError(t, err)
+	var raw [16]byte
+	copy(raw[:], keyAtoB)
+	require.NoError(t, hC.InstallKeysForTest(vni, txA, raw, raw, exp))
 
-	// A LOWER transmit SPI is accepted — it can only arrive from a fresh session whose key
-	// is fresh, so the reset counter is a fresh nonce space. This models a peer reconnect
-	// that reset its allocator: rx and tx both drop back to low values. Live tx SA is now (5, k4).
-	require.NoError(t, h.UpdateVirtualNetworkSAs(vni, 3, 5, k3, k4, exp),
-		"a lower tx SPI under a fresh key is accepted (reconnect recovery)")
+	n, loop = hA.VirtToPhy(ip, phy)
+	require.NotZero(t, n)
+	require.False(t, loop)
+	m = hC.PhyToVirt(phy[:n], out)
+	require.NotZero(t, m, "a raw psp.DeriveSAKey key must decrypt the handler's derived-key output")
+	require.Equal(t, ip, out[:m])
 }
 
 // TestRXRejectsSPINonceMismatch proves the RX side rejects a frame whose nonce

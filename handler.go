@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"github.com/apoxy-dev/icx/geneve"
 	"github.com/apoxy-dev/icx/ndproxy"
 	"github.com/apoxy-dev/icx/proxyarp"
+	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/replay"
 	"github.com/apoxy-dev/icx/udp"
 )
@@ -148,11 +150,14 @@ type transmitCipher struct {
 	// mirroring the receiveCipher.expiresAt enforcement, so a node whose control plane
 	// stops rekeying stops emitting under the stale key instead of sealing forever.
 	expiresAt time.Time
-	// key is the transmit key, retained so the TX anti-reset guard can distinguish a
-	// genuine double-install of the live SA (same SPI AND same key) from a fresh-session
-	// install that merely reused the SPI value under a new key (see UpdateVirtualNetworkSAs).
-	key     [16]byte
-	counter atomic.Uint64
+	// masterFP fingerprints (SHA-256) the master secret this SA's key was derived
+	// from, retained so the TX nonce-safety guard can scope its SPI-monotonicity
+	// check to installs under an UNCHANGED master: a fresh master is a fresh
+	// derivation space, so any SPI is safe there, while a reused master must
+	// strictly advance the SPI (see UpdateVirtualNetworkSecret). Raw-key test
+	// installs pass the zero fingerprint, which a derived install never produces.
+	masterFP [32]byte
+	counter  atomic.Uint64
 }
 
 // The state associated with each virtual network.
@@ -659,9 +664,14 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 	return nil
 }
 
-// UpdateVirtualNetworkSAs installs/rotates a virtual network's pair of simplex
-// security associations (PSP model). It must be called at least once every 24
-// hours or after replay.RekeyAfterMessages messages.
+// UpdateVirtualNetworkSecret installs/rotates a virtual network's pair of simplex
+// security associations (PSP model). The handler derives each direction's AES-GCM-128
+// key itself — data_key = KDF(master, SPI) via the PSP SP 800-108/AES-CMAC KDF
+// (psp.DeriveSAKey) — so callers hand it a 32-byte master secret and two SPIs, never
+// raw AEAD keys. Because the SPI is a KDF input, advancing it under an unchanged
+// master yields a cryptographically fresh key, which is what makes the
+// nonce-uniqueness invariant — no (key, nonce=SPI‖counter) pair ever repeats —
+// structural rather than a caller obligation.
 //
 // rxSPI and txSPI are the per-direction 32-bit SPIs that select the receive and
 // transmit SAs. Each is carried in the Geneve key-epoch option and bound into the
@@ -672,117 +682,90 @@ func (h *Handler) UpdateVirtualNetworkRoutes(vni uint, allowedRoutes []Route) er
 //   - txSPI is the PEER's receive SPI — the one we encrypt to. We stamp it into the
 //     key-epoch option and nonce[:4] of every outbound frame.
 //
-// The two SPIs are distinct (the control plane partitions the SPI space by role,
-// see control/sa.go), so each direction has its own nonce space.
+// The two SPIs must be distinct: equal SPIs under one master derive equal keys for
+// the two directions. The QUIC control plane partitions the SPI space by role
+// (psp.MakeSPI); symmetric-epoch callers get mirrored role-partitioned pairs from
+// psp.EpochSPIs.
 //
-// This entry point is for the CONTROL PLANE, where every SA generation carries a
-// FRESH per-session key (each QUIC reconnect is a fresh ECDHE handshake — no 0-RTT,
-// no session resumption, enforced in control/transport.go). That freshness is what
-// guarantees the nonce-uniqueness invariant — no (key, nonce=SPI‖counter) pair ever
-// repeats — across rekeys, reconnects and restarts:
-//   - within a session the receive-SPI allocator is monotonic, so a given SPI value
-//     is handed out once and its reset-to-zero counter is always a fresh nonce space;
-//   - across sessions the master keys are fresh, so even a reused SPI value derives a
-//     different key. SPIs may therefore reset to 1 on a reconnect and be re-accepted
-//     here at a LOWER value than before — which is exactly what makes a one-sided
-//     restart recover seamlessly with no persisted state.
+// Nonce-uniqueness rests on two independent freshness sources, either of which
+// suffices per install:
+//   - a FRESH master secret (the control plane: every QUIC session is a fresh ECDHE
+//     handshake — no 0-RTT, no resumption, enforced in control/transport.go; the
+//     relay path: a fresh random master per connection). Any SPI is then safe, even
+//     one that collides with or regresses below the live SA's — its from-zero
+//     counter pairs with a key that has never sealed a packet. This is what makes a
+//     one-sided restart recover seamlessly with no persisted state.
+//   - a strictly ADVANCED txSPI under a reused master (rotation within a
+//     connection): a new KDF context is a fresh key.
 //
-// Three fail-closed guards apply: non-zero SPIs, distinct rx/tx keys, and a TX
-// anti-reset check that rejects re-installing the CURRENTLY-live transmit SA — same SPI
-// AND same key (the only in-process action that would reset a live counter under an
-// unchanged key — a defensive backstop against a double-install/retry). A txSPI that
-// merely reuses the live SPI value under a FRESH key (the transient-reconnect case) is
-// accepted, as is any lower-or-higher txSPI; safety rests on the fresh-key guarantee
-// above, not on monotonicity.
+// The guards fail closed on everything else: reserved SPIs (low 31 bits zero, per
+// the PSP spec and control/sa.go), rxSPI == txSPI, and a TX nonce-safety check that
+// rejects a txSPI at or below the live SA's when the master is UNCHANGED (same
+// SHA-256 fingerprint) — the only in-process action that would reset a live counter
+// into an already-used (key, nonce) space. There is deliberately no RX monotonicity
+// guard — the receive side never emits a nonce, so a reused receive SPI is harmless
+// (its per-SA replay filter is rebuilt with the fresh key); rxEpoch is tracked only
+// to grace-clamp the previous receive cipher (see installKeys).
+//
 // Callers must serialize installs per VNI; the guard→install sequence is not
-// internally locked (the control plane is single-threaded per Tunnel). Manually-keyed
-// SAs that lack per-session key freshness should use the strictly-guarded single-epoch
-// UpdateVirtualNetworkKeys seam instead.
-func (h *Handler) UpdateVirtualNetworkSAs(vni uint, rxSPI, txSPI uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
+// internally locked (the control plane is single-threaded per Tunnel).
+func (h *Handler) UpdateVirtualNetworkSecret(vni uint, master [32]byte, rxSPI, txSPI uint32, expiresAt time.Time) error {
 	value, ok := h.networkByID.Load(vni)
 	if !ok {
 		return fmt.Errorf("VNI %d not found", vni)
 	}
 	vnet := value.(*VirtualNetwork)
 
-	// Reserved-SPI guard: SPI 0 is reserved. Rejecting it keeps the data plane's
-	// accepted SPI space aligned with the control plane, which never emits an SPI
-	// whose low 31 bits are zero (control/sa.go), and refuses to write the all-zero
+	// Reserved-SPI guard: an SPI whose low 31 bits are zero is reserved (PSP spec;
+	// control/sa.go never allocates one). Rejecting it also refuses the all-zero
 	// nonce prefix that predated the SPI binding.
-	if rxSPI == 0 || txSPI == 0 {
-		return errors.New("rx and tx SPIs must be non-zero")
+	if psp.ReservedSPI(rxSPI) || psp.ReservedSPI(txSPI) {
+		return errors.New("rx and tx SPIs must have non-zero low 31 bits (reserved)")
 	}
 
-	// TX anti-reset guard: reject re-installing the SA that is currently live for
-	// transmit — same SPI AND same key. That pair is the only in-process action that would
-	// reset the TX counter to zero under a key already used at that SPI (a GCM nonce-reuse
-	// hazard): a defensive backstop against an accidental double-install/retry of the
-	// identical generation. The key comparison is load-bearing, not cosmetic: on a transient
-	// reconnect the receive-SPI allocator resets to a low value, so the new transmit SPI can
-	// COLLIDE with the still-live one — but it arrives under a FRESH master key (every session
-	// is a fresh ECDHE handshake; resumption and 0-RTT are disabled and asserted in
-	// control/transport.go), so its from-zero counter is a fresh nonce space and the install
-	// is safe. Comparing the SPI alone would spuriously reject that legitimate recovery. A
-	// different SPI is likewise always accepted. There is deliberately no RX monotonicity
-	// guard — the receive side never emits a nonce, so a reused receive SPI is harmless (its
-	// per-SA replay filter is rebuilt with the fresh key); rxEpoch is tracked only to
-	// grace-clamp the previous receive cipher (see installKeys).
-	if cur := vnet.txCipher.Load(); cur != nil && txSPI == cur.epoch && txKey == cur.key {
-		return fmt.Errorf("tx SA (SPI %d) is already live; refusing to reset its counter", txSPI)
+	// Distinct-SPI guard: with both keys derived from the same master, rxSPI == txSPI
+	// is the one input shape that would give the two directions an identical key AND
+	// an identical nonce space. Role-partitioned SPIs (psp.MakeSPI/EpochSPIs) never
+	// produce it; reject it outright.
+	if rxSPI == txSPI {
+		return errors.New("rx and tx SPIs must differ: each direction requires its own derivation")
 	}
 
-	// Distinct-key guard. Under per-direction SPIs the role bit already separates the
-	// two directions' nonce spaces, so this is belt-and-suspenders. Real peers always
-	// derive distinct per-direction keys (control.DeriveSA over role-partitioned SPIs),
-	// so this never rejects a legitimate install.
-	if rxKey == txKey {
-		return errors.New("rx and tx keys must differ: each direction requires its own key")
+	// TX nonce-safety guard, scoped by master fingerprint. Under an UNCHANGED master
+	// (same SHA-256 fingerprint as the live SA's) the txSPI must strictly advance:
+	// re-installing at or below the live SPI would reset the from-zero counter into a
+	// (key, nonce) space that key has already emitted — the GCM nonce-reuse hazard.
+	// Under a DIFFERENT master any txSPI is accepted: on a transient reconnect the
+	// peer's SPI allocator resets to a low value, so the new transmit SPI can collide
+	// with or regress below the still-live one — but it arrives under a fresh master,
+	// so its derived key has never sealed a packet and the install is safe. Comparing
+	// the SPI alone would spuriously reject that legitimate recovery.
+	masterFP := sha256.Sum256(master[:])
+	if cur := vnet.txCipher.Load(); cur != nil && cur.masterFP == masterFP && txSPI <= cur.epoch {
+		return fmt.Errorf("tx SPI must strictly increase under an unchanged master secret: new %d <= current %d", txSPI, cur.epoch)
 	}
 
-	return h.installKeys(vnet, rxSPI, txSPI, rxKey, txKey, expiresAt)
-}
+	rxKeyBytes, err := psp.DeriveSAKey(master[:], rxSPI, psp.AESGCM128)
+	if err != nil {
+		return fmt.Errorf("derive rx key: %w", err)
+	}
+	txKeyBytes, err := psp.DeriveSAKey(master[:], txSPI, psp.AESGCM128)
+	if err != nil {
+		return fmt.Errorf("derive tx key: %w", err)
+	}
+	var rxKey, txKey [16]byte
+	copy(rxKey[:], rxKeyBytes)
+	copy(txKey[:], txKeyBytes)
 
-// UpdateVirtualNetworkKeys installs a single epoch (SPI) for BOTH simplex directions,
-// separated only by the distinct rx/tx keys. It is the simple manual-keying seam — used
-// by tests and by embedders that drive their own keying rather than the QUIC control
-// plane (which installs genuine per-direction SAs via UpdateVirtualNetworkSAs).
-//
-// It enforces a STRICT monotonicity guard: the epoch must strictly increase within the
-// process. That stops a caller from reinstalling an older-or-equal epoch with a reused
-// key, which would reset the GCM counter under an already-used (epoch, key) and repeat a
-// nonce. The guard cannot see across process restarts, so a caller that supplies a key
-// which SURVIVES restarts (e.g. one read from disk) MUST advance the epoch past the last
-// value used in any prior run — otherwise the from-zero counter reuses nonces under the
-// persisted key. The control plane sidesteps this entirely by deriving a fresh key per
-// session; manual callers own the invariant.
-//
-// Callers must serialize installs per VNI.
-func (h *Handler) UpdateVirtualNetworkKeys(vni uint, epoch uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
-	value, ok := h.networkByID.Load(vni)
-	if !ok {
-		return fmt.Errorf("VNI %d not found", vni)
-	}
-	vnet := value.(*VirtualNetwork)
-
-	if epoch == 0 {
-		return errors.New("epoch (SPI) must be non-zero")
-	}
-	// Strict monotonicity: a manual-keyed caller has no per-session key freshness to fall
-	// back on, so the epoch must strictly increase or a reset counter could reuse a nonce.
-	if cur := vnet.txCipher.Load(); cur != nil && epoch <= cur.epoch {
-		return fmt.Errorf("epoch must be monotonically increasing: new %d <= current %d", epoch, cur.epoch)
-	}
-	if rxKey == txKey {
-		return errors.New("rx and tx keys must differ: each direction requires its own key")
-	}
-
-	return h.installKeys(vnet, epoch, epoch, rxKey, txKey, expiresAt)
+	return h.installKeys(vnet, rxSPI, txSPI, rxKey, txKey, masterFP, expiresAt)
 }
 
 // installKeys builds and installs the RX/TX ciphers for a generation, applies the 30s
 // grace period to the previous RX key, and sweeps expired RX keys. It is the unguarded
-// mechanism behind UpdateVirtualNetworkSAs; the SPI/key guards live in that caller.
-func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, txKey [16]byte, expiresAt time.Time) error {
+// mechanism behind UpdateVirtualNetworkSecret; the SPI/derivation guards live in that
+// caller. masterFP fingerprints the master secret the keys were derived from (zero for
+// raw-key test installs, which the guard therefore never matches).
+func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, txKey [16]byte, masterFP [32]byte, expiresAt time.Time) error {
 	// Clamp the previous RX key to a 30s grace window. The previous receive SA is
 	// keyed by the previous receive SPI (vnet.rxEpoch) — NOT by txCipher.epoch, which
 	// under per-direction SPIs is the previous TRANSMIT SPI (the peer's receive SPI)
@@ -845,15 +828,15 @@ func (h *Handler) installKeys(vnet *VirtualNetwork, rxSPI, txSPI uint32, rxKey, 
 	// A fresh transmitCipher resets the TX counter to zero for the new transmit SPI.
 	// This is load-bearing for nonce uniqueness: the AES-GCM nonce is txSPI‖counter, so
 	// each transmit SPI MUST begin its own counter at zero. Safety across rekeys, reconnects
-	// and restarts rests on each generation pairing that from-zero counter with a FRESH
-	// per-session key (fresh ECDHE; no resumption/0-RTT), so even a reused or regressed SPI
-	// value derives a different key and the (key, nonce) pair never repeats. A refactor that
-	// carried the counter across installs would reintroduce reuse. The key is retained so the
-	// TX anti-reset guard can reject a literal double-install of this same live SA.
+	// and restarts rests on each generation pairing that from-zero counter with a key no
+	// prior generation has used — a fresh master secret, or a fresh SPI (= fresh KDF context)
+	// under a reused master; UpdateVirtualNetworkSecret's guards enforce exactly this. A
+	// refactor that carried the counter across installs would reintroduce reuse. The master
+	// fingerprint is retained so the guard can scope its SPI-monotonicity check.
 	vnet.txCipher.Store(&transmitCipher{
 		AEAD:      txCipher,
 		epoch:     txSPI,
-		key:       txKey,
+		masterFP:  masterFP,
 		expiresAt: expiresAt,
 	})
 

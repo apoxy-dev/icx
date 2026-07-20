@@ -121,22 +121,41 @@ func run(version control.ICXVersion) error {
 	}
 	respSAs := r.sas
 
-	// 6. Report and verify.
-	fmt.Printf("master keys agree: %v\n", initSess.MasterKeys() != nil && r.sess.MasterKeys() != nil)
+	// 6. Report and verify. The SAs carry derivation inputs (master + SPIs), not
+	// finished keys: the data-plane handler derives each direction's key itself
+	// (UpdateVirtualNetworkSecret). Derive them here only to demonstrate both
+	// ends agree byte-for-byte.
+	fmt.Printf("master keys agree: %v\n", initSAs.Master == respSAs.Master)
+	iTx, err := control.DeriveSAKey(initSAs.Master[:], initSAs.TxSPI, version)
+	if err != nil {
+		return err
+	}
+	iRx, err := control.DeriveSAKey(initSAs.Master[:], initSAs.RxSPI, version)
+	if err != nil {
+		return err
+	}
+	rTx, err := control.DeriveSAKey(respSAs.Master[:], respSAs.TxSPI, version)
+	if err != nil {
+		return err
+	}
+	rRx, err := control.DeriveSAKey(respSAs.Master[:], respSAs.RxSPI, version)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("SAs (%s):\n", suiteName(version))
 	fmt.Printf("  initiator: tx spi=%#08x key=%s | rx spi=%#08x key=%s\n",
-		initSAs.Tx.SPI, fp(initSAs.Tx.Key), initSAs.Rx.SPI, fp(initSAs.Rx.Key))
+		initSAs.TxSPI, fp(iTx), initSAs.RxSPI, fp(iRx))
 	fmt.Printf("  responder: tx spi=%#08x key=%s | rx spi=%#08x key=%s\n",
-		respSAs.Tx.SPI, fp(respSAs.Tx.Key), respSAs.Rx.SPI, fp(respSAs.Rx.Key))
+		respSAs.TxSPI, fp(rTx), respSAs.RxSPI, fp(rRx))
 
-	if !equal(initSAs.Tx.Key, respSAs.Rx.Key) || !equal(initSAs.Rx.Key, respSAs.Tx.Key) {
+	if !equal(iTx, rRx) || !equal(iRx, rTx) {
 		return fmt.Errorf("VERIFY FAILED: tx/rx keys do not cross-match between peers")
 	}
-	if equal(initSAs.Tx.Key, initSAs.Rx.Key) {
+	if equal(iTx, iRx) {
 		return fmt.Errorf("VERIFY FAILED: initiator tx and rx keys collided")
 	}
-	if len(initSAs.Tx.Key) != expectedKeyLen(version) {
-		return fmt.Errorf("VERIFY FAILED: key length %d, want %d", len(initSAs.Tx.Key), expectedKeyLen(version))
+	if len(iTx) != expectedKeyLen(version) {
+		return fmt.Errorf("VERIFY FAILED: key length %d, want %d", len(iTx), expectedKeyLen(version))
 	}
 
 	fmt.Println("VERIFY OK: cross-matched, tx≠rx, FIPS-suite handshake, keys never crossed the wire")

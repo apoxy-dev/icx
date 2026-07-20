@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/apoxy-dev/icx/psp"
 )
 
 // numMasterKeys is the PSP master-key count: one active, one retained for
 // in-flight SAs during rotation (the MSB of the SPI selects between them).
-const numMasterKeys = 2
+const numMasterKeys = psp.NumMasterKeys
 
 // MasterKeys holds the two 256-bit PSP master keys. They are seeded from the
 // forward-secret TLS exporter (see ExportRootSecret) and live only in RAM; they
@@ -44,14 +46,12 @@ func DeriveMasterKeys(rootSecret []byte) (*MasterKeys, error) {
 }
 
 // MasterKeyIndex returns which master key (0 or 1) an SPI selects: per PSP, the
-// most-significant bit of the SPI.
-func MasterKeyIndex(spi uint32) int { return int(spi >> 31) }
+// most-significant bit of the SPI. See psp.MasterKeyIndex.
+func MasterKeyIndex(spi uint32) int { return psp.MasterKeyIndex(spi) }
 
-// RoleOf reports which role allocated an SPI, per the role bit (bit30). It is
-// the inverse of the role argument to MakeSPI and lets a peer validate that an
-// announced RX SPI was allocated by the opposite role, preserving the SPI-space
-// partition that keeps tx and rx keys distinct.
-func RoleOf(spi uint32) Role { return Role((spi >> spiRoleShift) & 1) }
+// RoleOf reports which role allocated an SPI, per the role bit (bit30). See
+// psp.RoleOf.
+func RoleOf(spi uint32) Role { return psp.RoleOf(spi) }
 
 // SA is a unidirectional PSP security association: an SPI, the derived AES-GCM
 // key, and the cipher suite (which fixes the key length / cipher).
@@ -63,7 +63,7 @@ type SA struct {
 
 // DeriveSA derives the SA key for spi using the master key its MSB selects.
 func (m *MasterKeys) DeriveSA(spi uint32, v ICXVersion) (*SA, error) {
-	if spi&spiLowMask == 0 {
+	if psp.ReservedSPI(spi) {
 		return nil, errors.New("control: SPI low 31 bits must be non-zero (zero is reserved)")
 	}
 	key, err := DeriveSAKey(m.keys[MasterKeyIndex(spi)][:], spi, v)
@@ -73,42 +73,22 @@ func (m *MasterKeys) DeriveSA(spi uint32, v ICXVersion) (*SA, error) {
 	return &SA{SPI: spi, Key: key, Version: v}, nil
 }
 
-// Role identifies which peer allocated an SPI. The two directions MUST use
-// distinct SPIs, otherwise both directions would derive the same key
-// (txKey == rxKey). Partitioning the SPI space by role guarantees distinctness
-// even though both peers allocate independently from the shared master keys.
-type Role uint8
+// Role identifies which peer allocated an SPI; the SPI space is partitioned by
+// role so the two directions always derive distinct keys. See psp.Role.
+type Role = psp.Role
 
 const (
-	Initiator Role = iota // canonical lower static key
-	Responder
+	Initiator = psp.Initiator
+	Responder = psp.Responder
 )
 
-// SPI bit layout (PSP keeps the SPI opaque except for the MSB master-key
-// selector; we additionally reserve one bit to partition by allocating role):
-//
-//	bit31      master-key index (PSP)
-//	bit30      allocating role (0=initiator, 1=responder)
-//	bits[29:0] per-(index,role) counter, 1..2^30-1 (0 reserved)
-const (
-	spiRoleShift   = 30
-	spiCounterMask = (uint32(1) << spiRoleShift) - 1 // low 30 bits
-	spiLowMask     = uint32(0x7fffffff)              // low 31 bits (PSP: must be non-zero)
-)
+// spiCounterMask is the largest usable per-(index,role) SPI counter value.
+const spiCounterMask = psp.SPICounterMax
 
 // MakeSPI composes an SPI from the active master-key index, the allocating role
-// and a per-(index,role) counter.
+// and a per-(index,role) counter. See psp.MakeSPI for the bit layout.
 func MakeSPI(masterKeyIndex int, role Role, counter uint32) (uint32, error) {
-	if masterKeyIndex < 0 || masterKeyIndex >= numMasterKeys {
-		return 0, fmt.Errorf("control: master key index must be 0..%d", numMasterKeys-1)
-	}
-	if role > Responder {
-		return 0, fmt.Errorf("control: invalid role %d", role)
-	}
-	if counter == 0 || counter > spiCounterMask {
-		return 0, fmt.Errorf("control: SPI counter out of range (1..%d)", spiCounterMask)
-	}
-	return uint32(masterKeyIndex)<<31 | uint32(role)<<spiRoleShift | counter, nil
+	return psp.MakeSPI(masterKeyIndex, role, counter)
 }
 
 // ErrSPIExhausted is returned by Allocate when the 2^30 counter space for a
