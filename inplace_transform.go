@@ -72,11 +72,12 @@ const geneveHdrLen = 32
 func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	phyFrame := buf[off : off+length]
 
-	// Capture the outer underlay source only when peer-source validation is on
-	// (APO-650); otherwise pass nil so udp.Decode skips the address copy.
+	// Capture the outer underlay source only when peer-source validation
+	// (APO-650) or source learning (APO-740) needs it; otherwise pass nil so
+	// udp.Decode skips the address copy. Mirrors PhyToVirt.
 	var outerSrc tcpip.FullAddress
 	var outerSrcPtr *tcpip.FullAddress
-	if h.opts.validateOuterSrc {
+	if h.opts.validateOuterSrc || h.opts.sourceLearning {
 		outerSrcPtr = &outerSrc
 	}
 
@@ -114,14 +115,16 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// Drop frames whose outer underlay source does not match the configured peer
 	// before any crypto/replay work (APO-650). Only the IP is compared (the UDP
 	// source port is rewritten per packet by source-port hashing). A nil
-	// RemoteAddr under an enabled check fails closed. Mirrors PhyToVirt.
-	if h.opts.validateOuterSrc && (vnet.RemoteAddr == nil || outerSrc.Addr != vnet.RemoteAddr.Addr) {
-		if debugDropEnabled() {
-			slog.Debug("Dropping frame: outer source does not match configured peer",
-				slog.String("outerSrc", outerSrc.Addr.String()))
+	// remote under an enabled check fails closed. Mirrors PhyToVirt.
+	if h.opts.validateOuterSrc {
+		if remote := vnet.remoteAddr.Load(); remote == nil || outerSrc.Addr != remote.Addr {
+			if debugDropEnabled() {
+				slog.Debug("Dropping frame: outer source does not match configured peer",
+					slog.String("outerSrc", outerSrc.Addr.String()))
+			}
+			vnet.Stats.RXDropsBadPeer.Add(1)
+			return dropWindowOffset, 0
 		}
-		vnet.Stats.RXDropsBadPeer.Add(1)
-		return dropWindowOffset, 0
 	}
 
 	var nonce []byte
@@ -232,6 +235,15 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 		}
 		vnet.Stats.RXReplayDrops.Add(1)
 		return dropWindowOffset, 0
+	}
+
+	// The frame is authenticated (Open) and fresh (replay window): adopt its
+	// outer source as the remote endpoint (APO-740). Placed BEFORE the OOB
+	// early-return so a peer's keep-alives populate and refresh the endpoint,
+	// and before the inner cryptokey-routing checks, which police the inner
+	// addresses and are orthogonal to outer roaming. Mirrors PhyToVirt.
+	if h.opts.sourceLearning {
+		h.maybeLearnRemote(vnet, outerSrc, phyFrame)
 	}
 
 	// Is it an authenticated out-of-band message?
@@ -546,6 +558,19 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	}
 	vnet := srcValue.(*VirtualNetwork)
 
+	// Load the remote endpoint once per packet: under source learning the RX path
+	// may republish it concurrently (APO-740), so all reads below use this one
+	// consistent snapshot. nil (keys installed, no endpoint learned yet) fails
+	// closed. Mirrors VirtToPhy.
+	remote := vnet.remoteAddr.Load()
+	if remote == nil {
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame: no remote endpoint learned yet", slog.Uint64("vni", uint64(vnet.ID)))
+		}
+		vnet.Stats.TXDropsNoRemote.Add(1)
+		return dropWindowOffset, 0, false
+	}
+
 	hdr := h.hdrPool.Get().(*geneve.Header)
 	defer func() {
 		h.hdrPool.Put(hdr)
@@ -613,7 +638,7 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 
 	// Determine the outer-header payload offset for the underlay address family.
 	var payloadOffset int
-	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
+	if remote.Addr.Len() == net.IPv4len {
 		payloadOffset = udp.PayloadOffsetIPv4
 	} else {
 		payloadOffset = udp.PayloadOffsetIPv6
@@ -694,7 +719,7 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	encryptedFrameLen := len(txCipher.Seal(buf[ipStart:ipStart], nonce, buf[ipStart:ipStart+ptLen], aad))
 
 	// Underlay source selection.
-	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
+	best := h.opts.localAddrs.Select(remote)
 	if best == nil {
 		slog.Warn("No local underlay addresses configured")
 		vnet.Stats.TXErrors.Add(1)
@@ -709,7 +734,7 @@ func (h *Handler) VirtToPhyInPlace(buf []byte, off, length int) (int, int, bool)
 	// Write the outer Eth/IP/UDP headers into the headroom at phyStart. The
 	// Geneve header + ciphertext + tag already sit at phyStart+payloadOffset.
 	phyFrame := buf[phyStart:]
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, h.skipOuterUDPChecksum(vnet.RemoteAddr))
+	frameLen, err := udp.Encode(phyFrame, &localAddr, remote, hdrLen+encryptedFrameLen, h.skipOuterUDPChecksum(remote))
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
@@ -812,7 +837,23 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
-		// No key yet, not really an error for keep-alives.
+		// No key yet, not really an error for keep-alives — but mark the network
+		// serviced so a long-unkeyed network (now common under the add-before-learn
+		// workflow, APO-740) does not stay perpetually "due" and crowd out other
+		// networks in the Range pick above. Mirrors the expired-key and
+		// no-remote branches below, and ToPhy.
+		vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
+		return dropWindowOffset, 0
+	}
+
+	// No remote endpoint learned yet (source learning, APO-740): nothing to keep
+	// alive. Expected steady state for an unlearned network, so no log and no
+	// error counter — but mark it serviced so it does not stay perpetually "due"
+	// and starve every other network's keep-alives (Range stops at the first due
+	// one). Mirrors ToPhy.
+	remote := vnet.remoteAddr.Load()
+	if remote == nil {
+		vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 		return dropWindowOffset, 0
 	}
 
@@ -867,7 +908,7 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 
 	// Place Geneve payload inside outer UDP frame.
 	var payloadOffset int
-	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
+	if remote.Addr.Len() == net.IPv4len {
 		payloadOffset = udp.PayloadOffsetIPv4
 	} else {
 		payloadOffset = udp.PayloadOffsetIPv6
@@ -890,7 +931,7 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 	encLen := len(ct) // AEAD tag length
 
 	// Underlay source selection.
-	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
+	best := h.opts.localAddrs.Select(remote)
 	if best == nil {
 		slog.Warn("No local underlay addresses configured")
 		vnet.Stats.TXErrors.Add(1)
@@ -900,7 +941,7 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 
 	// Finish outer UDP/IP/Ethernet
 	totalGeneveLen := hdrLen + encLen
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, totalGeneveLen, h.skipOuterUDPChecksum(vnet.RemoteAddr))
+	frameLen, err := udp.Encode(phyFrame, &localAddr, remote, totalGeneveLen, h.skipOuterUDPChecksum(remote))
 	if err != nil {
 		slog.Warn("UDP encode failed", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)

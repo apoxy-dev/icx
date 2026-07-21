@@ -75,10 +75,15 @@ func Decode(frame []byte, addr *tcpip.FullAddress, skipChecksumValidation bool) 
 		return nil, errors.New("invalid UDP checksum or length")
 	}
 
+	// Only the value-typed Addr and Port are filled; the outer source MAC is
+	// deliberately NOT extracted here. eth.SourceAddress() is a []byte-to-string
+	// conversion that escapes to the heap, which would put one allocation on
+	// EVERY decode when the caller captures the source (APO-740) — callers that
+	// need the MAC (the rare source-learn path) read it from the frame
+	// themselves.
 	if addr != nil {
 		addr.Addr = srcAddr
 		addr.Port = udp.SourcePort()
-		addr.LinkAddr = eth.SourceAddress()
 	}
 
 	return udp.Payload(), nil

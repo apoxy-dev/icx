@@ -108,6 +108,18 @@ type Statistics struct {
 	// SA's key had expired (APO-656). RX enforces key expiry; this makes TX fail closed
 	// symmetrically instead of sealing indefinitely under a stale key.
 	TXDropsExpiredKey atomic.Uint64
+	// TXDropsNoRemote is the number of outbound frames dropped because the virtual
+	// network has no remote endpoint yet: under source learning (APO-740) a network
+	// may be installed with keys but no static remote, and TX fails closed until
+	// the first authenticated inbound packet populates it.
+	TXDropsNoRemote atomic.Uint64
+	// RXLearnedRemotes is the number of times the remote endpoint was learned or
+	// re-learned from an authenticated inbound packet (WithSourceLearning, APO-740).
+	RXLearnedRemotes atomic.Uint64
+	// RXLearnsDamped is the number of authenticated inbound packets whose differing
+	// outer source was NOT adopted because a remote change had already been accepted
+	// within the damping interval (WithSourceLearning, APO-740).
+	RXLearnsDamped atomic.Uint64
 	// LastKeepAliveUnixNano is the timestamp of the last transmitted keep-alive packet.
 	LastKeepAliveUnixNano atomic.Int64
 }
@@ -164,8 +176,20 @@ type transmitCipher struct {
 type VirtualNetwork struct {
 	// ID is the virtual network identifier.
 	ID uint
-	// RemoteAddr is the address of the remote endpoint.
-	RemoteAddr *tcpip.FullAddress
+	// remoteAddr is the address of the remote endpoint, published atomically
+	// (APO-740): under source learning the RX path re-publishes it from an
+	// authenticated packet's outer source while the TX paths read it lock-free,
+	// so the pointer is swapped whole (copy-on-write, like allowedRoutes) and a
+	// reader keeps a consistent (if possibly older) endpoint. nil until either a
+	// static remote is configured or the first authenticated packet is learned;
+	// TX fails closed while nil. Read it through the RemoteAddr accessor.
+	remoteAddr atomic.Pointer[tcpip.FullAddress]
+	// lastRemoteLearnUnixNano is when the remote endpoint last CHANGED (flap
+	// damping, APO-740): a subsequent change within remoteLearnDampInterval is
+	// suppressed so two paths alternating source addresses (multi-path NAT)
+	// cannot thrash the endpoint at line rate. The first learn is recorded but
+	// never damped.
+	lastRemoteLearnUnixNano atomic.Int64
 	// allowedRoutes is the list of allowed source/destination address prefix pairs for
 	// this virtual network, published atomically (APO-652): the RX validation hot path
 	// Loads a stable slice snapshot while UpdateVirtualNetworkRoutes Stores a whole
@@ -201,6 +225,101 @@ func (v *VirtualNetwork) AllowedRoutes() []Route {
 		return *p
 	}
 	return nil
+}
+
+// RemoteAddr returns the virtual network's current remote endpoint, or nil when
+// none is configured or learned yet. The pointer is published atomically
+// (APO-740): under source learning the RX path may replace it at any time, so
+// the pointee must be treated as read-only — a caller keeps a consistent (if
+// possibly older) endpoint.
+func (v *VirtualNetwork) RemoteAddr() *tcpip.FullAddress {
+	return v.remoteAddr.Load()
+}
+
+// remoteLearnDampInterval bounds how often source learning may CHANGE an
+// already-learned remote endpoint (APO-740). Only an authenticated peer (one
+// holding valid keys) can move the endpoint at all, so damping exists purely to
+// stop a legitimate peer whose packets arrive via alternating paths (multi-path
+// NAT, ECMP with per-packet source rewriting) from thrashing the endpoint at
+// line rate. The first learn is never damped.
+const remoteLearnDampInterval = 5 * time.Second
+
+// maybeLearnRemote adopts src as the virtual network's remote endpoint
+// (WireGuard-roaming semantics, APO-740). It must be called only after BOTH the
+// AEAD Open and the replay-window validation have succeeded — never from an
+// unauthenticated drop path — so an off-path spoofer can not redirect the
+// tunnel. Steady state (unchanged endpoint) takes no atomic store and no
+// allocation; the damped path allocates nothing either.
+//
+// Only Addr+Port are compared for change detection. The outer source MAC
+// (LinkAddr) is extracted from ethFrame only when an endpoint is actually
+// adopted — the AF_XDP TX path needs a destination MAC — so it reflects the
+// learn-time frame, not the most recent packet (a MAC-only change, e.g. a
+// next-hop failover with a stable peer address, is NOT re-learned; an AF_XDP
+// consumer of source learning needs its own neighbor refresh).
+func (h *Handler) maybeLearnRemote(vnet *VirtualNetwork, src tcpip.FullAddress, ethFrame []byte) {
+	cur := vnet.remoteAddr.Load()
+	if cur != nil && cur.Addr == src.Addr && cur.Port == src.Port {
+		return
+	}
+
+	// Never adopt an endpoint we cannot transmit to: udp.Encode requires the
+	// local and remote underlay families to match, so a cross-family source (a
+	// dual-stack peer emitting one frame over the other family) would turn every
+	// subsequent TX into a hard error until re-learned. Cheap slice scan, and
+	// only on the rare would-learn path.
+	sameFamily := false
+	for _, la := range h.opts.localAddrs {
+		if la != nil && la.Addr.Len() == src.Addr.Len() {
+			sameFamily = true
+			break
+		}
+	}
+	if !sameFamily {
+		if debugDropEnabled() {
+			slog.Debug("Not learning remote endpoint: no local underlay address of the same family",
+				slog.Uint64("vni", uint64(vnet.ID)), slog.String("addr", src.Addr.String()))
+		}
+		return
+	}
+
+	now := h.clock.Now().UnixNano()
+
+	if cur == nil {
+		// First learn: always immediate. The CAS elects a single winner among
+		// concurrent RX queues at first contact, so a delayed packet from a
+		// stale source cannot clobber a fresher endpoint published in between.
+		fresh := src
+		fresh.LinkAddr = header.Ethernet(ethFrame).SourceAddress()
+		if vnet.remoteAddr.CompareAndSwap(nil, &fresh) {
+			vnet.lastRemoteLearnUnixNano.Store(now)
+			vnet.Stats.RXLearnedRemotes.Add(1)
+			slog.Info("Learned remote endpoint for virtual network",
+				slog.Uint64("vni", uint64(vnet.ID)),
+				slog.String("addr", src.Addr.String()),
+				slog.Int("port", int(src.Port)))
+		}
+		return
+	}
+
+	// A CHANGE of an established endpoint: damp it. The timestamp CAS elects a
+	// single learner among concurrent RX queues racing on the same interval.
+	last := vnet.lastRemoteLearnUnixNano.Load()
+	if now-last < int64(remoteLearnDampInterval) {
+		vnet.Stats.RXLearnsDamped.Add(1)
+		return
+	}
+	if !vnet.lastRemoteLearnUnixNano.CompareAndSwap(last, now) {
+		return
+	}
+	fresh := src
+	fresh.LinkAddr = header.Ethernet(ethFrame).SourceAddress()
+	vnet.remoteAddr.Store(&fresh)
+	vnet.Stats.RXLearnedRemotes.Add(1)
+	slog.Info("Learned remote endpoint for virtual network",
+		slog.Uint64("vni", uint64(vnet.ID)),
+		slog.String("addr", src.Addr.String()),
+		slog.Int("port", int(src.Port)))
 }
 
 // Clock provides time to the handler. Tests can inject a fake clock.
@@ -241,6 +360,11 @@ type handlerOptions struct {
 	// rxRateLimitPPS, when > 0, caps how many frames per second per virtual network
 	// may reach the AES-GCM Open on the RX path (APO-655). 0 disables the limiter.
 	rxRateLimitPPS int
+	// sourceLearning, when set, makes the RX path adopt the outer underlay
+	// source of an AUTHENTICATED packet (AEAD + replay both passed) as the
+	// virtual network's remote endpoint (APO-740). Mutually exclusive with
+	// validateOuterSrc.
+	sourceLearning bool
 	// forceOuterUDPChecksum, when set, makes the TX path compute the outer UDP
 	// checksum even on an IPv4 underlay, where it is otherwise skipped (the legal
 	// RFC 768 zero checksum) to avoid a redundant software pass over the already
@@ -362,6 +486,36 @@ func WithOuterSrcValidation() HandlerOption {
 	}
 }
 
+// WithSourceLearning makes the RX path learn each virtual network's remote
+// endpoint from the outer underlay source {addr, port} of inbound packets that
+// pass BOTH AEAD authentication and the anti-replay check (WireGuard-roaming
+// semantics, APO-740). An unauthenticated packet can never move the endpoint.
+//
+// When enabled, AddVirtualNetwork accepts a nil remote address: keys can be
+// installed before any endpoint is known and the first authenticated packet
+// populates it (TX fails closed until then). A non-nil remote passed to
+// AddVirtualNetwork is merely the initial endpoint and is updated when the peer
+// roams. Changes to an established endpoint are damped to one per
+// remoteLearnDampInterval per network.
+//
+// The outer source PORT is part of the learned endpoint (a NAT rebinding moves
+// the port and return traffic must follow it), which constrains the peer's TX
+// configuration: a peer whose driver puts per-flow hashed source ports on the
+// wire (the AF_XDP forwarder under WithSourcePortHashing) would teach a
+// learning receiver an ephemeral port that accepts no return traffic. Peers of
+// a learning handler must transmit from their stable bound port — the tun and
+// netstack drivers do so inherently (their UDP socket's bound port overrides
+// the engine's hashed port), as do keep-alives on every driver.
+//
+// Mutually exclusive with WithOuterSrcValidation, which pins the peer's source
+// instead of following it; NewHandler rejects the combination.
+func WithSourceLearning() HandlerOption {
+	return func(opts *handlerOptions) error {
+		opts.sourceLearning = true
+		return nil
+	}
+}
+
 // WithRXRateLimit caps how many frames per second per virtual network may reach
 // the AES-GCM Open on the RX path, bounding the CPU an off-path flood of
 // forgeable VNI/epoch frames can burn (APO-655). pps <= 0 disables the limiter
@@ -475,6 +629,10 @@ func NewHandler(opts ...HandlerOption) (*Handler, error) {
 		return nil, fmt.Errorf("virtual MAC must be set for L2 mode")
 	}
 
+	if options.sourceLearning && options.validateOuterSrc {
+		return nil, fmt.Errorf("source learning and outer-source validation are mutually exclusive")
+	}
+
 	hdrPool := &sync.Pool{
 		New: func() any {
 			return &geneve.Header{}
@@ -571,14 +729,22 @@ func (h *Handler) rebuildRoutesLocked() {
 }
 
 // AddVirtualNetwork adds a new network with the given VNI and remote address.
+// Under WithSourceLearning remoteAddr may be nil: keys can be installed before
+// any endpoint is known, TX fails closed, and the first authenticated inbound
+// packet populates the remote (APO-740).
 func (h *Handler) AddVirtualNetwork(vni uint, remoteAddr *tcpip.FullAddress, allowedRoutes []Route) error {
 	if _, exists := h.networkByID.Load(vni); exists {
 		return fmt.Errorf("network with VNI %d already exists", vni)
 	}
+	if remoteAddr == nil && !h.opts.sourceLearning {
+		return fmt.Errorf("remote address is required unless source learning is enabled")
+	}
 
 	vnet := &VirtualNetwork{
-		ID:         vni,
-		RemoteAddr: remoteAddr,
+		ID: vni,
+	}
+	if remoteAddr != nil {
+		vnet.remoteAddr.Store(remoteAddr)
 	}
 	vnet.allowedRoutes.Store(&allowedRoutes)
 	if h.opts.rxRateLimitPPS > 0 {
@@ -894,11 +1060,12 @@ func (h *Handler) txKeyExpired(vnet *VirtualNetwork, txCipher *transmitCipher, n
 // PhyToVirt converts a physical frame to a virtual frame typically by performing decapsulation.
 // Returns the length of the resulting virtual frame.
 func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
-	// Capture the outer underlay source only when peer-source validation is on
-	// (APO-650); otherwise pass nil so udp.Decode skips the address copy.
+	// Capture the outer underlay source only when peer-source validation
+	// (APO-650) or source learning (APO-740) needs it; otherwise pass nil so
+	// udp.Decode skips the address copy.
 	var outerSrc tcpip.FullAddress
 	var outerSrcPtr *tcpip.FullAddress
-	if h.opts.validateOuterSrc {
+	if h.opts.validateOuterSrc || h.opts.sourceLearning {
 		outerSrcPtr = &outerSrc
 	}
 
@@ -932,14 +1099,16 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	// Drop frames whose outer underlay source does not match the configured peer
 	// before any crypto/replay work (APO-650). Only the IP is compared (the UDP
 	// source port is rewritten per packet by source-port hashing). A nil
-	// RemoteAddr under an enabled check fails closed.
-	if h.opts.validateOuterSrc && (vnet.RemoteAddr == nil || outerSrc.Addr != vnet.RemoteAddr.Addr) {
-		if debugDropEnabled() {
-			slog.Debug("Dropping frame: outer source does not match configured peer",
-				slog.String("outerSrc", outerSrc.Addr.String()))
+	// remote under an enabled check fails closed.
+	if h.opts.validateOuterSrc {
+		if remote := vnet.remoteAddr.Load(); remote == nil || outerSrc.Addr != remote.Addr {
+			if debugDropEnabled() {
+				slog.Debug("Dropping frame: outer source does not match configured peer",
+					slog.String("outerSrc", outerSrc.Addr.String()))
+			}
+			vnet.Stats.RXDropsBadPeer.Add(1)
+			return 0
 		}
-		vnet.Stats.RXDropsBadPeer.Add(1)
-		return 0
 	}
 
 	var nonce []byte
@@ -1048,6 +1217,15 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 		}
 		vnet.Stats.RXReplayDrops.Add(1)
 		return 0
+	}
+
+	// The frame is authenticated (Open) and fresh (replay window): adopt its
+	// outer source as the remote endpoint (APO-740). Placed BEFORE the OOB
+	// early-return so a peer's keep-alives populate and refresh the endpoint,
+	// and before the inner cryptokey-routing checks, which police the inner
+	// addresses and are orthogonal to outer roaming.
+	if h.opts.sourceLearning {
+		h.maybeLearnRemote(vnet, outerSrc, phyFrame)
 	}
 
 	// Is it an authenticated out-of-band message?
@@ -1322,6 +1500,19 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 	vnet := srcValue.(*VirtualNetwork)
 
+	// Load the remote endpoint once per packet: under source learning the RX path
+	// may republish it concurrently (APO-740), so all reads below use this one
+	// consistent snapshot. nil (keys installed, no endpoint learned yet) fails
+	// closed. Mirrors VirtToPhyInPlace.
+	remote := vnet.remoteAddr.Load()
+	if remote == nil {
+		if debugDropEnabled() {
+			slog.Debug("Dropping frame: no remote endpoint learned yet", slog.Uint64("vni", uint64(vnet.ID)))
+		}
+		vnet.Stats.TXDropsNoRemote.Add(1)
+		return 0, false
+	}
+
 	hdr := h.hdrPool.Get().(*geneve.Header)
 	defer func() {
 		h.hdrPool.Put(hdr)
@@ -1388,7 +1579,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	}
 
 	var payload []byte
-	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
+	if remote.Addr.Len() == net.IPv4len {
 		payload = phyFrame[udp.PayloadOffsetIPv4:]
 	} else {
 		payload = phyFrame[udp.PayloadOffsetIPv6:]
@@ -1420,7 +1611,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 	encryptedFrameLen := len(txCipher.Seal(payload[hdrLen:hdrLen], nonce, ipPacket, payload[:hdrLen]))
 
 	// Underlay source selection.
-	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
+	best := h.opts.localAddrs.Select(remote)
 	if best == nil {
 		slog.Warn("No local underlay addresses configured")
 		vnet.Stats.TXErrors.Add(1)
@@ -1432,7 +1623,7 @@ func (h *Handler) VirtToPhy(virtFrame, phyFrame []byte) (int, bool) {
 		localAddr.Port = flowhash.MapToEphemeralPort(flowhash.Hash(h.flowHashKey, ipPacket))
 	}
 
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, hdrLen+encryptedFrameLen, h.skipOuterUDPChecksum(vnet.RemoteAddr))
+	frameLen, err := udp.Encode(phyFrame, &localAddr, remote, hdrLen+encryptedFrameLen, h.skipOuterUDPChecksum(remote))
 	if err != nil {
 		slog.Warn("Failed to encode UDP frame", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)
@@ -1474,7 +1665,23 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 
 	txCipher := vnet.txCipher.Load()
 	if txCipher == nil {
-		// No key yet, not really an error for keep-alives.
+		// No key yet, not really an error for keep-alives — but mark the network
+		// serviced so a long-unkeyed network (now common under the add-before-learn
+		// workflow, APO-740) does not stay perpetually "due" and crowd out other
+		// networks in the Range pick above. Mirrors the expired-key and
+		// no-remote branches below.
+		vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
+		return 0
+	}
+
+	// No remote endpoint learned yet (source learning, APO-740): nothing to keep
+	// alive. Expected steady state for an unlearned network, so no log and no
+	// error counter — but mark it serviced so it does not stay perpetually "due"
+	// and starve every other network's keep-alives (Range stops at the first due
+	// one). Mirrors ToPhyInPlace.
+	remote := vnet.remoteAddr.Load()
+	if remote == nil {
+		vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 		return 0
 	}
 
@@ -1529,7 +1736,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 
 	// Place Geneve payload inside outer UDP frame.
 	var payload []byte
-	if vnet.RemoteAddr.Addr.Len() == net.IPv4len {
+	if remote.Addr.Len() == net.IPv4len {
 		payload = phyFrame[udp.PayloadOffsetIPv4:]
 	} else {
 		payload = phyFrame[udp.PayloadOffsetIPv6:]
@@ -1549,7 +1756,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 	encLen := len(ct) // AEAD tag length
 
 	// Underlay source selection.
-	best := h.opts.localAddrs.Select(vnet.RemoteAddr)
+	best := h.opts.localAddrs.Select(remote)
 	if best == nil {
 		slog.Warn("No local underlay addresses configured")
 		vnet.Stats.TXErrors.Add(1)
@@ -1559,7 +1766,7 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 
 	// Finish outer UDP/IP/Ethernet
 	totalGeneveLen := hdrLen + encLen
-	frameLen, err := udp.Encode(phyFrame, &localAddr, vnet.RemoteAddr, totalGeneveLen, h.skipOuterUDPChecksum(vnet.RemoteAddr))
+	frameLen, err := udp.Encode(phyFrame, &localAddr, remote, totalGeneveLen, h.skipOuterUDPChecksum(remote))
 	if err != nil {
 		slog.Warn("UDP encode failed", slog.Any("error", err))
 		vnet.Stats.TXErrors.Add(1)

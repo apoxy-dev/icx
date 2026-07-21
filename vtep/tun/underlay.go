@@ -139,11 +139,13 @@ func peel(frame []byte) ([]byte, netip.AddrPort, error) {
 // synthesize builds a full Ethernet+IP+UDP frame around the payload currently at
 // buf[payloadAt:payloadAt+payloadLen] into buf, returning the frame length. The
 // outer family is taken from peer so udp.Decode routes the correct path. The
-// outer addresses are decorative to the engine: udp.Decode (called with
-// skip-checksum) ignores the MACs and checksum, validating only the length
-// fields, and PhyToVirt selects the SA by Geneve SPI and never learns the peer.
-// Both outer src and dst are set to peer, which trivially keeps the address
-// families equal as udp.Encode requires.
+// outer MACs and checksum are decorative to the engine: udp.Decode (called with
+// skip-checksum) ignores them, validating only the length fields, and PhyToVirt
+// selects the SA by Geneve SPI. The outer source address, however, is
+// meaningful: it carries the REAL received peer, which is exactly what the
+// engine adopts under WithSourceLearning (APO-740). Both outer src and dst are
+// set to peer, which trivially keeps the address families equal as udp.Encode
+// requires.
 func synthesize(buf []byte, payloadAt, payloadLen int, peer netip.AddrPort) (int, error) {
 	a := peer.Addr().Unmap()
 
