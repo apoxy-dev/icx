@@ -716,6 +716,17 @@ func (h *Handler) UpdateVirtualNetworkSecret(vni uint, master [32]byte, rxSPI, t
 	}
 	vnet := value.(*VirtualNetwork)
 
+	// Degenerate-master guard: an all-zero master is not a real secret — the keys
+	// it derives are publicly computable, so any packet sealed under them is
+	// readable by anyone. Reject it fail-closed at the one boundary every keying
+	// path flows through, so a caller that reaches here with a zero-value master
+	// (uninitialized field, absent wire field, un-set race) cannot key a tunnel
+	// under a known key. Callers must supply a fresh, high-entropy master; this
+	// only catches the degenerate zero case, which is never legitimate.
+	if master == ([32]byte{}) {
+		return errors.New("master secret must be non-zero")
+	}
+
 	// Reserved-SPI guard: an SPI whose low 31 bits are zero is reserved (PSP spec;
 	// control/sa.go never allocates one). Rejecting it also refuses the all-zero
 	// nonce prefix that predated the SPI binding.

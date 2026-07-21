@@ -1,7 +1,6 @@
 package control
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/tls"
@@ -308,9 +307,11 @@ func (s *Session) NegotiateSAs(ctx context.Context, v ICXVersion) (*DirectionalS
 	return s.deriveDirectional(v, myRxSPI, peer)
 }
 
-// deriveDirectional derives the tx/rx SAs and enforces the txKey != rxKey
-// invariant (the role-partitioned SPI space guarantees distinct SPIs, but we
-// assert on the derived keys as a belt-and-suspenders check).
+// deriveDirectional validates the peer's RX SPI and returns the directional SAs.
+// The role-partitioned SPI space guarantees the two directions derive distinct
+// keys (distinct role bits => distinct SPIs => distinct KDF contexts), and the
+// handler re-checks rxSPI != txSPI at install, so no key-equality assertion is
+// needed here.
 func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) (*DirectionalSAs, error) {
 	if peer.Version != v {
 		return nil, fmt.Errorf("control: cipher suite mismatch: local %d, peer %d", v, peer.Version)
@@ -322,27 +323,21 @@ func (s *Session) deriveDirectional(v ICXVersion, myRxSPI uint32, peer saOffer) 
 	// inside the responder's own role/index partition, making the responder's TX
 	// key for one exchange collide byte-for-byte with an RX key its allocator
 	// later mints for a different VNI — same key, same SPI, distinct SA, i.e.
-	// catastrophic (key, nonce) reuse the per-exchange tx!=rx guard cannot see.
+	// catastrophic (key, nonce) reuse.
 	if MasterKeyIndex(peer.RxSPI) != activeMasterKeyIndex {
 		return nil, fmt.Errorf("control: peer SPI uses inactive master-key index %d", MasterKeyIndex(peer.RxSPI))
 	}
 	if RoleOf(peer.RxSPI) == s.role {
 		return nil, errors.New("control: peer SPI collides with the local role partition (SPI spoofing)")
 	}
-	// Derive both keys transiently as a belt-and-suspenders check — the role
-	// partition guarantees distinct SPIs, but assert on the derived keys too. The
-	// data plane re-derives from (Master, SPI) itself; these transient copies never
-	// leave this function.
-	rx, err := s.masterKeys.DeriveSA(myRxSPI, v)
-	if err != nil {
-		return nil, fmt.Errorf("control: derive rx SA: %w", err)
-	}
-	tx, err := s.masterKeys.DeriveSA(peer.RxSPI, v)
-	if err != nil {
-		return nil, fmt.Errorf("control: derive tx SA: %w", err)
-	}
-	if bytes.Equal(tx.Key, rx.Key) {
-		return nil, errors.New("control: tx and rx SA keys collided")
+	// Reject a reserved peer SPI (low 31 bits zero) here, at the boundary where it
+	// enters our SA state and the returned DirectionalSAs. The role/index checks
+	// above accept SPI 0 whenever the local role is Responder (RoleOf(0) is
+	// Initiator), so this is the only guard that stops a reserved TxSPI from
+	// reaching a DirectionalSAs consumer; the handler also rejects it, but
+	// external consumers of the exported type get no second check.
+	if ReservedSPI(peer.RxSPI) {
+		return nil, errors.New("control: peer SPI has reserved (zero) low 31 bits")
 	}
 	// Both SPIs select the active master-key index (validated above for the
 	// peer's, allocated at it for ours), so a single master key covers both

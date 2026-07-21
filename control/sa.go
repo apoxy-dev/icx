@@ -53,6 +53,10 @@ func MasterKeyIndex(spi uint32) int { return psp.MasterKeyIndex(spi) }
 // psp.RoleOf.
 func RoleOf(spi uint32) Role { return psp.RoleOf(spi) }
 
+// ReservedSPI reports whether an SPI's low 31 bits are zero, which the PSP spec
+// reserves and the allocator never issues. See psp.ReservedSPI.
+func ReservedSPI(spi uint32) bool { return psp.ReservedSPI(spi) }
+
 // SA is a unidirectional PSP security association: an SPI, the derived AES-GCM
 // key, and the cipher suite (which fixes the key length / cipher).
 type SA struct {

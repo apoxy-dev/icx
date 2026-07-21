@@ -333,6 +333,11 @@ func TestUpdateVirtualNetworkSecretGuards(t *testing.T) {
 	copy(mB[:], []byte("master-secret-B-bbbbbbbbbbbbbbbb"))
 	exp := time.Now().Add(time.Hour)
 
+	// An all-zero master is rejected: its derived keys are publicly computable, so
+	// it must never key a tunnel regardless of the SPIs.
+	require.Error(t, h.UpdateVirtualNetworkSecret(vni, [32]byte{}, 10, 20, exp),
+		"an all-zero master secret must be rejected")
+
 	// Reserved SPIs (low 31 bits zero) are rejected in either direction — including
 	// the master-key-selector MSB alone.
 	require.Error(t, h.UpdateVirtualNetworkSecret(vni, mA, 0, 20, exp), "rx SPI 0 must be rejected")
