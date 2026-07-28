@@ -50,9 +50,13 @@ func Resolve(ctx context.Context, link netlink.Link, srcAddr *tcpip.FullAddress,
 	var dstMAC tcpip.LinkAddress
 	err = retry.Do(
 		func() error {
+			// Bind only the source IP (to pin the egress interface), never
+			// the caller's port: the caller typically has that port bound
+			// already (it is the underlay listener), so reusing it here
+			// fails with EADDRINUSE. Any ephemeral port triggers neighbor
+			// resolution for the next hop just the same.
 			laddr := &net.UDPAddr{
-				IP:   net.IP(srcAddr.Addr.AsSlice()),
-				Port: int(srcAddr.Port),
+				IP: net.IP(srcAddr.Addr.AsSlice()),
 			}
 
 			// Trigger OS neighbor resolution by sending a dummy packet.
@@ -103,7 +107,13 @@ func searchNeighborList(link netlink.Link, ip net.IP) (tcpip.LinkAddress, error)
 
 	for _, n := range neighs {
 		if n.IP.Equal(ip) && n.HardwareAddr != nil &&
-			(n.State == netlink.NUD_REACHABLE || n.State == netlink.NUD_STALE || n.State == netlink.NUD_DELAY) {
+			(n.State == netlink.NUD_REACHABLE || n.State == netlink.NUD_STALE || n.State == netlink.NUD_DELAY ||
+				n.State == netlink.NUD_PERMANENT || n.State == netlink.NUD_NOARP) {
+			// PERMANENT/NOARP entries are statically configured (e.g. the AWS
+			// VPC CNI installs a permanent entry for the pod's veth gateway
+			// 169.254.1.1) and never transition through the dynamic NUD
+			// states, so they must be accepted here: the trigger-dial
+			// fallback below can never resolve them.
 			return tcpip.LinkAddress(n.HardwareAddr), nil
 		}
 	}
