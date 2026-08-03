@@ -108,6 +108,19 @@ type Underlay interface {
 	io.Closer
 }
 
+// BatchUnderlay is an optional Underlay extension for batched receives. When
+// the underlay implements it, the inbound pump reads up to a device batch of
+// frames per call and hands the decapsulated packets to Device.Write as one
+// batch — one write syscall (with GRO coalescing on a real TUN) instead of one
+// per packet. Semantics mirror Device.Read: the call blocks until at least one
+// frame is available, writes frame i into bufs[i] and its length into
+// sizes[i], and returns the frame count. A zero-length frame is skipped by the
+// caller. After Close it must return an error satisfying
+// errors.Is(err, net.ErrClosed).
+type BatchUnderlay interface {
+	ReadFrames(bufs [][]byte, sizes []int) (int, error)
+}
+
 // Config configures a Datapath. Engine, Device and Underlay are required.
 type Config struct {
 	// Engine is the ICX engine performing encap/decap + crypto. *icx.Handler
@@ -311,8 +324,15 @@ func (d *Datapath) outbound() error {
 	}
 }
 
-// inbound pumps underlay -> engine -> TUN (decap + L3 inject).
+// inbound pumps underlay -> engine -> TUN (decap + L3 inject). When the
+// underlay supports batched receives the whole batch is decapsulated and
+// injected with a single Device.Write, amortizing the TUN write syscall (and
+// letting a GRO-capable device coalesce the segments); otherwise it falls back
+// to frame-at-a-time.
 func (d *Datapath) inbound() error {
+	if bu, ok := d.underlay.(BatchUnderlay); ok {
+		return d.inboundBatch(bu)
+	}
 	phyBuf := make([]byte, maxFrameSize)
 	// virtBuf must hold the full decapsulated inner packet at the device offset.
 	// PhyToVirt does NOT bound its output to the destination buffer — the APO-667
@@ -360,6 +380,72 @@ func (d *Datapath) inbound() error {
 			continue
 		}
 		writeBatch[0] = virtBuf[:d.offset+m]
+		if _, err := d.dev.Write(writeBatch, d.offset); err != nil {
+			if isClosedErr(err) {
+				return net.ErrClosed
+			}
+			slog.Warn("tun datapath: error writing to device", slog.Any("error", err))
+		}
+	}
+}
+
+// inboundBatch is the batched inbound pump: one underlay call yields up to a
+// device batch of frames, each is decapsulated into its own buffer, and the
+// whole batch is injected with a single Device.Write.
+func (d *Datapath) inboundBatch(bu BatchUnderlay) error {
+	bs := d.dev.BatchSize()
+	if bs < 1 {
+		bs = 1
+	}
+	phyBufs := make([][]byte, bs)
+	// Each virt buffer must hold the full decapsulated inner packet at the
+	// device offset; see the sizing rationale in the single-frame pump.
+	virtBufs := make([][]byte, bs)
+	for i := 0; i < bs; i++ {
+		phyBufs[i] = make([]byte, maxFrameSize)
+		virtBufs[i] = make([]byte, d.offset+maxFrameSize)
+	}
+	sizes := make([]int, bs)
+	writeBatch := make([][]byte, 0, bs)
+	consecErr := 0
+
+	for {
+		n, err := bu.ReadFrames(phyBufs, sizes)
+		if err != nil {
+			if isClosedErr(err) {
+				return net.ErrClosed
+			}
+			consecErr++
+			slog.Warn("tun datapath: error reading underlay frames",
+				slog.Any("error", err), slog.Int("consecutive", consecErr))
+			if consecErr >= maxConsecReadErrors {
+				return fmt.Errorf("tun datapath: underlay read failed %d times consecutively: %w", consecErr, err)
+			}
+			if !d.backoffOnError(consecErr) {
+				return net.ErrClosed
+			}
+			continue
+		}
+		consecErr = 0
+
+		writeBatch = writeBatch[:0]
+		for i := 0; i < n; i++ {
+			if sizes[i] <= 0 {
+				continue
+			}
+			m := d.engine.PhyToVirt(phyBufs[i][:sizes[i]], virtBufs[i][d.offset:])
+			if m == 0 {
+				continue
+			}
+			if d.offset+m > len(virtBufs[i]) {
+				slog.Warn("tun datapath: decapsulated packet exceeds buffer, dropping", slog.Int("len", m))
+				continue
+			}
+			writeBatch = append(writeBatch, virtBufs[i][:d.offset+m])
+		}
+		if len(writeBatch) == 0 {
+			continue
+		}
 		if _, err := d.dev.Write(writeBatch, d.offset); err != nil {
 			if isClosedErr(err) {
 				return net.ErrClosed

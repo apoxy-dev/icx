@@ -2,6 +2,7 @@ package tun
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -185,6 +186,67 @@ func TestInboundPlumbing(t *testing.T) {
 		require.Equal(t, frame, got, "inbound: identity engine must surface the underlay frame on the device")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout: inbound frame never reached the device")
+	}
+}
+
+// fakeBatchUnderlay extends fakeUnderlay with the BatchUnderlay contract:
+// ReadFrames blocks for the first frame, then drains whatever else is queued
+// without blocking, up to len(bufs).
+type fakeBatchUnderlay struct {
+	*fakeUnderlay
+}
+
+func (u *fakeBatchUnderlay) ReadFrames(bufs [][]byte, sizes []int) (int, error) {
+	select {
+	case f := <-u.in:
+		sizes[0] = copy(bufs[0], f)
+	case <-u.closed:
+		return 0, net.ErrClosed
+	}
+	n := 1
+	for n < len(bufs) {
+		select {
+		case f := <-u.in:
+			sizes[n] = copy(bufs[n], f)
+			n++
+		default:
+			return n, nil
+		}
+	}
+	return n, nil
+}
+
+func TestInboundBatchPlumbing(t *testing.T) {
+	// Run with the real wireguard TUN's device offset (16 >= the 10-byte
+	// virtio-net header) so a misplaced-offset regression shifts the payload
+	// and fails the equality checks, rather than only ever exercising 0.
+	for _, offset := range []int{0, 16} {
+		t.Run(fmt.Sprintf("offset=%d", offset), func(t *testing.T) {
+			dev := newFakeDevice(8)
+			ul := &fakeBatchUnderlay{fakeUnderlay: newFakeUnderlay()}
+			dp, err := New(Config{Engine: &fakeEngine{}, Device: dev, Underlay: ul, DeviceOffset: offset})
+			require.NoError(t, err)
+			stop := startRun(t, dp)
+			defer stop()
+
+			frames := [][]byte{
+				[]byte("encapd-frame-one"),
+				[]byte("encapd-frame-two"),
+				[]byte("encapd-frame-three"),
+			}
+			for _, f := range frames {
+				ul.in <- append([]byte(nil), f...)
+			}
+
+			for i := 0; i < len(frames); i++ {
+				select {
+				case got := <-dev.written:
+					require.Equal(t, frames[i], got, "inbound batch: frame %d must surface on the device in order", i)
+				case <-time.After(2 * time.Second):
+					t.Fatalf("timeout: inbound batch frame %d never reached the device", i)
+				}
+			}
+		})
 	}
 }
 
