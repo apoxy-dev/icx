@@ -48,8 +48,15 @@ const (
 	// the universally safe floor (seam doc Risk 3 / APO-794).
 	defaultInnerMTU = 1280
 
-	// maxFrameSize bounds a single underlay/decap scratch buffer.
-	maxFrameSize = 65535
+	// rxFrameSlack is extra room in an inbound phy buffer beyond the largest
+	// outer frame a conforming peer emits (innerMTU + encapHeadroom), absorbing
+	// modest peer-side MTU/overhead drift without paying for the 64KiB UDP
+	// theoretical max. A datagram larger than the buffer is truncated by the
+	// socket read and dropped by decap auth — the same fate an oversized inner
+	// packet meets anyway, since it cannot be written to the MTU-clamped TUN.
+	// Sizing per-MTU instead of 64KiB matters: buffers are per-batch-slot
+	// per-session, and a shared-gateway process runs one session per tenant.
+	rxFrameSlack = 512
 
 	// encapHeadroom bounds the outer-header + AEAD-tag overhead added to an inner
 	// packet on encap: udp.PayloadOffsetIPv6 (62) + the 32-byte Geneve header +
@@ -168,6 +175,17 @@ type Datapath struct {
 }
 
 var _ vtep.Datapath = (*Datapath)(nil)
+
+// maxPhyFrame is the inbound phy buffer size: the largest outer frame a
+// conforming peer emits plus slack (see rxFrameSlack). The decap destination
+// must be at least this large — PhyToVirt does not bound its output and
+// AES-GCM Open appends, so the invariant that keeps Open in place is
+// len(virtBuf)-offset >= len(phyBuf), which both inbound pumps preserve. A
+// decapsulated inner packet is always smaller than the frame that carried it,
+// so a phy-sized destination can never overflow.
+func (d *Datapath) maxPhyFrame() int {
+	return d.innerMTU + encapHeadroom + rxFrameSlack
+}
 
 // New creates a Datapath over an injected device and underlay. The pumps do not
 // run until Run is called.
@@ -333,15 +351,12 @@ func (d *Datapath) inbound() error {
 	if bu, ok := d.underlay.(BatchUnderlay); ok {
 		return d.inboundBatch(bu)
 	}
-	phyBuf := make([]byte, maxFrameSize)
+	phyBuf := make([]byte, d.maxPhyFrame())
 	// virtBuf must hold the full decapsulated inner packet at the device offset.
-	// PhyToVirt does NOT bound its output to the destination buffer — the APO-667
-	// seal-overflow bound covers encap only, and AES-GCM Open appends, reallocating
-	// (and mis-placing the plaintext) if the destination is too small. A peer
-	// holding the SA key can emit an inner packet up to the underlay frame size, so
-	// size for the worst case (matching the netstack driver's 65535 buffers) rather
-	// than the local MTU clamp.
-	virtBuf := make([]byte, d.offset+maxFrameSize)
+	// PhyToVirt does NOT bound its output to the destination buffer, so virtBuf
+	// is sized to the phy buffer: the inner packet can never exceed the frame
+	// that carried it (see maxPhyFrame).
+	virtBuf := make([]byte, d.offset+d.maxPhyFrame())
 	writeBatch := make([][]byte, 1)
 	consecErr := 0
 
@@ -374,7 +389,7 @@ func (d *Datapath) inbound() error {
 			continue
 		}
 		if d.offset+m > len(virtBuf) {
-			// Unreachable given virtBuf is sized to maxFrameSize, but never slice
+			// Unreachable given virtBuf is phy-sized, but never slice
 			// past the buffer if that ever changes.
 			slog.Warn("tun datapath: decapsulated packet exceeds buffer, dropping", slog.Int("len", m))
 			continue
@@ -402,8 +417,8 @@ func (d *Datapath) inboundBatch(bu BatchUnderlay) error {
 	// device offset; see the sizing rationale in the single-frame pump.
 	virtBufs := make([][]byte, bs)
 	for i := 0; i < bs; i++ {
-		phyBufs[i] = make([]byte, maxFrameSize)
-		virtBufs[i] = make([]byte, d.offset+maxFrameSize)
+		phyBufs[i] = make([]byte, d.maxPhyFrame())
+		virtBufs[i] = make([]byte, d.offset+d.maxPhyFrame())
 	}
 	sizes := make([]int, bs)
 	writeBatch := make([][]byte, 0, bs)

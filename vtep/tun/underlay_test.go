@@ -128,7 +128,7 @@ func TestUDPUnderlayLoopback(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, n)
 
-	buf := make([]byte, maxFrameSize)
+	buf := make([]byte, testScratchFrame)
 	fn, err := uuB.ReadFrame(buf)
 	require.NoError(t, err)
 	require.NotZero(t, fn)

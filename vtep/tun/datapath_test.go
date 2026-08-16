@@ -15,6 +15,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
+// testScratchFrame is an oversized scratch buffer for building phy frames in
+// tests, deliberately larger than any inbound buffer the datapath allocates.
+const testScratchFrame = 65535
+
 // fakeDevice is an in-memory Device: inner packets to hand to Read are pushed on
 // readCh; packets captured from Write land on written. Close unblocks a pending
 // Read with net.ErrClosed.
@@ -379,10 +383,12 @@ func makeSizedInnerIPv4(t *testing.T, total int) []byte {
 // TestInboundOversizedDecapNoPanic is the regression for the inbound decap-buffer
 // bound: a peer holding the SA key can encapsulate an inner packet larger than the
 // receiver's MTU clamp, and PhyToVirt's AES-GCM Open does not bound its output to
-// the destination buffer. An undersized inbound buffer would slice out of range
-// (panic) on the decapsulated length. The frame is pre-built with a large encap
-// buffer so the APO-667 *encap* bound does not drop it, then fed straight to the
-// receiver datapath.
+// the destination buffer. An undersized decap destination would slice out of range
+// (panic) on the decapsulated length. Inbound buffers are phy-sized (maxPhyFrame),
+// so the oversized frame is truncated at the underlay read and dropped by decap
+// auth instead of delivered; the pump must survive it and keep serving in-MTU
+// traffic. The frame is pre-built with a large encap buffer so the APO-667
+// *encap* bound does not drop it, then fed straight to the receiver datapath.
 func TestInboundOversizedDecapNoPanic(t *testing.T) {
 	const vni = uint(7)
 	lo := tcpip.AddrFrom4([4]byte{127, 0, 0, 1})
@@ -398,9 +404,10 @@ func TestInboundOversizedDecapNoPanic(t *testing.T) {
 	require.NoError(t, hA.UpdateVirtualNetworkSecret(vni, master, spiBA, spiAB, exp))
 	require.NoError(t, hB.UpdateVirtualNetworkSecret(vni, master, spiAB, spiBA, exp))
 
-	// 4000-byte inner packet: far above the 1280 clamp + the old inbound buffer.
+	// 4000-byte inner packet: far above the 1280 clamp and the phy-sized
+	// inbound buffer.
 	largeInner := makeSizedInnerIPv4(t, 4000)
-	phy := make([]byte, maxFrameSize)
+	phy := make([]byte, testScratchFrame)
 	m, loop := hA.VirtToPhy(largeInner, phy)
 	require.False(t, loop)
 	require.NotZero(t, m, "encap with a large buffer must not be dropped")
@@ -413,11 +420,22 @@ func TestInboundOversizedDecapNoPanic(t *testing.T) {
 	defer stop()
 
 	ulB.in <- append([]byte(nil), phy[:m]...)
+
+	// An in-MTU packet queued behind the oversized one: the pump processes the
+	// channel in order, so receiving it (and only it) proves the oversized frame
+	// was dropped without panicking or wedging the pump.
+	smallInner := makeSizedInnerIPv4(t, 512)
+	phy2 := make([]byte, testScratchFrame)
+	m2, loop := hA.VirtToPhy(smallInner, phy2)
+	require.False(t, loop)
+	require.NotZero(t, m2)
+	ulB.in <- append([]byte(nil), phy2[:m2]...)
+
 	select {
 	case got := <-devB.written:
-		require.Equal(t, largeInner, got, "oversized inner packet must decapsulate intact, not panic")
+		require.Equal(t, smallInner, got, "oversized inner must be dropped and the pump must keep serving in-MTU traffic")
 	case <-time.After(2 * time.Second):
-		t.Fatal("timeout: oversized inner packet never decapsulated")
+		t.Fatal("timeout: pump stopped serving after an oversized inner frame")
 	}
 }
 
