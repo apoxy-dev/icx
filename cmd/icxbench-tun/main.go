@@ -104,7 +104,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("tun.Open: %v", err)
 	}
-	defer dp.Close()
+	defer func() { _ = dp.Close() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
