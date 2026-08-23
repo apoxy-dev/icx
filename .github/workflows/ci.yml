@@ -10,10 +10,9 @@ on:
 jobs:
   lint:
     name: Lint
-    # Depot runner with the Dagger engine pinned to the dagger.json engineVersion
-    # (same convention as apoxy-cli / apoxy-cloud). The CLI is pre-installed by the
-    # ,dagger=<ver> label suffix; no install step is needed.
-    runs-on: depot-ubuntu-22.04-16,dagger=0.19.10
+    # Blacksmith runner (same convention as apoxy-cloud). The setup-dagger action
+    # installs the Dagger CLI at the version that dagger.json declares.
+    runs-on: blacksmith-16vcpu-ubuntu-2204
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -23,6 +22,8 @@ jobs:
         with:
           go-version: '1.25.x'
           check-latest: true
+
+      - uses: ./.github/actions/setup-dagger
 
       - name: Run golangci-lint via Dagger
         env:
@@ -36,7 +37,7 @@ jobs:
     # cli modules. The real-kernel datapath tests self-skip (they probe for root
     # + AF_XDP), so this runs on an ordinary runner and fails fast before the
     # heavier privileged matrix below.
-    runs-on: depot-ubuntu-22.04-16,dagger=0.19.10
+    runs-on: blacksmith-16vcpu-ubuntu-2204
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -46,6 +47,8 @@ jobs:
         with:
           go-version: '1.25.x'
           check-latest: true
+
+      - uses: ./.github/actions/setup-dagger
 
       - name: Run unit tests via Dagger
         env:
@@ -65,9 +68,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: depot-ubuntu-22.04-16,dagger=0.19.10
+          - runner: blacksmith-16vcpu-ubuntu-2204
             arch: amd64
-          - runner: depot-ubuntu-22.04-arm-16,dagger=0.19.10
+          - runner: blacksmith-16vcpu-ubuntu-2204-arm
             arch: arm64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -79,6 +82,8 @@ jobs:
         with:
           go-version: '1.25.x'
           check-latest: true
+
+      - uses: ./.github/actions/setup-dagger
 
       - name: Run integration tests via Dagger
         env:
