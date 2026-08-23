@@ -11,7 +11,6 @@ import (
 
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/internal/xsk"
-	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/veth"
 )
 
@@ -30,10 +29,7 @@ import (
 // directly: send a raw frame into the veth and observe where in its frame chunk
 // the kernel placed it after the XDP redirect into the AF_XDP socket.
 func TestForwarderRXHeadroom(t *testing.T) {
-	netAdmin, _ := permissions.IsNetAdmin()
-	if !netAdmin {
-		t.Skip("Skipping test because it requires NET_ADMIN capabilities")
-	}
+	requireForwarderEnv(t)
 
 	const (
 		frameSize         = 2048

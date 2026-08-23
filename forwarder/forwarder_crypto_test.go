@@ -18,7 +18,6 @@ import (
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
@@ -44,10 +43,7 @@ import (
 //     (the same XDP-redirect primitive TestForwarderRXHeadroom uses), and the
 //     decapped inner frame is read with a second raw socket on the virt peer.
 func TestForwarderCryptoRoundTrip(t *testing.T) {
-	netAdmin, _ := permissions.IsNetAdmin()
-	if !netAdmin {
-		t.Skip("Skipping test because it requires NET_ADMIN capabilities")
-	}
+	requireForwarderEnv(t)
 
 	// phy/virt veth pairs. The forwarder binds to the .Peer ends; we inject on
 	// phy.Link and read on virt.Link (the opposite ends), mirroring TestForwarder.

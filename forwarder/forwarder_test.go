@@ -21,7 +21,6 @@ import (
 
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/proxyarp"
 	"github.com/apoxy-dev/icx/veth"
 )
@@ -29,10 +28,7 @@ import (
 const nsName = "icx-test-ns"
 
 func TestForwarder(t *testing.T) {
-	netAdmin, _ := permissions.IsNetAdmin()
-	if !netAdmin {
-		t.Skip("Skipping test because it requires NET_ADMIN capabilities")
-	}
+	requireForwarderEnv(t)
 
 	if testing.Verbose() {
 		slog.SetLogLoggerLevel(slog.LevelDebug)

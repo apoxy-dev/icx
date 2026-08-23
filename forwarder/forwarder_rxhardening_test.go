@@ -18,7 +18,6 @@ import (
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/filter"
 	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
@@ -35,10 +34,7 @@ import (
 // addresses, so the ONLY thing that can drop the bad one is the outer-source
 // check — which is exactly what RXDropsBadPeer isolates.
 func TestForwarderOuterSrcValidation(t *testing.T) {
-	netAdmin, _ := permissions.IsNetAdmin()
-	if !netAdmin {
-		t.Skip("Skipping test because it requires NET_ADMIN capabilities")
-	}
+	requireForwarderEnv(t)
 
 	phyDev, err := veth.Create("icx-s7phy", 1, 1500)
 	require.NoError(t, err)

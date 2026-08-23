@@ -18,7 +18,6 @@ import (
 
 	"github.com/apoxy-dev/icx"
 	"github.com/apoxy-dev/icx/forwarder"
-	"github.com/apoxy-dev/icx/permissions"
 	"github.com/apoxy-dev/icx/psp"
 	"github.com/apoxy-dev/icx/veth"
 )
@@ -40,10 +39,7 @@ import (
 // Integration lane default) it also exercises the N-goroutine datapath for data
 // races that the single-queue tests cannot reach.
 func TestForwarderCryptoMultiQueue(t *testing.T) {
-	netAdmin, _ := permissions.IsNetAdmin()
-	if !netAdmin {
-		t.Skip("Skipping test because it requires NET_ADMIN capabilities")
-	}
+	requireForwarderEnv(t)
 
 	const numQueues = 4
 
