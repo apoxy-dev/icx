@@ -122,6 +122,12 @@ type Statistics struct {
 	RXLearnsDamped atomic.Uint64
 	// LastKeepAliveUnixNano is the timestamp of the last transmitted keep-alive packet.
 	LastKeepAliveUnixNano atomic.Int64
+	// RXKeepAlives is the number of received keep-alive frames. A keep-alive carries
+	// no inner packet, so it is counted here and never in RXPackets or RXBytes.
+	RXKeepAlives atomic.Uint64
+	// TXKeepAlives is the number of transmitted keep-alive frames. A keep-alive carries
+	// no inner packet, so it is counted here and never in TXPackets or TXBytes.
+	TXKeepAlives atomic.Uint64
 }
 
 // Route represents a source/destination address prefix pair allowed for a virtual network.
@@ -1231,9 +1237,10 @@ func (h *Handler) PhyToVirt(phyFrame, virtFrame []byte) int {
 	// Is it an authenticated out-of-band message?
 	if hdr.ProtocolType == 0 {
 		slog.Debug("Dropping out-of-band message")
-		// Treat as a (zero-byte) virtual packet receive for stats purposes.
-		vnet.Stats.RXPackets.Add(1)
-		vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
+		// Count the frame as a keep-alive, not as a packet: it carries no inner
+		// packet, so it must not move the packet and byte counters. The last
+		// receive time still moves, because a keep-alive proves the peer is alive.
+		vnet.Stats.RXKeepAlives.Add(1)
 		vnet.Stats.LastRXUnixNano.Store(h.clock.Now().UnixNano())
 		return 0
 	}
@@ -1773,8 +1780,10 @@ func (h *Handler) ToPhy(phyFrame []byte) int {
 		return 0
 	}
 
-	// Stats: treat as a (zero-byte) virtual packet send.
-	vnet.Stats.TXPackets.Add(1)
+	// Stats: count the frame as a keep-alive, not as a packet. It carries no inner
+	// packet, so it must not move the packet and byte counters. Both send times
+	// still move, because the frame did go out on the wire.
+	vnet.Stats.TXKeepAlives.Add(1)
 	vnet.Stats.LastTXUnixNano.Store(now.UnixNano())
 	vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 

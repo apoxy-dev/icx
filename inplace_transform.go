@@ -249,9 +249,10 @@ func (h *Handler) PhyToVirtInPlace(buf []byte, off, length int) (int, int) {
 	// Is it an authenticated out-of-band message?
 	if hdr.ProtocolType == 0 {
 		slog.Debug("Dropping out-of-band message")
-		// Treat as a (zero-byte) virtual packet receive for stats purposes.
-		vnet.Stats.RXPackets.Add(1)
-		vnet.Stats.RXBytes.Add(uint64(len(ipPacket)))
+		// Count the frame as a keep-alive, not as a packet: it carries no inner
+		// packet, so it must not move the packet and byte counters. The last
+		// receive time still moves, because a keep-alive proves the peer is alive.
+		vnet.Stats.RXKeepAlives.Add(1)
 		vnet.Stats.LastRXUnixNano.Store(h.clock.Now().UnixNano())
 		return dropWindowOffset, 0
 	}
@@ -948,8 +949,10 @@ func (h *Handler) ToPhyInPlace(buf []byte, off int) (int, int) {
 		return dropWindowOffset, 0
 	}
 
-	// Stats: treat as a (zero-byte) virtual packet send.
-	vnet.Stats.TXPackets.Add(1)
+	// Stats: count the frame as a keep-alive, not as a packet. It carries no inner
+	// packet, so it must not move the packet and byte counters. Both send times
+	// still move, because the frame did go out on the wire.
+	vnet.Stats.TXKeepAlives.Add(1)
 	vnet.Stats.LastTXUnixNano.Store(now.UnixNano())
 	vnet.Stats.LastKeepAliveUnixNano.Store(now.UnixNano())
 

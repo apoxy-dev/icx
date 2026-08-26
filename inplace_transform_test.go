@@ -520,12 +520,14 @@ func TestInPlaceToPhyByteEquivalence(t *testing.T) {
 			}
 
 			// The keep-alive must decap as an out-of-band message (ProtocolType
-			// 0): PhyToVirt returns 0 (drop) but increments RXPackets.
-			before := env.vnet.Stats.RXPackets.Load()
+			// 0): PhyToVirt returns 0 (drop) and counts one received keep-alive.
+			before := env.vnet.Stats.RXKeepAlives.Load()
+			beforePackets := env.vnet.Stats.RXPackets.Load()
 			virtOut := make([]byte, mtu+inplaceScratch)
 			m := env.h.PhyToVirt(append([]byte(nil), gotOut...), virtOut)
 			require.Equal(t, 0, m, "keep-alive decap should return 0 (out-of-band)")
-			require.Equal(t, before+1, env.vnet.Stats.RXPackets.Load(), "keep-alive should count as an RX packet")
+			require.Equal(t, before+1, env.vnet.Stats.RXKeepAlives.Load(), "keep-alive should count as a received keep-alive")
+			require.Equal(t, beforePackets, env.vnet.Stats.RXPackets.Load(), "keep-alive must not count as an RX packet")
 		})
 	}
 }

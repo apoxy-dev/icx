@@ -442,3 +442,36 @@ func TestSourceLearningOptionValidation(t *testing.T) {
 	err = h.AddVirtualNetwork(learnVNI, nil, []icx.Route{{Src: wildcard, Dst: wildcard}})
 	require.ErrorContains(t, err, "source learning")
 }
+
+// TestKeepAliveRXStats pins the receive-side keep-alive accounting: an
+// authenticated out-of-band frame counts only in RXKeepAlives, never in
+// RXPackets or RXBytes, so an idle tunnel reports a zero packet rate. The frame
+// must still refresh the last receive time and still teach the RX path where
+// the peer is, because those are the two jobs a keep-alive exists to do.
+func TestKeepAliveRXStats(t *testing.T) {
+	for _, mode := range deliverModes {
+		t.Run(mode.name, func(t *testing.T) {
+			clk := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+			rx := newLearningReceiver(t, clk)
+			vnet, ok := rx.GetVirtualNetwork(learnVNI)
+			require.True(t, ok)
+
+			sender := newLearningSender(t, net.IPv4(10, 0, 0, 2), 4321, learnKey)
+			phy := make([]byte, 2000)
+			n := sender.ToPhy(phy)
+			require.NotZero(t, n)
+
+			clk.Advance(time.Second)
+			require.Zero(t, mode.deliver(rx, append([]byte(nil), phy[:n]...)), "a keep-alive yields no virtual frame")
+
+			require.Equal(t, uint64(1), vnet.Stats.RXKeepAlives.Load(), "the keep-alive is counted as a keep-alive")
+			require.Zero(t, vnet.Stats.RXPackets.Load(), "a keep-alive is not a packet")
+			require.Zero(t, vnet.Stats.RXBytes.Load(), "a keep-alive carries no payload bytes")
+			require.Equal(t, clk.Now().UnixNano(), vnet.Stats.LastRXUnixNano.Load(), "the last receive time moves")
+
+			// Source learning still runs on the keep-alive path.
+			require.Equal(t, uint64(1), vnet.Stats.RXLearnedRemotes.Load(), "the keep-alive still teaches the endpoint")
+			requireRemote(t, rx, net.IPv4(10, 0, 0, 2), 4321)
+		})
+	}
+}

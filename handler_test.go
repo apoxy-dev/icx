@@ -825,3 +825,69 @@ type fakeClock struct {
 
 func (c *fakeClock) Now() time.Time          { return c.now }
 func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+// keepAliveSendModes drives both keep-alive transmit paths — the two-buffer
+// ToPhy and the in-place ToPhyInPlace — so the accounting of one cannot drift
+// from the other.
+var keepAliveSendModes = []struct {
+	name string
+	send func(h *icx.Handler) int
+}{
+	{"cross-buffer", func(h *icx.Handler) int {
+		return h.ToPhy(make([]byte, 2000))
+	}},
+	{"in-place", func(h *icx.Handler) int {
+		buf := make([]byte, 2000)
+		_, n := h.ToPhyInPlace(buf, 128)
+		return n
+	}},
+}
+
+// TestKeepAliveTXStats pins the transmit-side keep-alive accounting: a keep-alive
+// carries no inner packet, so it counts only in TXKeepAlives and must leave the
+// packet and byte counters alone. An idle tunnel must therefore report a zero
+// packet rate. Both send times still move, because the frame did go out on the
+// wire and the keep-alive scheduler needs to know when it did.
+func TestKeepAliveTXStats(t *testing.T) {
+	for _, mode := range keepAliveSendModes {
+		t.Run(mode.name, func(t *testing.T) {
+			clk := &fakeClock{now: time.Unix(1_700_000_000, 0)}
+
+			localAddr := &tcpip.FullAddress{
+				Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 1).To4()),
+				Port: 1234,
+			}
+			peerAddr := &tcpip.FullAddress{
+				Addr: tcpip.AddrFrom4Slice(net.IPv4(10, 0, 0, 2).To4()),
+				Port: 4321,
+			}
+
+			var key [16]byte
+			copy(key[:], []byte("0123456789abcdef"))
+
+			h, err := icx.NewHandler(
+				icx.WithLocalAddr(localAddr),
+				icx.WithLayer3VirtFrames(),
+				icx.WithKeepAliveInterval(10*time.Second),
+				icx.WithClock(clk),
+			)
+			require.NoError(t, err)
+
+			wildcard := netip.MustParsePrefix("0.0.0.0/0")
+			require.NoError(t, h.AddVirtualNetwork(0x12345, peerAddr, []icx.Route{{Src: wildcard, Dst: wildcard}}))
+			require.NoError(t, h.InstallKeysForTest(0x12345, 1, key, key, clk.Now().Add(time.Hour)))
+
+			vnet, ok := h.GetVirtualNetwork(0x12345)
+			require.True(t, ok)
+
+			clk.Advance(time.Minute)
+			require.NotZero(t, mode.send(h), "a keep-alive is due")
+
+			require.Equal(t, uint64(1), vnet.Stats.TXKeepAlives.Load(), "the keep-alive is counted as a keep-alive")
+			require.Zero(t, vnet.Stats.TXPackets.Load(), "a keep-alive is not a packet")
+			require.Zero(t, vnet.Stats.TXBytes.Load(), "a keep-alive carries no payload bytes")
+			require.Equal(t, clk.Now().UnixNano(), vnet.Stats.LastTXUnixNano.Load(), "the last send time moves")
+			require.Equal(t, clk.Now().UnixNano(), vnet.Stats.LastKeepAliveUnixNano.Load(), "the last keep-alive time moves")
+		})
+	}
+}
