@@ -70,6 +70,7 @@ type geneveProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type geneveMapSpecs struct {
 	BindMap    *ebpf.MapSpec `ebpf:"bind_map"`
+	NextProg   *ebpf.MapSpec `ebpf:"next_prog"`
 	QidconfMap *ebpf.MapSpec `ebpf:"qidconf_map"`
 	XsksMap    *ebpf.MapSpec `ebpf:"xsks_map"`
 }
@@ -101,6 +102,7 @@ func (o *geneveObjects) Close() error {
 // It can be passed to loadGeneveObjects or ebpf.CollectionSpec.LoadAndAssign.
 type geneveMaps struct {
 	BindMap    *ebpf.Map `ebpf:"bind_map"`
+	NextProg   *ebpf.Map `ebpf:"next_prog"`
 	QidconfMap *ebpf.Map `ebpf:"qidconf_map"`
 	XsksMap    *ebpf.Map `ebpf:"xsks_map"`
 }
@@ -108,6 +110,7 @@ type geneveMaps struct {
 func (m *geneveMaps) Close() error {
 	return _GeneveClose(
 		m.BindMap,
+		m.NextProg,
 		m.QidconfMap,
 		m.XsksMap,
 	)

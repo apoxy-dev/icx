@@ -1,0 +1,873 @@
+//go:build linux
+
+package filter
+
+import (
+	"encoding/binary"
+	"errors"
+	"net"
+	"net/netip"
+	"os"
+	"runtime"
+	"strconv"
+	"testing"
+	"time"
+	"unsafe"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+
+	"github.com/apoxy-dev/icx/permissions"
+)
+
+// XDP actions.
+const (
+	xdpDROP uint32 = 1
+	xdpPASS uint32 = 2
+	xdpTX   uint32 = 3
+)
+
+const (
+	relayPort  = 6081
+	nextPort   = 5000
+	testSPI    = 0x01020304
+	testMaxLen = 1500
+)
+
+var (
+	relayMAC = net.HardwareAddr{0x02, 0, 0, 0, 0, 0x01}
+	peerMAC  = net.HardwareAddr{0x02, 0, 0, 0, 0, 0x02}
+	// relay4 and relay6 are on the test link. next4 and next6 are neighbors
+	// on it. The senders are anywhere.
+	relay4  = netip.MustParseAddr("10.9.0.1")
+	next4   = netip.MustParseAddr("10.9.0.2")
+	sender4 = netip.MustParseAddr("192.0.2.7")
+	relay6  = netip.MustParseAddr("fd09::1")
+	next6   = netip.MustParseAddr("fd09::2")
+	sender6 = netip.MustParseAddr("2001:db8::7")
+	noNeigh = netip.MustParseAddr("10.9.0.77")
+	other4  = netip.MustParseAddr("198.51.100.9")
+)
+
+// xdpMD is struct xdp_md, the context of an XDP test run.
+type xdpMD struct {
+	Data, DataEnd, DataMeta, IngressIfindex, RxQueueIndex, EgressIfindex uint32
+}
+
+// testNS is a netns with a veth link rl0 that has the relay addresses and
+// the neighbors next4 and next6. A test run finds the ingress ifindex in the
+// netns of the thread, so the programs run on the thread of testNS.
+type testNS struct {
+	ifindex int
+	work    chan func()
+}
+
+// newTestNS makes a testNS. It skips the test without NET_ADMIN.
+func newTestNS(t testing.TB) *testNS {
+	t.Helper()
+	if ok, _ := permissions.IsNetAdmin(); !ok {
+		t.Skip("needs NET_ADMIN")
+	}
+	ns := &testNS{work: make(chan func())}
+	errc := make(chan error, 1)
+	go func() {
+		// The thread stays in the new netns, so it must exit with the goroutine.
+		runtime.LockOSThread()
+		if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+			errc <- err
+			return
+		}
+		var err error
+		ns.ifindex, err = setupLink()
+		errc <- err
+		if err != nil {
+			return
+		}
+		for fn := range ns.work {
+			fn()
+		}
+	}()
+	if err := <-errc; err != nil {
+		t.Skipf("cannot set up the test netns: %v", err)
+	}
+	t.Cleanup(func() { close(ns.work) })
+	return ns
+}
+
+func setForwarding(t testing.TB, ns *testNS, v string) {
+	var err error
+	ns.do(func() { err = os.WriteFile("/proc/sys/net/ipv4/conf/rl0/forwarding", []byte(v), 0o644) })
+	require.NoError(t, err)
+}
+
+// do runs fn on the thread of ns.
+func (ns *testNS) do(fn func()) {
+	done := make(chan struct{})
+	ns.work <- func() {
+		defer close(done)
+		fn()
+	}
+	<-done
+}
+
+func setupLink() (int, error) {
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: "rl0", HardwareAddr: relayMAC},
+		PeerName:  "rl1",
+	}
+	if err := netlink.LinkAdd(veth); err != nil {
+		return 0, err
+	}
+	for _, name := range []string{"lo", "rl0", "rl1"} {
+		l, err := netlink.LinkByName(name)
+		if err != nil {
+			return 0, err
+		}
+		if err := netlink.LinkSetUp(l); err != nil {
+			return 0, err
+		}
+	}
+	l, err := netlink.LinkByName("rl0")
+	if err != nil {
+		return 0, err
+	}
+	for _, p := range []string{"10.9.0.1/24", "fd09::1/64"} {
+		a, _ := netlink.ParseAddr(p)
+		a.Flags = unix.IFA_F_NODAD
+		if err := netlink.AddrAdd(l, a); err != nil {
+			return 0, err
+		}
+	}
+	for _, ip := range []netip.Addr{next4, next6} {
+		fam := netlink.FAMILY_V4
+		if ip.Is6() {
+			fam = netlink.FAMILY_V6
+		}
+		n := &netlink.Neigh{LinkIndex: l.Attrs().Index, Family: fam, State: netlink.NUD_PERMANENT, IP: ip.AsSlice(), HardwareAddr: peerMAC}
+		if err := netlink.NeighAdd(n); err != nil {
+			return 0, err
+		}
+	}
+	// The FIB lookup of XDP needs forwarding on the ingress link.
+	for _, f := range []string{"/proc/sys/net/ipv4/conf/rl0/forwarding", "/proc/sys/net/ipv6/conf/rl0/forwarding"} {
+		if err := os.WriteFile(f, []byte("1"), 0o644); err != nil {
+			return 0, err
+		}
+	}
+	return l.Attrs().Index, nil
+}
+
+// pspPayload returns a PSP packet of size bytes with spi.
+func pspPayload(size int, spi uint32) []byte {
+	p := make([]byte, size)
+	p[0], p[1], p[2], p[3] = 4, 2, 2, 0x03
+	binary.BigEndian.PutUint32(p[4:8], spi)
+	for i := 8; i < size; i++ {
+		p[i] = byte(i)
+	}
+	return p
+}
+
+// packet returns an Ethernet frame from src to dst with payload.
+func packet(t testing.TB, src, dst netip.AddrPort, ttl uint8, payload []byte) []byte {
+	t.Helper()
+	eth := &layers.Ethernet{SrcMAC: peerMAC, DstMAC: relayMAC, EthernetType: layers.EthernetTypeIPv4}
+	udp := &layers.UDP{SrcPort: layers.UDPPort(src.Port()), DstPort: layers.UDPPort(dst.Port())}
+	var ip gopacket.NetworkLayer
+	if src.Addr().Is4() {
+		ip4 := &layers.IPv4{Version: 4, IHL: 5, TTL: ttl, Protocol: layers.IPProtocolUDP, SrcIP: src.Addr().AsSlice(), DstIP: dst.Addr().AsSlice()}
+		ip = ip4
+	} else {
+		eth.EthernetType = layers.EthernetTypeIPv6
+		ip = &layers.IPv6{Version: 6, HopLimit: ttl, NextHeader: layers.IPProtocolUDP, SrcIP: src.Addr().AsSlice(), DstIP: dst.Addr().AsSlice()}
+	}
+	require.NoError(t, udp.SetNetworkLayerForChecksum(ip))
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	require.NoError(t, gopacket.SerializeLayers(buf, opts, eth, ip.(gopacket.SerializableLayer), udp, gopacket.Payload(payload)))
+	return buf.Bytes()
+}
+
+// sum16 returns the one's complement sum of b, with initial sum s.
+func sum16(s uint32, b []byte) uint32 {
+	for i := 0; i+1 < len(b); i += 2 {
+		s += uint32(binary.BigEndian.Uint16(b[i:]))
+	}
+	if len(b)%2 == 1 {
+		s += uint32(b[len(b)-1]) << 8
+	}
+	return s
+}
+
+func fold(s uint32) uint16 {
+	for s > 0xffff {
+		s = s&0xffff + s>>16
+	}
+	return uint16(s)
+}
+
+// fixIPv4Sum sets the header checksum of the IPv4 header h.
+func fixIPv4Sum(h []byte) {
+	h[10], h[11] = 0, 0
+	binary.BigEndian.PutUint16(h[10:12], ^fold(sum16(0, h)))
+}
+
+// checkSums checks the IPv4 header checksum and the UDP checksum of frame.
+func checkSums(t *testing.T, frame []byte) {
+	t.Helper()
+	var src, dst []byte
+	var udp []byte
+	if binary.BigEndian.Uint16(frame[12:14]) == 0x0800 {
+		ip := frame[14:34]
+		assert.Equal(t, uint16(0xffff), fold(sum16(0, ip)), "IPv4 header checksum")
+		src, dst, udp = ip[12:16], ip[16:20], frame[34:]
+	} else {
+		ip := frame[14:54]
+		src, dst, udp = ip[8:24], ip[24:40], frame[54:]
+	}
+	udp = udp[:binary.BigEndian.Uint16(udp[4:6])]
+	if binary.BigEndian.Uint16(udp[6:8]) == 0 {
+		return
+	}
+	s := sum16(0, src)
+	s = sum16(s, dst)
+	s += uint32(unix.IPPROTO_UDP) + uint32(len(udp))
+	assert.Equal(t, uint16(0xffff), fold(sum16(s, udp)), "UDP checksum")
+}
+
+// newTestRelay loads a relay program with the test port, length bound and addresses.
+func newTestRelay(t testing.TB, cfg RelayConfig) *Relay {
+	t.Helper()
+	cfg.Port = relayPort
+	cfg.MaxLen = testMaxLen
+	r, err := NewRelay(cfg)
+	if errors.Is(err, unix.EPERM) {
+		t.Skipf("cannot load BPF programs: %v", err)
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = r.Close() })
+	require.NoError(t, r.SetAddrs([]netip.Addr{relay4, relay6}))
+	return r
+}
+
+func (ns *testNS) run(t testing.TB, prog *ebpf.Program, frame []byte) (uint32, []byte) {
+	t.Helper()
+	out := make([]byte, len(frame)+256)
+	opts := &ebpf.RunOptions{
+		Data:    frame,
+		DataOut: out,
+		Context: xdpMD{DataEnd: uint32(len(frame)), IngressIfindex: uint32(ns.ifindex)},
+	}
+	var ret uint32
+	var err error
+	ns.do(func() { ret, err = prog.Run(opts) })
+	require.NoError(t, err)
+	return ret, opts.DataOut
+}
+
+func TestRelayForward(t *testing.T) {
+	far := Monotonic() + time.Hour
+	src4, dst4 := netip.AddrPortFrom(sender4, 4000), netip.AddrPortFrom(relay4, relayPort)
+	src6, dst6 := netip.AddrPortFrom(sender6, 4000), netip.AddrPortFrom(relay6, relayPort)
+	row4 := map[netip.AddrPort]RelayRow{src4: {Next: netip.AddrPortFrom(next4, nextPort), Expires: far}}
+	row6 := map[netip.AddrPort]RelayRow{src6: {Next: netip.AddrPortFrom(next6, nextPort), Expires: far}}
+	cases := []struct {
+		name    string
+		cfg     RelayConfig
+		rows    map[netip.AddrPort]RelayRow // Rows for testSPI.
+		tunnels []uint32
+		frames  int // Frames to send; the last one is checked. Default 1.
+		src     netip.AddrPort
+		dst     netip.AddrPort
+		ttl     uint8
+		payload []byte
+		noCsum  bool                // Send with UDP checksum 0.
+		noFwd   bool                // Turn off IPv4 forwarding on the link.
+		mutate  func([]byte) []byte // Changes the frame. A forward keeps the change.
+		want    uint32
+		stats   RelayStats
+	}{
+		{
+			name: "IPv4 forward",
+			rows: row4, src: src4, dst: dst4, ttl: 3,
+			want: xdpTX, stats: RelayStats{Packets: 1, Bytes: 100},
+		},
+		{
+			name: "IPv6 forward",
+			rows: row6, src: src6, dst: dst6, ttl: 1,
+			want: xdpTX, stats: RelayStats{Packets: 1, Bytes: 100},
+		},
+		{
+			name: "IPv4 forward with no UDP checksum",
+			rows: row4, src: src4, dst: dst4, ttl: 64, noCsum: true,
+			want: xdpTX, stats: RelayStats{Packets: 1, Bytes: 100},
+		},
+		{
+			name: "IPv6 with no UDP checksum",
+			rows: row6, src: src6, dst: dst6, ttl: 64, noCsum: true,
+			want: xdpPASS, stats: RelayStats{Malformed: 1},
+		},
+		{
+			name: "frame with Ethernet padding",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			mutate: func(f []byte) []byte { return append(f, make([]byte, 20)...) },
+			want:   xdpTX, stats: RelayStats{Packets: 1, Bytes: 100},
+		},
+		{
+			name: "unknown row",
+			rows: map[netip.AddrPort]RelayRow{netip.AddrPortFrom(sender4, 4001): {Next: netip.AddrPortFrom(next4, nextPort), Expires: far}},
+			src:  src4, dst: dst4, ttl: 64,
+			want: xdpPASS, stats: RelayStats{NoRow: 1},
+		},
+		{
+			name: "destination is not a relay address",
+			rows: row4, src: src4, dst: netip.AddrPortFrom(other4, relayPort), ttl: 64,
+			want: xdpPASS,
+		},
+		{
+			name: "datagram above the length bound",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			payload: pspPayload(testMaxLen-28+1, testSPI),
+			want:    xdpPASS, stats: RelayStats{TooLong: 1},
+		},
+		{
+			name: "QUIC packet",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			payload: append([]byte{0x40}, pspPayload(99, testSPI)[1:]...),
+			want:    xdpPASS,
+		},
+		{
+			name: "reserved SPI",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			payload: pspPayload(100, 0x80000000),
+			want:    xdpPASS,
+		},
+		{
+			name: "short PSP packet",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			payload: pspPayload(39, testSPI),
+			want:    xdpPASS,
+		},
+		{
+			name: "PSP packet with the D bit",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			payload: func() []byte {
+				p := pspPayload(100, testSPI)
+				p[3] |= 0x40
+				return p
+			}(),
+			want: xdpPASS,
+		},
+		{
+			name: "other port",
+			rows: row4, src: src4, dst: netip.AddrPortFrom(relay4, relayPort+1), ttl: 64,
+			want: xdpPASS,
+		},
+		{
+			name: "IPv4 options",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			mutate: func(f []byte) []byte {
+				out := append(append(append([]byte{}, f[:34]...), 1, 1, 1, 0), f[34:]...)
+				out[14] = 0x46
+				binary.BigEndian.PutUint16(out[16:18], binary.BigEndian.Uint16(f[16:18])+4)
+				fixIPv4Sum(out[14:38])
+				return out
+			},
+			want: xdpPASS,
+		},
+		{
+			name: "IPv4 fragment",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			mutate: func(f []byte) []byte {
+				f[20] |= 0x20
+				fixIPv4Sum(f[14:34])
+				return f
+			},
+			want: xdpPASS,
+		},
+		{
+			name: "truncated frame",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			mutate: func(f []byte) []byte { return f[:len(f)-10] },
+			want:   xdpPASS,
+		},
+		{
+			name: "UDP length below the IP length",
+			rows: row4, src: src4, dst: dst4, ttl: 64,
+			mutate: func(f []byte) []byte {
+				binary.BigEndian.PutUint16(f[38:40], 100)
+				return f
+			},
+			want: xdpPASS,
+		},
+		{
+			name: "expired row",
+			rows: map[netip.AddrPort]RelayRow{src4: {Next: netip.AddrPortFrom(next4, nextPort), Expires: Monotonic() - time.Second}},
+			src:  src4, dst: dst4, ttl: 64,
+			want: xdpPASS, stats: RelayStats{Expired: 1},
+		},
+		{
+			name: "no neighbor",
+			rows: map[netip.AddrPort]RelayRow{src4: {Next: netip.AddrPortFrom(noNeigh, nextPort), Expires: far}},
+			src:  src4, dst: dst4, ttl: 64,
+			want: xdpPASS, stats: RelayStats{NoRoute: 1},
+		},
+		{
+			name: "next hop of the other family",
+			rows: map[netip.AddrPort]RelayRow{src4: {Next: netip.AddrPortFrom(next6, nextPort), Expires: far}},
+			src:  src4, dst: dst4, ttl: 64,
+			want: xdpPASS, stats: RelayStats{NoRoute: 1},
+		},
+		{
+			name: "forwarding off",
+			rows: row4, noFwd: true, src: src4, dst: dst4, ttl: 64,
+			want: xdpPASS, stats: RelayStats{NoRoute: 1},
+		},
+		{
+			name: "lane meter drop",
+			cfg:  RelayConfig{LaneRate: 1, LaneBurst: 250},
+			rows: row4, frames: 3, src: src4, dst: dst4, ttl: 64,
+			want: xdpDROP, stats: RelayStats{Packets: 2, Bytes: 200, LaneDrops: 1},
+		},
+		{
+			name:    "tunnel limit drop",
+			cfg:     RelayConfig{TunnelRate: 1, TunnelBurst: 150},
+			rows:    map[netip.AddrPort]RelayRow{src4: {Next: netip.AddrPortFrom(next4, nextPort), Tunnel: 7, Expires: far}},
+			tunnels: []uint32{7},
+			frames:  2, src: src4, dst: dst4, ttl: 64,
+			want: xdpDROP, stats: RelayStats{Packets: 1, Bytes: 100, TunnelDrops: 1},
+		},
+		{
+			name: "row with no tunnel",
+			cfg:  RelayConfig{TunnelRate: 1, TunnelBurst: 150},
+			rows: row4, frames: 3, src: src4, dst: dst4, ttl: 64,
+			want: xdpTX, stats: RelayStats{Packets: 3, Bytes: 300},
+		},
+	}
+	ns := newTestNS(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRelay(t, tc.cfg)
+			for src, row := range tc.rows {
+				require.NoError(t, r.PutRow(src, testSPI, row))
+			}
+			for _, id := range tc.tunnels {
+				require.NoError(t, r.PutTunnel(id))
+			}
+			payload := tc.payload
+			if payload == nil {
+				payload = pspPayload(100, testSPI)
+			}
+			frame := packet(t, tc.src, tc.dst, tc.ttl, payload)
+			if tc.noCsum {
+				off := 34
+				if tc.src.Addr().Is6() {
+					off = 54
+				}
+				frame[off+6], frame[off+7] = 0, 0
+			}
+			if tc.mutate != nil {
+				frame = tc.mutate(frame)
+			}
+			if tc.noFwd {
+				setForwarding(t, ns, "0")
+				t.Cleanup(func() { setForwarding(t, ns, "1") })
+			}
+			var ret uint32
+			var out []byte
+			for range max(tc.frames, 1) {
+				ret, out = ns.run(t, r.Program(), frame)
+			}
+			assert.Equal(t, tc.want, ret)
+			st, err := r.Stats()
+			require.NoError(t, err)
+			assert.Equal(t, tc.stats, st)
+			if ret != xdpTX {
+				if ret == xdpPASS {
+					assert.Equal(t, frame, out, "a passed frame does not change")
+				}
+				return
+			}
+			row := tc.rows[tc.src]
+			want := packet(t, netip.AddrPortFrom(tc.dst.Addr(), relayPort), row.Next, 64, payload)
+			copy(want[0:6], peerMAC)
+			copy(want[6:12], relayMAC)
+			if tc.noCsum {
+				want[34+6], want[34+7] = 0, 0
+			}
+			if tc.mutate != nil {
+				want = tc.mutate(want)
+			}
+			if tc.src.Addr().Is4() {
+				// The IP ID and the IP checksum come from the input frame.
+				copy(want[18:20], out[18:20])
+				copy(want[24:26], out[24:26])
+			}
+			assert.Equal(t, want, out)
+			checkSums(t, out)
+			c, err := r.Counters(tc.src, testSPI)
+			require.NoError(t, err)
+			assert.Equal(t, tc.stats.Packets, c.Packets)
+			assert.Equal(t, tc.stats.Bytes, c.Bytes)
+			assert.Greater(t, c.Used, time.Duration(0))
+		})
+	}
+}
+
+func TestRelayRows(t *testing.T) {
+	ns := newTestNS(t)
+	r := newTestRelay(t, RelayConfig{LaneRate: 1, LaneBurst: 250, TunnelRate: 1, TunnelBurst: 1000})
+	src := netip.AddrPortFrom(sender4, 4000)
+	frame := packet(t, src, netip.AddrPortFrom(relay4, relayPort), 64, pspPayload(100, testSPI))
+	require.NoError(t, r.PutTunnel(3))
+	require.NoError(t, r.PutRow(src, testSPI, RelayRow{Next: netip.AddrPortFrom(next4, nextPort), Tunnel: 3, Expires: Monotonic() + time.Hour}))
+	for range 3 {
+		ns.run(t, r.Program(), frame)
+	}
+	// A change keeps the meter and the counters.
+	require.NoError(t, r.PutRow(src, testSPI, RelayRow{Next: netip.AddrPortFrom(next4, nextPort+1), Tunnel: 3, Expires: Monotonic() + time.Hour}))
+	ret, out := ns.run(t, r.Program(), frame)
+	assert.Equal(t, xdpDROP, ret)
+	assert.NotEqual(t, uint16(nextPort+1), binary.BigEndian.Uint16(out[36:38]))
+	c, err := r.Counters(src, testSPI)
+	require.NoError(t, err)
+	assert.Equal(t, RelayCounters{Packets: 2, Bytes: 200, Drops: 2, Used: c.Used}, c)
+
+	c, err = r.DeleteRow(src, testSPI)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), c.Packets)
+	_, err = r.Counters(src, testSPI)
+	assert.ErrorIs(t, err, ebpf.ErrKeyNotExist)
+	ret, _ = ns.run(t, r.Program(), frame)
+	assert.Equal(t, xdpPASS, ret)
+	// A new row starts with a full meter and zero counters.
+	require.NoError(t, r.PutRow(src, testSPI, RelayRow{Next: netip.AddrPortFrom(next4, nextPort), Tunnel: 3, Expires: Monotonic() + time.Hour}))
+	ret, _ = ns.run(t, r.Program(), frame)
+	assert.Equal(t, xdpTX, ret)
+	c, err = r.Counters(src, testSPI)
+	require.NoError(t, err)
+	assert.Equal(t, RelayCounters{Packets: 1, Bytes: 100, Used: c.Used}, c)
+
+	drops, err := r.DeleteTunnel(3)
+	require.NoError(t, err)
+	assert.Zero(t, drops)
+	_, err = r.TunnelDrops(3)
+	assert.ErrorIs(t, err, ebpf.ErrKeyNotExist)
+}
+
+// TestRelayMeterLargestBurst runs each meter with the largest burst at a low
+// rate, on back-to-back packets. A refill must not overflow the tokens, which
+// would empty the bucket.
+func TestRelayMeterLargestBurst(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  RelayConfig
+	}{
+		{"lane meter", RelayConfig{LaneRate: 2e8, LaneBurst: MaxRelayBurst}},
+		{"tunnel limit", RelayConfig{TunnelRate: 2e8, TunnelBurst: MaxRelayBurst}},
+	}
+	ns := newTestNS(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRelay(t, tc.cfg)
+			// The forwarded frame goes to next, so next is a relay address too.
+			require.NoError(t, r.SetAddrs([]netip.Addr{relay4, next4}))
+			require.NoError(t, r.PutTunnel(1))
+			to := netip.AddrPortFrom(next4, relayPort)
+			for _, src := range []netip.AddrPort{netip.AddrPortFrom(sender4, 4000), netip.AddrPortFrom(relay4, relayPort), to} {
+				require.NoError(t, r.PutRow(src, testSPI, RelayRow{Next: to, Tunnel: 1, Expires: Monotonic() + time.Hour}))
+			}
+			frame := packet(t, netip.AddrPortFrom(sender4, 4000), netip.AddrPortFrom(relay4, relayPort), 64, pspPayload(100, testSPI))
+			opts := &ebpf.RunOptions{
+				Data:    frame,
+				Repeat:  2000,
+				Context: xdpMD{DataEnd: uint32(len(frame)), IngressIfindex: uint32(ns.ifindex)},
+			}
+			var ret uint32
+			var err error
+			ns.do(func() { ret, err = r.Program().Run(opts) })
+			require.NoError(t, err)
+			assert.Equal(t, xdpTX, ret)
+			st, err := r.Stats()
+			require.NoError(t, err)
+			assert.Equal(t, RelayStats{Packets: 2000, Bytes: 200000}, st)
+		})
+	}
+}
+
+// TestRelayChain checks that the Geneve program sends the packets that it
+// passes to the relay program.
+func TestRelayChain(t *testing.T) {
+	ns := newTestNS(t)
+	r := newTestRelay(t, RelayConfig{})
+	g, err := Geneve(&net.UDPAddr{IP: relay4.AsSlice(), Port: relayPort})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = g.Close() })
+	src := netip.AddrPortFrom(sender4, 4000)
+	require.NoError(t, r.PutRow(src, testSPI, RelayRow{Next: netip.AddrPortFrom(next4, nextPort), Expires: Monotonic() + time.Hour}))
+	frame := packet(t, src, netip.AddrPortFrom(relay4, relayPort), 64, pspPayload(100, testSPI))
+
+	ret, _ := ns.run(t, g.Program, frame)
+	assert.Equal(t, xdpPASS, ret)
+	require.NoError(t, g.Chain(r.Program()))
+	ret, _ = ns.run(t, g.Program, frame)
+	assert.Equal(t, xdpTX, ret)
+	require.NoError(t, g.Chain(nil))
+	ret, _ = ns.run(t, g.Program, frame)
+	assert.Equal(t, xdpPASS, ret)
+}
+
+// genericResult is what the next hops of a TestRelayGeneric case got.
+type genericResult struct {
+	spisA, spisB []uint32
+	stats        RelayStats
+	err          error
+}
+
+// TestRelayGeneric runs the program in generic mode on a veth and sends to it
+// from the peer netns, as a wire does and as a sender with UDP GSO does. The
+// kernel gives a GSO message to generic XDP as one datagram.
+func TestRelayGeneric(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	cases := []struct {
+		name  string
+		gso   bool // Send both packets in one UDP GSO message.
+		size  int  // PSP packet size.
+		spisA []uint32
+		spisB []uint32
+		stats RelayStats
+	}{
+		{name: "single datagrams", size: 100, spisA: []uint32{1}, spisB: []uint32{2}, stats: RelayStats{Packets: 2, Bytes: 200}},
+		{name: "joined datagram above the length bound", gso: true, size: 800, stats: RelayStats{TooLong: 1}},
+		// The program does not see this join, so the packet of SPI 2 goes to
+		// the next hop of SPI 1. The loader must check the link.
+		{name: "joined datagram below the length bound", gso: true, size: 600, spisA: []uint32{1, 2}, stats: RelayStats{Packets: 1, Bytes: 1200}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runGeneric(t, tc.gso, tc.size)
+			require.NoError(t, res.err)
+			assert.Equal(t, tc.spisA, res.spisA)
+			assert.Equal(t, tc.spisB, res.spisB)
+			assert.Equal(t, tc.stats, res.stats)
+		})
+	}
+}
+
+// runGeneric makes a relay netns with rl0 (10.9.0.1) and a peer netns with
+// rl1, which has the sender 10.9.0.7 and the next hops 10.9.0.2 and 10.9.0.3.
+// It sends a PSP packet with SPI 1 and one with SPI 2 to the relay and
+// returns what each next hop got.
+func runGeneric(t *testing.T, gso bool, size int) genericResult {
+	t.Helper()
+	resc := make(chan genericResult, 1)
+	go func() {
+		// The thread moves between the netns, so it must exit with the goroutine.
+		runtime.LockOSThread()
+		var res genericResult
+		defer func() { resc <- res }()
+		res.err = func() error {
+			relayNS, peerNS, err := twoNetNS()
+			if err != nil {
+				return err
+			}
+			defer unix.Close(relayNS)
+			defer unix.Close(peerNS)
+			veth := &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "rl0", HardwareAddr: relayMAC}, PeerName: "rl1", PeerHardwareAddr: peerMAC}
+			if err := netlink.LinkAdd(veth); err != nil {
+				return err
+			}
+			l0, err := netlink.LinkByName("rl0")
+			if err != nil {
+				return err
+			}
+			l1, err := netlink.LinkByName("rl1")
+			if err != nil {
+				return err
+			}
+			if err := netlink.LinkSetNsFd(l1, peerNS); err != nil {
+				return err
+			}
+			if err := linkUp(l0, "10.9.0.1/24", map[string]net.HardwareAddr{"10.9.0.2": peerMAC, "10.9.0.3": peerMAC, "10.9.0.7": peerMAC}); err != nil {
+				return err
+			}
+			if err := os.WriteFile("/proc/sys/net/ipv4/conf/rl0/forwarding", []byte("1"), 0o644); err != nil {
+				return err
+			}
+			r, err := NewRelay(RelayConfig{Port: relayPort, MaxLen: uint32(l0.Attrs().MTU)})
+			if err != nil {
+				return err
+			}
+			defer r.Close()
+			if err := r.SetAddrs([]netip.Addr{relay4}); err != nil {
+				return err
+			}
+			if err := r.Attach(l0.Attrs().Index, link.XDPGenericMode); err != nil {
+				return err
+			}
+			sender := netip.MustParseAddrPort("10.9.0.7:4000")
+			for spi, next := range map[uint32]string{1: "10.9.0.2:5000", 2: "10.9.0.3:5000"} {
+				if err := r.PutRow(sender, spi, RelayRow{Next: netip.MustParseAddrPort(next), Expires: Monotonic() + time.Hour}); err != nil {
+					return err
+				}
+			}
+
+			if err := unix.Setns(peerNS, unix.CLONE_NEWNET); err != nil {
+				return err
+			}
+			l1, err = netlink.LinkByName("rl1")
+			if err != nil {
+				return err
+			}
+			if err := linkUp(l1, "10.9.0.7/24", map[string]net.HardwareAddr{"10.9.0.1": relayMAC}); err != nil {
+				return err
+			}
+			for _, p := range []string{"10.9.0.2/24", "10.9.0.3/24"} {
+				a, _ := netlink.ParseAddr(p)
+				if err := netlink.AddrAdd(l1, a); err != nil {
+					return err
+				}
+			}
+			var conns [3]*net.UDPConn
+			for i, a := range []string{"10.9.0.2:5000", "10.9.0.3:5000", "10.9.0.7:4000"} {
+				if conns[i], err = net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(a))); err != nil {
+					return err
+				}
+				defer conns[i].Close()
+			}
+			dst := &net.UDPAddr{IP: relay4.AsSlice(), Port: relayPort}
+			p1, p2 := pspPayload(size, 1), pspPayload(size, 2)
+			if gso {
+				oob := make([]byte, unix.CmsgSpace(2))
+				h := (*unix.Cmsghdr)(unsafe.Pointer(&oob[0]))
+				h.Level, h.Type = unix.SOL_UDP, unix.UDP_SEGMENT
+				h.SetLen(unix.CmsgLen(2))
+				binary.NativeEndian.PutUint16(oob[unix.CmsgLen(0):], uint16(size))
+				if _, _, err := conns[2].WriteMsgUDP(append(append([]byte{}, p1...), p2...), oob, dst); err != nil {
+					return err
+				}
+			} else {
+				for _, p := range [][]byte{p1, p2} {
+					if _, err := conns[2].WriteToUDP(p, dst); err != nil {
+						return err
+					}
+				}
+			}
+			res.spisA, res.spisB = readSPIs(conns[0]), readSPIs(conns[1])
+			res.stats, err = r.Stats()
+			return err
+		}()
+	}()
+	return <-resc
+}
+
+// twoNetNS puts the thread in a new netns and returns it and a second new
+// netns.
+func twoNetNS() (relayNS, peerNS int, err error) {
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+		return 0, 0, err
+	}
+	relayNS, err = unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+		return 0, 0, err
+	}
+	peerNS, err = unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	return relayNS, peerNS, unix.Setns(relayNS, unix.CLONE_NEWNET)
+}
+
+// linkUp sets l and lo up, gives l the address a, and adds the neighbors.
+func linkUp(l netlink.Link, a string, neighbors map[string]net.HardwareAddr) error {
+	lo, err := netlink.LinkByName("lo")
+	if err != nil {
+		return err
+	}
+	if err := netlink.LinkSetUp(lo); err != nil {
+		return err
+	}
+	if err := netlink.LinkSetUp(l); err != nil {
+		return err
+	}
+	addr, _ := netlink.ParseAddr(a)
+	if err := netlink.AddrAdd(l, addr); err != nil {
+		return err
+	}
+	for ip, mac := range neighbors {
+		n := &netlink.Neigh{LinkIndex: l.Attrs().Index, Family: netlink.FAMILY_V4, State: netlink.NUD_PERMANENT, IP: net.ParseIP(ip), HardwareAddr: mac}
+		if err := netlink.NeighAdd(n); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readSPIs returns the SPIs of the PSP packets that c gets in 500 ms.
+func readSPIs(c *net.UDPConn) []uint32 {
+	var spis []uint32
+	buf := make([]byte, 4096)
+	for {
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, err := c.Read(buf)
+		if err != nil {
+			return spis
+		}
+		if n >= 8 {
+			spis = append(spis, binary.BigEndian.Uint32(buf[4:8]))
+		}
+	}
+}
+
+// BenchmarkRelayForward runs the program on one frame many times. The rows
+// send the frame on to the same next hop each time, so each run forwards.
+func BenchmarkRelayForward(b *testing.B) {
+	for _, v6 := range []bool{false, true} {
+		for _, size := range []int{64, 800, 1400} {
+			name := "IPv4/" + strconv.Itoa(size)
+			sender, relay, next := sender4, relay4, next4
+			if v6 {
+				name = "IPv6/" + strconv.Itoa(size)
+				sender, relay, next = sender6, relay6, next6
+			}
+			b.Run(name, func(b *testing.B) {
+				ns := newTestNS(b)
+				r := newTestRelay(b, RelayConfig{TunnelRate: 1e12, TunnelBurst: 1e8})
+				// The forwarded frame goes to next, so next is a relay address too.
+				require.NoError(b, r.SetAddrs([]netip.Addr{relay, next}))
+				require.NoError(b, r.PutTunnel(1))
+				to := netip.AddrPortFrom(next, relayPort)
+				for _, src := range []netip.AddrPort{netip.AddrPortFrom(sender, 4000), netip.AddrPortFrom(relay, relayPort), to} {
+					require.NoError(b, r.PutRow(src, testSPI, RelayRow{Next: to, Tunnel: 1, Expires: Monotonic() + time.Hour}))
+				}
+				frame := packet(b, netip.AddrPortFrom(sender, 4000), netip.AddrPortFrom(relay, relayPort), 64, pspPayload(size, testSPI))
+				opts := &ebpf.RunOptions{
+					Data:    frame,
+					Repeat:  uint32(b.N),
+					Context: xdpMD{DataEnd: uint32(len(frame)), IngressIfindex: uint32(ns.ifindex)},
+				}
+				var ret uint32
+				var err error
+				b.ResetTimer()
+				ns.do(func() { ret, err = r.Program().Run(opts) })
+				b.StopTimer()
+				require.NoError(b, err)
+				require.Equal(b, xdpTX, ret)
+				st, err := r.Stats()
+				require.NoError(b, err)
+				require.GreaterOrEqual(b, st.Packets, uint64(b.N))
+			})
+		}
+	}
+}

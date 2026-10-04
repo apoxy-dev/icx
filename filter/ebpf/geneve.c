@@ -70,8 +70,15 @@ struct {
 	__type(value, int);
 } bind_map SEC(".maps");
 
-SEC("xdp_sock")
-int xdp_sock_prog(struct xdp_md *ctx)
+/* next_prog holds a program for the packets that this program passes. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u32);
+} next_prog SEC(".maps");
+
+static __always_inline int geneve(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
@@ -147,6 +154,17 @@ int xdp_sock_prog(struct xdp_md *ctx)
 	// non-bound-port traffic already returns XDP_PASS at the checks above, so this
 	// only affects frames addressed to our own bind.
 	return bpf_redirect_map(&xsks_map, index, XDP_DROP);
+}
+
+SEC("xdp_sock")
+int xdp_sock_prog(struct xdp_md *ctx)
+{
+	int act = geneve(ctx);
+
+	/* Only packets that are not Geneve to a bind get XDP_PASS. */
+	if (act == XDP_PASS)
+		bpf_tail_call(ctx, &next_prog, 0);
+	return act;
 }
 
 char _license[] SEC("license") = "GPL";

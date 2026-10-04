@@ -13,6 +13,7 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go all ebpf/all.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go geneve ebpf/geneve.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type relay_key -type relay_row -type relay_lane -type relay_tunnel -type relay_addr -type relay_stats relay ebpf/relay.c
 
 // All creates an eBPF program that intercepts all incoming packets
 // and redirects them to the XDP socket.
@@ -78,5 +79,6 @@ func Geneve(addrs ...net.Addr) (*Program, error) {
 		Program: col.Programs["xdp_sock_prog"],
 		Queues:  col.Maps["qidconf_map"],
 		Sockets: col.Maps["xsks_map"],
+		Next:    col.Maps["next_prog"],
 	}, nil
 }

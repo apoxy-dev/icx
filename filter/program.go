@@ -39,6 +39,27 @@ type Program struct {
 	Program *ebpf.Program
 	Queues  *ebpf.Map // qidconf_map: rx_queue_index -> enabled(1)
 	Sockets *ebpf.Map // xsks_map (XSKMAP): rx_queue_index -> socket fd
+	// Next is the PROG_ARRAY (next_prog) of the program that gets the packets
+	// that Program passes. Only Geneve has it.
+	Next *ebpf.Map
+}
+
+// Chain sends the packets that the program passes to next. A nil next
+// removes the program that is there.
+func (p *Program) Chain(next *ebpf.Program) error {
+	if p.Next == nil {
+		return errors.New("program has no next program slot")
+	}
+	if next == nil {
+		if err := p.Next.Delete(uint32(0)); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("failed to clear next_prog: %w", err)
+		}
+		return nil
+	}
+	if err := p.Next.Put(uint32(0), next); err != nil {
+		return fmt.Errorf("failed to update next_prog: %w", err)
+	}
+	return nil
 }
 
 // Attach attaches the XDP program to the interface, replacing any program
@@ -94,6 +115,12 @@ func (p *Program) Unregister(queueID int) error {
 // freed on teardown.
 func (p *Program) Close() error {
 	var errs []error
+	if p.Next != nil {
+		if err := p.Next.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close next_prog: %w", err))
+		}
+		p.Next = nil
+	}
 	if p.Sockets != nil {
 		if err := p.Sockets.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close xsks_map: %w", err))
