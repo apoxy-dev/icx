@@ -51,7 +51,7 @@ func TestTXDropsOnExpiredKey(t *testing.T) {
 
 	// Keep-alives (ToPhy) fail closed under the same expired key, too. The network is
 	// due a keep-alive (none sent yet), so ToPhy reaches — and is stopped by — the
-	// expiry gate rather than returning early.
+	// expiry check rather than returning early.
 	require.Zero(t, h.ToPhy(phy), "keep-alive must not seal under an expired key")
 	require.Equal(t, uint64(2), vnet.Stats.TXDropsExpiredKey.Load(), "keep-alive expiry drop is counted too")
 }

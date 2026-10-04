@@ -28,7 +28,7 @@ var AttachFlags = 0
 
 // Program is a loaded XDP redirect program plus the maps that steer packets into
 // AF_XDP sockets. It owns the eBPF program (xdp_sock_prog), the per-queue config
-// map (qidconf_map) that gates which RX queues redirect, and the XSKMAP
+// map (qidconf_map) that selects which RX queues redirect, and the XSKMAP
 // (xsks_map) that maps a queue index to a bound socket fd.
 //
 // This replaces github.com/slavc/xdp's Program type: icx built it by hand from a

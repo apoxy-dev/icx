@@ -780,7 +780,7 @@ func (f *Forwarder) processFrames(ctx context.Context, queueID int, pinCPUs []in
 		// and its serviced-store are not atomic across goroutines — so running this
 		// in all N processFrames goroutines made each due network's keep-alive egress
 		// up to N times per interval and burn N transmit-counter values toward the
-		// rekey threshold (APO-670). Gating to one queue restores exactly one
+		// rekey threshold (APO-670). Limiting the drain to one queue restores exactly one
 		// keep-alive per network per interval regardless of queue count.
 		for queueID == 0 && phy.NumFreeTxSlots() > 0 {
 			schedScratch = umem.Alloc(schedScratch[:0], 1)

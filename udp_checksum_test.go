@@ -120,7 +120,7 @@ func benchTxChecksumHandler(b *testing.B, extra ...HandlerOption) (*Handler, []b
 }
 
 // runTxChecksumBench drives VirtToPhy in a tight loop. The counter climbs freely
-// (TX seal does not gate on replay), so no per-iteration reset is needed.
+// (TX seal does not check replay), so no per-iteration reset is needed.
 func runTxChecksumBench(b *testing.B, h *Handler, inner, phy []byte) {
 	b.SetBytes(int64(len(inner)))
 	b.ReportAllocs()

@@ -33,8 +33,8 @@ type rxRateLimiter struct {
 const subWindowsPerSec = 10
 
 // newRxRateLimiter builds a limiter admitting at most pps frames per second,
-// enforced over a 1/subWindowsPerSec-second window. pps must be > 0 (callers gate
-// on the configured limit before constructing one).
+// enforced over a 1/subWindowsPerSec-second window. pps must be > 0 (callers check
+// the configured limit before constructing one).
 func newRxRateLimiter(pps int) *rxRateLimiter {
 	limit := int64(pps) / subWindowsPerSec
 	if limit < 1 {

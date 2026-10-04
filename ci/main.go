@@ -5,7 +5,7 @@
 // onto the ways the code is exercised:
 //
 //   - Unit: the root module (minus the root-requiring datapath packages) plus
-//     the cli module, unprivileged, race detector on — the fast feedback gate.
+//     the cli module, unprivileged, race detector on — the fast feedback check.
 //   - Integration: the whole tree plus the cli module WITH the root capability
 //     set, on a real kernel, so the veth/AF_XDP/forwarder tests actually run.
 //   - Bench / Benchstat: `go test -bench -benchmem` and an A/B baseline diff,
@@ -67,7 +67,7 @@ func (m *Icx) BuilderContainer(src *dagger.Directory) *dagger.Container {
 // Unit runs the test suite WITHOUT extra privilege: the root module minus the
 // root-requiring datapath packages (see privilegedPkgRe) plus the separate cli
 // module, race detector on by default, test cache disabled. It is the fast,
-// runner-agnostic correctness gate. For the privileged lane that actually
+// runner-agnostic correctness check. For the privileged lane that actually
 // exercises the veth/AF_XDP datapath, use Integration.
 func (m *Icx) Unit(
 	ctx context.Context,
@@ -92,8 +92,8 @@ func (m *Icx) Unit(
 // plus the privileged ones). CI runs it on both amd64 and arm64 so the
 // weak-memory aarch64 datapath is exercised on every PR.
 //
-// It is safe on a kernel without CONFIG_XDP_SOCKETS — the AF_XDP tests gate
-// themselves at runtime and skip cleanly; the lane just covers less.
+// It is safe on a kernel without CONFIG_XDP_SOCKETS — the AF_XDP tests probe
+// for it at runtime and skip cleanly; the lane just covers less.
 func (m *Icx) Integration(
 	ctx context.Context,
 	src *dagger.Directory,
@@ -216,9 +216,9 @@ func (m *Icx) Lint(ctx context.Context, src *dagger.Directory) (string, error) {
 		Stdout(ctx)
 }
 
-// All is the full local verification gate: Lint, then Unit (the fast
+// All is the full local verification: Lint, then Unit (the fast
 // unprivileged lane), then Integration (the privileged real-kernel lane). Unit
-// and Integration are not redundant — Unit proves the unprivileged gate is
+// and Integration are not redundant — Unit proves the unprivileged lane is
 // green while Integration actually exercises the datapath the former skips. The
 // combined output of every stage is returned; the first failing stage aborts.
 func (m *Icx) All(ctx context.Context, src *dagger.Directory) (string, error) {

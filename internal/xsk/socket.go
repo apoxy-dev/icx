@@ -214,7 +214,7 @@ func (s *Socket) NumFilled() int {
 func (s *Socket) NumCompleted() int { return int(s.compRing.available()) }
 
 // NumTransmitted reports how many descriptors are queued on the TX ring that the
-// kernel has not yet consumed (in-flight), for POLLOUT gating. Derived from the
+// kernel has not yet consumed (in-flight), for the POLLOUT check. Derived from the
 // ring indices, so it cannot drift the way slavc/xdp's hand-maintained counter
 // did.
 func (s *Socket) NumTransmitted() int {

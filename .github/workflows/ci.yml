@@ -33,7 +33,7 @@ jobs:
   unit:
     name: Unit
     needs: lint
-    # Fast, unprivileged feedback gate: `go test -race ./...` over the root and
+    # Fast, unprivileged feedback check: `go test -race ./...` over the root and
     # cli modules. The real-kernel datapath tests self-skip (they probe for root
     # + AF_XDP), so this runs on an ordinary runner and fails fast before the
     # heavier privileged matrix below.

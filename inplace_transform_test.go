@@ -409,7 +409,7 @@ func TestInPlaceEncapByteEquivalenceWithSourcePortHash(t *testing.T) {
 	}
 }
 
-// TestVirtToPhyInPlaceDropsExpiredKey covers the in-place TX expiry gate (APO-656)
+// TestVirtToPhyInPlaceDropsExpiredKey covers the in-place TX expiry check (APO-656)
 // directly: the byte-equivalence oracle installs a live key and so never reaches the
 // expired branch in VirtToPhyInPlace/ToPhyInPlace. Installing an already-expired SA and
 // driving the in-place encap asserts it fails closed and charges TXDropsExpiredKey.
