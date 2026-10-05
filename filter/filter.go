@@ -13,7 +13,7 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go all ebpf/all.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go geneve ebpf/geneve.c
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type relay_key -type relay_row -type relay_lane -type relay_meter -type relay_addr -type relay_stats relay ebpf/relay.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -type relay_key -type relay_row -type relay_lane -type relay_meter -type relay_share -type relay_addr -type relay_stats relay ebpf/relay.c
 
 // All creates an eBPF program that intercepts all incoming packets
 // and redirects them to the XDP socket.

@@ -904,7 +904,8 @@ func TestRelayMeterLargestBurst(t *testing.T) {
 
 // TestRelayMeterManyThreads runs the program on many threads at the same time
 // on one meter, with more packets than the meter passes. The bytes that pass
-// must not be more than the rate gives in the time of the run, plus the burst.
+// must not be more than the rate gives in the time of the run, plus the burst
+// and the share of each CPU.
 func TestRelayMeterManyThreads(t *testing.T) {
 	const (
 		size    = 1000
@@ -916,9 +917,11 @@ func TestRelayMeterManyThreads(t *testing.T) {
 	cases := []struct {
 		name string
 		cfg  RelayConfig
+		// share is the most bytes that one CPU holds for its next packets.
+		share uint64
 	}{
-		{"lane meter", RelayConfig{LaneRate: rate, LaneBurst: burst}},
-		{"tunnel limit", RelayConfig{TunnelRate: rate, TunnelBurst: burst}},
+		{"lane meter", RelayConfig{LaneRate: rate, LaneBurst: burst}, 0},
+		{"tunnel limit", RelayConfig{TunnelRate: rate, TunnelBurst: burst}, burst/4096 + size},
 	}
 	ns := newTestNS(t)
 	var nsfd int
@@ -965,7 +968,8 @@ func TestRelayMeterManyThreads(t *testing.T) {
 
 			st, err := r.Stats()
 			require.NoError(t, err)
-			assert.LessOrEqual(t, st.Bytes, rate*uint64(elapsed)/uint64(time.Second)+burst)
+			limit := rate*uint64(elapsed)/uint64(time.Second) + burst
+			assert.LessOrEqual(t, st.Bytes, limit+tc.share*uint64(runtime.NumCPU()))
 			// The threads start in a short time, and then they use all tokens.
 			assert.GreaterOrEqual(t, st.Bytes, 9*rate*uint64(runTime)/uint64(time.Second)/10)
 			assert.Equal(t, st.Packets*size, st.Bytes)

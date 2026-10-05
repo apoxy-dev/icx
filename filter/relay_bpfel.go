@@ -53,6 +53,11 @@ type relayRelayRow struct {
 	Expires  uint64
 }
 
+type relayRelayShare struct {
+	Tokens uint64
+	Drops  uint64
+}
+
 type relayRelayStats struct {
 	Packets     uint64
 	Bytes       uint64
@@ -119,6 +124,7 @@ type relayMapSpecs struct {
 	RelayLanes    *ebpf.MapSpec `ebpf:"relay_lanes"`
 	RelayMeters   *ebpf.MapSpec `ebpf:"relay_meters"`
 	RelayRows     *ebpf.MapSpec `ebpf:"relay_rows"`
+	RelayShares   *ebpf.MapSpec `ebpf:"relay_shares"`
 	RelayTunnels  *ebpf.MapSpec `ebpf:"relay_tunnels"`
 }
 
@@ -163,6 +169,7 @@ type relayMaps struct {
 	RelayLanes    *ebpf.Map `ebpf:"relay_lanes"`
 	RelayMeters   *ebpf.Map `ebpf:"relay_meters"`
 	RelayRows     *ebpf.Map `ebpf:"relay_rows"`
+	RelayShares   *ebpf.Map `ebpf:"relay_shares"`
 	RelayTunnels  *ebpf.Map `ebpf:"relay_tunnels"`
 }
 
@@ -173,6 +180,7 @@ func (m *relayMaps) Close() error {
 		m.RelayLanes,
 		m.RelayMeters,
 		m.RelayRows,
+		m.RelayShares,
 		m.RelayTunnels,
 	)
 }

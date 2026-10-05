@@ -29,7 +29,9 @@ type RelayConfig struct {
 	MaxLen uint32
 	// LaneRate meters each row and TunnelRate meters each tunnel, in bytes
 	// per second. Zero turns the meter off. The bursts are in bytes.
-	LaneRate, LaneBurst     uint64
+	LaneRate, LaneBurst uint64
+	// Each CPU takes the tokens of a tunnel in groups. A tunnel can thus pass
+	// 1/4096 of TunnelBurst and one packet above the limit for each CPU.
 	TunnelRate, TunnelBurst uint64
 	// NextHopCache is the time that a row keeps the next hop of a route
 	// lookup, so a route or neighbor change takes effect after this time at
@@ -301,25 +303,41 @@ func (r *Relay) lane(lane uint32) (RelayCounters, error) {
 
 // PutTunnel adds the tunnel meter id with a full bucket.
 func (r *Relay) PutTunnel(id uint32) error {
-	return r.objs.RelayTunnels.Update(id, relayRelayMeter{}, ebpf.UpdateAny)
+	if err := r.objs.RelayTunnels.Update(id, relayRelayMeter{}, ebpf.UpdateAny); err != nil {
+		return err
+	}
+	// The program finds a tunnel by its shares, so the bucket comes first.
+	// An empty slice gives each CPU a zero share.
+	if err := r.objs.RelayShares.Update(id, []relayRelayShare{}, ebpf.UpdateAny); err != nil {
+		_ = r.objs.RelayTunnels.Delete(id)
+		return err
+	}
+	return nil
 }
 
 // DeleteTunnel removes the tunnel meter id and returns its drops.
 func (r *Relay) DeleteTunnel(id uint32) (uint64, error) {
-	var v relayRelayMeter
-	if err := r.objs.RelayTunnels.LookupWithFlags(id, &v, ebpf.LookupLock); err != nil {
+	drops, err := r.TunnelDrops(id)
+	if err != nil {
 		return 0, err
 	}
-	return v.Drops, r.objs.RelayTunnels.Delete(id)
+	if err := r.objs.RelayShares.Delete(id); err != nil {
+		return 0, err
+	}
+	return drops, r.objs.RelayTunnels.Delete(id)
 }
 
-// TunnelDrops returns the drops of the tunnel meter id.
+// TunnelDrops returns the drops of the tunnel meter id on all CPUs.
 func (r *Relay) TunnelDrops(id uint32) (uint64, error) {
-	var v relayRelayMeter
-	if err := r.objs.RelayTunnels.LookupWithFlags(id, &v, ebpf.LookupLock); err != nil {
+	var shares []relayRelayShare
+	if err := r.objs.RelayShares.Lookup(id, &shares); err != nil {
 		return 0, err
 	}
-	return v.Drops, nil
+	var drops uint64
+	for _, s := range shares {
+		drops += s.Drops
+	}
+	return drops, nil
 }
 
 // Stats returns the sum of the counters of all CPUs.

@@ -31,6 +31,10 @@
 #define PSP_EXT_LEN 2
 #define PSP_CRYPT_OFF 2
 
+/* A CPU takes the tokens of a tunnel in groups of 1/4096 of the burst, or of
+ * one packet if that is more. */
+#define SHARE_SHIFT 12
+
 /* The loader sets these. The port is in network byte order. max_len is the
  * largest IP length of a PSP datagram. A rate is in bytes per second, a burst
  * is in bytes, and a fill is the time in ns that fills an empty bucket. A zero
@@ -88,6 +92,13 @@ struct relay_meter {
 	__u32 pad;
 	__u64 tokens; /* In byte-ns. */
 	__u64 last;
+	__u64 drops; /* Of a lane meter. A tunnel counts its drops in its shares. */
+};
+
+/* The tokens that one CPU took from the bucket of a tunnel and did not use,
+ * and the drops of the tunnel on that CPU. */
+struct relay_share {
+	__u64 tokens; /* In bytes. */
 	__u64 drops;
 };
 
@@ -134,12 +145,21 @@ struct {
 	__type(value, struct relay_meter);
 } relay_meters SEC(".maps");
 
+/* The buckets of the tunnel limits, by tunnel. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
 	__type(key, __u32);
 	__type(value, struct relay_meter);
 } relay_tunnels SEC(".maps");
+
+/* The share of each CPU in a tunnel limit, by tunnel. */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, __u32);
+	__type(value, struct relay_share);
+} relay_shares SEC(".maps");
 
 /* The addresses of the relay on the link. An all-zero entry ends the list. */
 struct {
@@ -168,32 +188,17 @@ struct relay_fwd {
 	__u32 tot;  /* The IP length. */
 };
 
-/* meter_take takes size bytes from a token bucket. The tokens are in
- * byte-ns, so a refill needs no division. The caller holds the lock. */
-static __always_inline int meter_take(__u64 *tokens, __u64 *last, __u64 now,
-				      __u64 size, __u64 rate, __u64 burst,
-				      __u64 fill)
+/* meter_fill returns the tokens of a bucket at the time now. The tokens are
+ * in byte-ns, so a refill needs no division. */
+static __always_inline __u64 meter_fill(__u64 tokens, __u64 last, __u64 now,
+					__u64 rate, __u64 full, __u64 fill)
 {
-	__u64 t = *tokens, full = burst * NSEC;
-	__u64 elapsed = now > *last ? now - *last : 0;
+	__u64 elapsed = now > last ? now - last : 0;
 
 	if (elapsed >= fill)
-		t = full;
-	else
-		t += elapsed * rate;
-	if (t > full)
-		t = full;
-	/* A CPU that waited for the lock has an old time. The time must not go
-	 * back, or the bucket gets the tokens of that time again. */
-	if (now > *last)
-		*last = now;
-	size *= NSEC;
-	if (t < size) {
-		*tokens = t;
-		return 0;
-	}
-	*tokens = t - size;
-	return 1;
+		return full;
+	tokens += elapsed * rate;
+	return tokens > full ? full : tokens;
 }
 
 static __always_inline __u16 csum_fold(__u32 s)
@@ -259,18 +264,56 @@ static __always_inline int relay_slot(const struct relay_addr *dst)
 	return -1;
 }
 
-/* meter runs a token bucket. It returns 0 when the meter drops the packet. */
-static __always_inline int meter(struct relay_meter *m, __u64 now, __u64 size,
-				 __u64 rate, __u64 burst, __u64 fill)
+/* meter takes size bytes from a token bucket. It returns 0 when the bucket
+ * does not have them. */
+static __always_inline int meter(struct relay_meter *m, __u64 size, __u64 rate,
+				 __u64 burst, __u64 fill)
 {
+	__u64 now = bpf_ktime_get_ns(), full = burst * NSEC;
+	__u64 last = m->last, t = m->tokens;
 	int ok;
 
+	size *= NSEC;
+	/* A bucket that is empty drops with no lock, so the CPUs do not wait
+	 * for each other in a flood. Only a CPU with the lock passes. */
+	if (meter_fill(t, last, now, rate, full, fill) < size)
+		return 0;
 	bpf_spin_lock(&m->lock);
-	ok = meter_take(&m->tokens, &m->last, now, size, rate, burst, fill);
-	if (!ok)
-		m->drops++;
+	t = meter_fill(m->tokens, m->last, now, rate, full, fill);
+	/* A CPU that waited for the lock has an old time. The time must not go
+	 * back, or the bucket gets the tokens of that time again. */
+	if (now > m->last)
+		m->last = now;
+	ok = t >= size;
+	if (ok)
+		t -= size;
+	m->tokens = t;
 	bpf_spin_unlock(&m->lock);
 	return ok;
+}
+
+/* share_take takes size bytes from the share of this CPU in the tunnel id.
+ * An empty share takes a group of tokens from the bucket of the tunnel, so
+ * the CPUs do not write to the bucket for each packet. */
+static __always_inline int share_take(struct relay_share *s, __u32 id, __u64 size)
+{
+	__u64 group = tunnel_burst >> SHARE_SHIFT;
+	struct relay_meter *m;
+
+	if (s->tokens >= size) {
+		s->tokens -= size;
+		return 1;
+	}
+	m = bpf_map_lookup_elem(&relay_tunnels, &id);
+	/* The loader removes the shares before the bucket. */
+	if (!m)
+		return 1;
+	if (group < size)
+		group = size;
+	if (!meter(m, group, tunnel_rate, tunnel_burst, tunnel_fill))
+		return 0;
+	s->tokens += group - size;
+	return 1;
 }
 
 /* meters runs the lane meter of the row and the tunnel limit of its tunnel.
@@ -281,16 +324,18 @@ static __always_inline int meters(const struct relay_fwd *f)
 		__u32 id = f->row->lane;
 		struct relay_meter *m = bpf_map_lookup_elem(&relay_meters, &id);
 
-		if (m && !meter(m, f->now, f->size, lane_rate, lane_burst, lane_fill)) {
+		if (m && !meter(m, f->size, lane_rate, lane_burst, lane_fill)) {
+			__sync_fetch_and_add(&m->drops, 1);
 			f->st->lane_drops++;
 			return 0;
 		}
 	}
 	if (tunnel_rate && f->row->tunnel) {
 		__u32 id = f->row->tunnel;
-		struct relay_meter *m = bpf_map_lookup_elem(&relay_tunnels, &id);
+		struct relay_share *s = bpf_map_lookup_elem(&relay_shares, &id);
 
-		if (m && !meter(m, f->now, f->size, tunnel_rate, tunnel_burst, tunnel_fill)) {
+		if (s && !share_take(s, id, f->size)) {
+			s->drops++;
 			f->st->tunnel_drops++;
 			return 0;
 		}
@@ -513,12 +558,9 @@ static __always_inline int lookup(struct xdp_md *ctx, struct udphdr *udp,
 		f->st->no_row++;
 		return 0;
 	}
-	/* A meter needs the exact clock. The coarse clock costs less, and is
-	 * one timer tick behind at most. */
-	if (lane_rate || (tunnel_rate && f->row->tunnel))
-		f->now = bpf_ktime_get_ns();
-	else
-		f->now = bpf_ktime_get_coarse_ns();
+	/* The coarse clock costs less than the exact clock, and is one timer
+	 * tick behind at most. A meter reads the exact clock when it needs it. */
+	f->now = bpf_ktime_get_coarse_ns();
 	if (f->now > f->row->expires) {
 		f->st->expired++;
 		return 0;
