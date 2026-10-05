@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 
 	"github.com/apoxy-dev/icx/permissions"
@@ -897,6 +898,85 @@ func TestRelayMeterLargestBurst(t *testing.T) {
 			st, err := r.Stats()
 			require.NoError(t, err)
 			assert.Equal(t, RelayStats{Packets: 2000, Bytes: 200000}, st)
+		})
+	}
+}
+
+// TestRelayMeterManyThreads runs the program on many threads at the same time
+// on one meter, with more packets than the meter passes. The bytes that pass
+// must not be more than the rate gives in the time of the run, plus the burst.
+func TestRelayMeterManyThreads(t *testing.T) {
+	const (
+		size    = 1000
+		rate    = 100_000_000
+		burst   = rate / 10
+		threads = 8
+		runTime = 500 * time.Millisecond
+	)
+	cases := []struct {
+		name string
+		cfg  RelayConfig
+	}{
+		{"lane meter", RelayConfig{LaneRate: rate, LaneBurst: burst}},
+		{"tunnel limit", RelayConfig{TunnelRate: rate, TunnelBurst: burst}},
+	}
+	ns := newTestNS(t)
+	var nsfd int
+	var err error
+	ns.do(func() { nsfd, err = unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0) })
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(nsfd) })
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.NextHopCache = time.Hour
+			r := newTestRelay(t, tc.cfg)
+			// A forward of a frame from next to next gives the same frame, so
+			// all runs of all threads have one row.
+			require.NoError(t, r.SetAddrs([]netip.Addr{next4}))
+			require.NoError(t, r.PutTunnel(1))
+			to := netip.AddrPortFrom(next4, relayPort)
+			require.NoError(t, r.PutRow(to, testSPI, RelayRow{Next: to, Tunnel: 1, Expires: Monotonic() + time.Hour}))
+			frame := packet(t, to, to, 64, pspPayload(size, testSPI))
+
+			start := Monotonic()
+			var g errgroup.Group
+			for range threads {
+				g.Go(func() error {
+					// The thread moves to the test netns, so it must exit with the goroutine.
+					runtime.LockOSThread()
+					if err := unix.Setns(nsfd, unix.CLONE_NEWNET); err != nil {
+						return err
+					}
+					opts := &ebpf.RunOptions{
+						Data:    frame,
+						Repeat:  50000,
+						Context: xdpMD{DataEnd: uint32(len(frame)), IngressIfindex: uint32(ns.ifindex)},
+					}
+					for Monotonic() < start+runTime {
+						if _, err := r.Program().Run(opts); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+			}
+			require.NoError(t, g.Wait())
+			elapsed := Monotonic() - start
+
+			st, err := r.Stats()
+			require.NoError(t, err)
+			assert.LessOrEqual(t, st.Bytes, rate*uint64(elapsed)/uint64(time.Second)+burst)
+			// The threads start in a short time, and then they use all tokens.
+			assert.GreaterOrEqual(t, st.Bytes, 9*rate*uint64(runTime)/uint64(time.Second)/10)
+			assert.Equal(t, st.Packets*size, st.Bytes)
+			// The meter counts each drop that the CPUs count.
+			c, err := r.Counters(to, testSPI)
+			require.NoError(t, err)
+			assert.Equal(t, st.LaneDrops, c.Drops)
+			drops, err := r.TunnelDrops(1)
+			require.NoError(t, err)
+			assert.Equal(t, st.TunnelDrops, drops)
+			assert.NotZero(t, st.LaneDrops+st.TunnelDrops)
 		})
 	}
 }

@@ -183,7 +183,10 @@ static __always_inline int meter_take(__u64 *tokens, __u64 *last, __u64 now,
 		t += elapsed * rate;
 	if (t > full)
 		t = full;
-	*last = now;
+	/* A CPU that waited for the lock has an old time. The time must not go
+	 * back, or the bucket gets the tokens of that time again. */
+	if (now > *last)
+		*last = now;
 	size *= NSEC;
 	if (t < size) {
 		*tokens = t;
