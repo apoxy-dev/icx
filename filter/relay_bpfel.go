@@ -22,14 +22,25 @@ type relayRelayKey struct {
 }
 
 type relayRelayLane struct {
-	Lock    struct{ Val uint32 }
-	Pad     uint32
-	Tokens  uint64
-	Last    uint64
-	Used    uint64
-	Packets uint64
-	Bytes   uint64
-	Drops   uint64
+	Used     uint64
+	Packets  uint64
+	Bytes    uint64
+	HopUntil uint64
+	HopMac   [12]uint8
+	HopGen   uint32
+	HopFlow  uint32
+	HopLink  uint32
+	HopMtu   uint16
+	HopSlot  uint8
+	Pad      [5]uint8
+}
+
+type relayRelayMeter struct {
+	Lock   struct{ Val uint32 }
+	Pad    uint32
+	Tokens uint64
+	Last   uint64
+	Drops  uint64
 }
 
 type relayRelayRow struct {
@@ -37,7 +48,8 @@ type relayRelayRow struct {
 	Lane     uint32
 	Next     [16]uint8
 	NextPort uint16
-	Pad      [3]uint16
+	Pad      uint16
+	Gen      uint32
 	Expires  uint64
 }
 
@@ -51,14 +63,6 @@ type relayRelayStats struct {
 	NoRoute     uint64
 	Malformed   uint64
 	TooLong     uint64
-}
-
-type relayRelayTunnel struct {
-	Lock   struct{ Val uint32 }
-	Pad    uint32
-	Tokens uint64
-	Last   uint64
-	Drops  uint64
 }
 
 // loadRelay returns the embedded CollectionSpec for relay.
@@ -113,6 +117,7 @@ type relayMapSpecs struct {
 	RelayAddrs    *ebpf.MapSpec `ebpf:"relay_addrs"`
 	RelayCpuStats *ebpf.MapSpec `ebpf:"relay_cpu_stats"`
 	RelayLanes    *ebpf.MapSpec `ebpf:"relay_lanes"`
+	RelayMeters   *ebpf.MapSpec `ebpf:"relay_meters"`
 	RelayRows     *ebpf.MapSpec `ebpf:"relay_rows"`
 	RelayTunnels  *ebpf.MapSpec `ebpf:"relay_tunnels"`
 }
@@ -121,10 +126,12 @@ type relayMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type relayVariableSpecs struct {
+	HopTime     *ebpf.VariableSpec `ebpf:"hop_time"`
 	LaneBurst   *ebpf.VariableSpec `ebpf:"lane_burst"`
 	LaneFill    *ebpf.VariableSpec `ebpf:"lane_fill"`
 	LaneRate    *ebpf.VariableSpec `ebpf:"lane_rate"`
 	MaxLen      *ebpf.VariableSpec `ebpf:"max_len"`
+	Redirect    *ebpf.VariableSpec `ebpf:"redirect"`
 	RelayPort   *ebpf.VariableSpec `ebpf:"relay_port"`
 	TunnelBurst *ebpf.VariableSpec `ebpf:"tunnel_burst"`
 	TunnelFill  *ebpf.VariableSpec `ebpf:"tunnel_fill"`
@@ -154,6 +161,7 @@ type relayMaps struct {
 	RelayAddrs    *ebpf.Map `ebpf:"relay_addrs"`
 	RelayCpuStats *ebpf.Map `ebpf:"relay_cpu_stats"`
 	RelayLanes    *ebpf.Map `ebpf:"relay_lanes"`
+	RelayMeters   *ebpf.Map `ebpf:"relay_meters"`
 	RelayRows     *ebpf.Map `ebpf:"relay_rows"`
 	RelayTunnels  *ebpf.Map `ebpf:"relay_tunnels"`
 }
@@ -163,6 +171,7 @@ func (m *relayMaps) Close() error {
 		m.RelayAddrs,
 		m.RelayCpuStats,
 		m.RelayLanes,
+		m.RelayMeters,
 		m.RelayRows,
 		m.RelayTunnels,
 	)
@@ -172,10 +181,12 @@ func (m *relayMaps) Close() error {
 //
 // It can be passed to loadRelayObjects or ebpf.CollectionSpec.LoadAndAssign.
 type relayVariables struct {
+	HopTime     *ebpf.Variable `ebpf:"hop_time"`
 	LaneBurst   *ebpf.Variable `ebpf:"lane_burst"`
 	LaneFill    *ebpf.Variable `ebpf:"lane_fill"`
 	LaneRate    *ebpf.Variable `ebpf:"lane_rate"`
 	MaxLen      *ebpf.Variable `ebpf:"max_len"`
+	Redirect    *ebpf.Variable `ebpf:"redirect"`
 	RelayPort   *ebpf.Variable `ebpf:"relay_port"`
 	TunnelBurst *ebpf.Variable `ebpf:"tunnel_burst"`
 	TunnelFill  *ebpf.Variable `ebpf:"tunnel_fill"`

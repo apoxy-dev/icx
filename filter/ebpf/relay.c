@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
-/* relay_forward sends PSP packets on to the next hop of their row and
- * returns XDP_TX. A row is keyed on the sender address, the sender port and
- * the SPI. Packets that it cannot forward go to the kernel (XDP_PASS). */
+/* relay_forward sends PSP packets on to the next hop of their row, with
+ * XDP_TX or a redirect. A row is keyed on the sender address, the sender port
+ * and the SPI. Packets that it cannot forward go to the kernel (XDP_PASS). */
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
@@ -43,6 +43,10 @@ volatile const __u64 lane_fill = 0;
 volatile const __u64 tunnel_rate = 0;
 volatile const __u64 tunnel_burst = 0;
 volatile const __u64 tunnel_fill = 0;
+/* hop_time is the time in ns that a lane keeps its next hop; zero does a
+ * lookup for each packet. redirect sends with a redirect to the same link. */
+volatile const __u64 hop_time = 0;
+volatile const __u32 redirect = 0;
 
 struct relay_key {
 	__u8 addr[16]; /* IPv4 is ::ffff:a.b.c.d. */
@@ -54,29 +58,35 @@ struct relay_key {
 /* The next hop of a row. Only the loader writes it. */
 struct relay_row {
 	__u32 tunnel; /* Key in relay_tunnels, or 0 for no tunnel limit. */
-	__u32 lane;   /* Key in relay_lanes. */
+	__u32 lane;   /* Key in relay_lanes and relay_meters. */
 	__u8 next[16];
 	__be16 next_port;
-	__u16 pad[3];
+	__u16 pad;
+	__u32 gen;     /* The loader changes it with each new next hop. */
 	__u64 expires; /* CLOCK_MONOTONIC ns. */
 };
 
-/* The meter and the counters of a row. Only the program writes them. */
+/* The counters and the next hop of a row. Only the program writes them. A
+ * lane is one cache line. */
 struct relay_lane {
-	struct bpf_spin_lock lock;
-	__u32 pad;
-	__u64 tokens; /* Lane meter, in byte-ns. */
-	__u64 last;
 	__u64 used;
 	__u64 packets;
 	__u64 bytes;
-	__u64 drops;
+	__u64 hop_until; /* The next hop is good before this time. */
+	__u8 hop_mac[2 * ETH_ALEN]; /* The destination, then the source. */
+	__u32 hop_gen;   /* The gen of the row at the lookup. */
+	__be32 hop_flow; /* The TOS or the flow info of the lookup. */
+	__u32 hop_link;  /* The link of the lookup. */
+	__u16 hop_mtu;
+	__u8 hop_slot;   /* The relay address of the lookup. */
+	__u8 pad[5];
 };
 
-struct relay_tunnel {
+/* A token bucket. Only the program writes it. */
+struct relay_meter {
 	struct bpf_spin_lock lock;
 	__u32 pad;
-	__u64 tokens;
+	__u64 tokens; /* In byte-ns. */
 	__u64 last;
 	__u64 drops;
 };
@@ -105,19 +115,30 @@ struct {
 	__type(value, struct relay_row);
 } relay_rows SEC(".maps");
 
-/* The lanes of the rows. The loader gives each row a lane. */
+/* The lanes of the rows. The loader gives each row a lane. The map can be
+ * mapped, so its values start on a page and each lane is one cache line. */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 65536);
+	__uint(map_flags, BPF_F_MMAPABLE);
+	__type(key, __u32);
+	__type(value, struct relay_lane);
+} relay_lanes SEC(".maps");
+
+/* The lane meters, by lane. The loader makes the map small when the lane
+ * meter is off. */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 65536);
 	__type(key, __u32);
-	__type(value, struct relay_lane);
-} relay_lanes SEC(".maps");
+	__type(value, struct relay_meter);
+} relay_meters SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
 	__type(key, __u32);
-	__type(value, struct relay_tunnel);
+	__type(value, struct relay_meter);
 } relay_tunnels SEC(".maps");
 
 /* The addresses of the relay on the link. An all-zero entry ends the list. */
@@ -134,6 +155,18 @@ struct {
 	__type(key, __u32);
 	__type(value, struct relay_stats);
 } relay_cpu_stats SEC(".maps");
+
+/* What lookup finds for a packet that the program can forward. */
+struct relay_fwd {
+	struct relay_row *row;
+	struct relay_lane *lane;
+	struct relay_stats *st;
+	__u64 now;  /* The CLOCK_MONOTONIC time. */
+	__u64 size; /* UDP payload bytes. */
+	__u32 slot; /* The place of the destination in relay_addrs. */
+	__u32 link; /* The link of the packet. */
+	__u32 tot;  /* The IP length. */
+};
 
 /* meter_take takes size bytes from a token bucket. The tokens are in
  * byte-ns, so a refill needs no division. The caller holds the lock. */
@@ -200,8 +233,9 @@ static __always_inline __be32 psp_spi(const __u8 *p)
 	return spi;
 }
 
-/* is_relay_addr reports whether dst is an address of the relay. */
-static __always_inline int is_relay_addr(const struct relay_addr *dst)
+/* relay_slot returns the place of dst in relay_addrs, or -1 if dst is not an
+ * address of the relay. */
+static __always_inline int relay_slot(const struct relay_addr *dst)
 {
 	const __u64 *d = (const __u64 *)dst->addr;
 
@@ -212,98 +246,150 @@ static __always_inline int is_relay_addr(const struct relay_addr *dst)
 		const __u64 *w;
 
 		if (!a)
-			return 0;
+			return -1;
 		w = (const __u64 *)a->addr;
 		if (w[0] == d[0] && w[1] == d[1])
-			return 1;
+			return i;
 		if (!w[0] && !w[1])
-			return 0;
+			return -1;
 	}
-	return 0;
+	return -1;
+}
+
+/* meter runs a token bucket. It returns 0 when the meter drops the packet. */
+static __always_inline int meter(struct relay_meter *m, __u64 now, __u64 size,
+				 __u64 rate, __u64 burst, __u64 fill)
+{
+	int ok;
+
+	bpf_spin_lock(&m->lock);
+	ok = meter_take(&m->tokens, &m->last, now, size, rate, burst, fill);
+	if (!ok)
+		m->drops++;
+	bpf_spin_unlock(&m->lock);
+	return ok;
 }
 
 /* meters runs the lane meter of the row and the tunnel limit of its tunnel.
  * It returns 0 when a meter drops the packet. */
-static __always_inline int meters(struct relay_row *row,
-				  struct relay_lane *lane,
-				  struct relay_stats *st, __u64 now,
-				  __u64 size)
+static __always_inline int meters(const struct relay_fwd *f)
 {
-	int ok;
-
 	if (lane_rate) {
-		bpf_spin_lock(&lane->lock);
-		ok = meter_take(&lane->tokens, &lane->last, now, size,
-				lane_rate, lane_burst, lane_fill);
-		if (!ok)
-			lane->drops++;
-		bpf_spin_unlock(&lane->lock);
-		if (!ok) {
-			st->lane_drops++;
+		__u32 id = f->row->lane;
+		struct relay_meter *m = bpf_map_lookup_elem(&relay_meters, &id);
+
+		if (m && !meter(m, f->now, f->size, lane_rate, lane_burst, lane_fill)) {
+			f->st->lane_drops++;
 			return 0;
 		}
 	}
-	if (tunnel_rate && row->tunnel) {
-		__u32 id = row->tunnel;
-		struct relay_tunnel *t = bpf_map_lookup_elem(&relay_tunnels, &id);
+	if (tunnel_rate && f->row->tunnel) {
+		__u32 id = f->row->tunnel;
+		struct relay_meter *m = bpf_map_lookup_elem(&relay_tunnels, &id);
 
-		if (t) {
-			bpf_spin_lock(&t->lock);
-			ok = meter_take(&t->tokens, &t->last, now, size,
-					tunnel_rate, tunnel_burst, tunnel_fill);
-			if (!ok)
-				t->drops++;
-			bpf_spin_unlock(&t->lock);
-			if (!ok) {
-				st->tunnel_drops++;
-				return 0;
-			}
+		if (m && !meter(m, f->now, f->size, tunnel_rate, tunnel_burst, tunnel_fill)) {
+			f->st->tunnel_drops++;
+			return 0;
 		}
 	}
 	return 1;
 }
 
-static __always_inline void count(struct relay_lane *lane,
-				  struct relay_stats *st, __u64 now,
-				  __u64 size)
+/* send counts the forward and returns the action that sends the packet. */
+static __always_inline int send(const struct relay_fwd *f)
 {
-	__sync_fetch_and_add(&lane->packets, 1);
-	__sync_fetch_and_add(&lane->bytes, size);
-	lane->used = now;
-	st->packets++;
-	st->bytes += size;
+	__sync_fetch_and_add(&f->lane->packets, 1);
+	__sync_fetch_and_add(&f->lane->bytes, f->size);
+	f->lane->used = f->now;
+	f->st->packets++;
+	f->st->bytes += f->size;
+	if (redirect)
+		return bpf_redirect(f->link, 0);
+	return XDP_TX;
+}
+
+/* hop_ok reports whether the lane has the next hop of the packet. flow is
+ * the flow word of the packet. */
+static __always_inline int hop_ok(const struct relay_fwd *f, __be32 flow)
+{
+	const struct relay_lane *lane = f->lane;
+
+	return f->now < lane->hop_until && lane->hop_gen == f->row->gen &&
+	       lane->hop_slot == f->slot && lane->hop_link == f->link &&
+	       lane->hop_flow == flow && f->tot <= lane->hop_mtu;
+}
+
+/* hop_save keeps the next hop of a lookup in the lane. An old kernel gives
+ * the length of the packet for the MTU, so a longer packet gets a lookup. */
+static __always_inline void hop_save(const struct relay_fwd *f, __be32 flow,
+				     const struct bpf_fib_lookup *fib)
+{
+	struct relay_lane *lane = f->lane;
+
+	lane->hop_until = 0;
+	__builtin_memcpy(lane->hop_mac, fib->dmac, ETH_ALEN);
+	__builtin_memcpy(lane->hop_mac + ETH_ALEN, fib->smac, ETH_ALEN);
+	lane->hop_gen = f->row->gen;
+	lane->hop_flow = flow;
+	lane->hop_link = f->link;
+	lane->hop_slot = f->slot;
+	lane->hop_mtu = fib->mtu_result;
+	lane->hop_until = f->now + hop_time;
+}
+
+/* set_macs writes the MAC addresses of a packet: of the lane when the lane
+ * keeps the next hop, and of the lookup when it does not. */
+static __always_inline void set_macs(struct ethhdr *eth, const struct relay_fwd *f,
+				     const struct bpf_fib_lookup *fib)
+{
+	if (hop_time) {
+		const __u32 *m = (const __u32 *)f->lane->hop_mac;
+		__u32 *e = (__u32 *)eth;
+
+		e[0] = m[0];
+		e[1] = m[1];
+		e[2] = m[2];
+		return;
+	}
+	__builtin_memcpy(eth->h_dest, fib->dmac, ETH_ALEN);
+	__builtin_memcpy(eth->h_source, fib->smac, ETH_ALEN);
 }
 
 static __always_inline int forward4(struct xdp_md *ctx, struct ethhdr *eth,
 				    struct iphdr *iph, struct udphdr *udp,
-				    struct relay_row *row,
-				    struct relay_lane *lane,
-				    struct relay_stats *st, __u64 now,
-				    __u64 size)
+				    struct relay_fwd *f)
 {
-	struct bpf_fib_lookup fib = {};
+	struct relay_row *row = f->row;
+	struct bpf_fib_lookup fib;
 	__be32 next = *(__be32 *)&row->next[12];
+	/* Routing does not read the ECN bits. */
+	__be32 flow = iph->tos & 0xfc;
 	__u16 old[3], new[3];
 
 	if (*(__u32 *)&row->next[8] != bpf_htonl(0xffff)) {
-		st->no_route++;
+		f->st->no_route++;
 		return XDP_PASS;
 	}
-	fib.family = AF_INET;
-	fib.tos = iph->tos;
-	fib.l4_protocol = IPPROTO_UDP;
-	fib.sport = relay_port;
-	fib.dport = row->next_port;
-	fib.tot_len = bpf_ntohs(iph->tot_len);
-	fib.ifindex = ctx->ingress_ifindex;
-	fib.ipv4_src = iph->daddr;
-	fib.ipv4_dst = next;
-	if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
-	    fib.ifindex != ctx->ingress_ifindex) {
-		st->no_route++;
-		return XDP_PASS;
+	if (!hop_time || !hop_ok(f, flow)) {
+		__builtin_memset(&fib, 0, sizeof(fib));
+		fib.family = AF_INET;
+		fib.tos = iph->tos;
+		fib.l4_protocol = IPPROTO_UDP;
+		fib.sport = relay_port;
+		fib.dport = row->next_port;
+		fib.tot_len = f->tot;
+		fib.ifindex = f->link;
+		fib.ipv4_src = iph->daddr;
+		fib.ipv4_dst = next;
+		if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
+		    fib.ifindex != f->link) {
+			f->st->no_route++;
+			return XDP_PASS;
+		}
+		if (hop_time)
+			hop_save(f, flow, &fib);
 	}
-	if (!meters(row, lane, st, now, size))
+	if (!meters(f))
 		return XDP_DROP;
 
 	/* The source moves to the old destination, so only the old source
@@ -323,47 +409,49 @@ static __always_inline int forward4(struct xdp_md *ctx, struct ethhdr *eth,
 	iph->daddr = next;
 	udp->source = udp->dest;
 	udp->dest = row->next_port;
-	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
-	count(lane, st, now, size);
-	return XDP_TX;
+	set_macs(eth, f, &fib);
+	return send(f);
 }
 
 static __always_inline int forward6(struct xdp_md *ctx, struct ethhdr *eth,
 				    struct ipv6hdr *ip6, struct udphdr *udp,
-				    struct relay_row *row,
-				    struct relay_lane *lane,
-				    struct relay_stats *st, __u64 now,
-				    __u64 size)
+				    struct relay_fwd *f)
 {
-	struct bpf_fib_lookup fib = {};
+	struct relay_row *row = f->row;
+	__be32 flow = *(__be32 *)ip6 & bpf_htonl(0x0fffffff);
+	struct bpf_fib_lookup fib;
 	__u16 old[9], new[9];
 
 	/* IPv6 does not allow UDP without a checksum. */
 	if (!udp->check) {
-		st->malformed++;
+		f->st->malformed++;
 		return XDP_PASS;
 	}
 	if (*(__u32 *)&row->next[8] == bpf_htonl(0xffff) &&
 	    !*(__u64 *)&row->next[0]) {
-		st->no_route++;
+		f->st->no_route++;
 		return XDP_PASS;
 	}
-	fib.family = AF_INET6;
-	fib.flowinfo = *(__be32 *)ip6 & bpf_htonl(0x0fffffff);
-	fib.l4_protocol = IPPROTO_UDP;
-	fib.sport = relay_port;
-	fib.dport = row->next_port;
-	fib.tot_len = bpf_ntohs(ip6->payload_len) + sizeof(*ip6);
-	fib.ifindex = ctx->ingress_ifindex;
-	__builtin_memcpy(fib.ipv6_src, &ip6->daddr, 16);
-	__builtin_memcpy(fib.ipv6_dst, row->next, 16);
-	if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
-	    fib.ifindex != ctx->ingress_ifindex) {
-		st->no_route++;
-		return XDP_PASS;
+	if (!hop_time || !hop_ok(f, flow)) {
+		__builtin_memset(&fib, 0, sizeof(fib));
+		fib.family = AF_INET6;
+		fib.flowinfo = flow;
+		fib.l4_protocol = IPPROTO_UDP;
+		fib.sport = relay_port;
+		fib.dport = row->next_port;
+		fib.tot_len = f->tot;
+		fib.ifindex = f->link;
+		__builtin_memcpy(fib.ipv6_src, &ip6->daddr, 16);
+		__builtin_memcpy(fib.ipv6_dst, row->next, 16);
+		if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
+		    fib.ifindex != f->link) {
+			f->st->no_route++;
+			return XDP_PASS;
+		}
+		if (hop_time)
+			hop_save(f, flow, &fib);
 	}
-	if (!meters(row, lane, st, now, size))
+	if (!meters(f))
 		return XDP_DROP;
 
 	__builtin_memcpy(old, &ip6->saddr, 16);
@@ -376,64 +464,70 @@ static __always_inline int forward6(struct xdp_md *ctx, struct ethhdr *eth,
 	ip6->hop_limit = FWD_TTL;
 	udp->source = udp->dest;
 	udp->dest = row->next_port;
-	__builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
-	__builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
-	count(lane, st, now, size);
-	return XDP_TX;
+	set_macs(eth, f, &fib);
+	return send(f);
 }
 
 /* lookup checks the UDP and PSP headers and finds the row and the lane of
  * the packet. tot is the IP length and hlen the IP header length. It returns
- * NULL for XDP_PASS. */
-static __always_inline struct relay_row *
-lookup(struct udphdr *udp, void *data_end, __u32 tot, __u32 hlen,
-       const struct relay_addr *dst, struct relay_key *key,
-       struct relay_lane **lane, struct relay_stats **st, __u64 *now,
-       __u64 *size)
+ * 0 for XDP_PASS. */
+static __always_inline int lookup(struct xdp_md *ctx, struct udphdr *udp,
+				  void *data_end, __u32 tot, __u32 hlen,
+				  const struct relay_addr *dst,
+				  struct relay_key *key, struct relay_fwd *f)
 {
 	__u8 *psp = (void *)(udp + 1);
-	struct relay_row *row;
 	__u32 zero = 0;
 	__u32 ulen, lane_id;
+	int slot;
 
 	if ((void *)(psp + 8) > data_end || udp->dest != relay_port)
-		return NULL;
+		return 0;
 	ulen = bpf_ntohs(udp->len);
 	if (ulen < sizeof(*udp) + PSP_OVERHEAD || ulen != tot - hlen ||
 	    (void *)udp + ulen > data_end)
-		return NULL;
+		return 0;
 	key->spi = psp_spi(psp);
 	if (!key->spi)
-		return NULL;
-	*st = bpf_map_lookup_elem(&relay_cpu_stats, &zero);
-	if (!*st)
-		return NULL;
+		return 0;
+	f->st = bpf_map_lookup_elem(&relay_cpu_stats, &zero);
+	if (!f->st)
+		return 0;
 	/* In generic mode the kernel can join UDP packets before the program
 	 * runs. This catches only a join above max_len. The loader checks that
 	 * the link does not join packets. */
 	if (tot > max_len) {
-		(*st)->too_long++;
-		return NULL;
+		f->st->too_long++;
+		return 0;
 	}
-	if (!is_relay_addr(dst))
-		return NULL;
+	slot = relay_slot(dst);
+	if (slot < 0)
+		return 0;
+	f->slot = slot;
 	key->port = udp->source;
-	row = bpf_map_lookup_elem(&relay_rows, key);
-	if (!row) {
-		(*st)->no_row++;
-		return NULL;
+	f->row = bpf_map_lookup_elem(&relay_rows, key);
+	if (!f->row) {
+		f->st->no_row++;
+		return 0;
 	}
-	*now = bpf_ktime_get_ns();
-	if (*now > row->expires) {
-		(*st)->expired++;
-		return NULL;
+	/* A meter needs the exact clock. The coarse clock costs less, and is
+	 * one timer tick behind at most. */
+	if (lane_rate || (tunnel_rate && f->row->tunnel))
+		f->now = bpf_ktime_get_ns();
+	else
+		f->now = bpf_ktime_get_coarse_ns();
+	if (f->now > f->row->expires) {
+		f->st->expired++;
+		return 0;
 	}
-	lane_id = row->lane;
-	*lane = bpf_map_lookup_elem(&relay_lanes, &lane_id);
-	if (!*lane)
-		return NULL;
-	*size = ulen - sizeof(*udp);
-	return row;
+	lane_id = f->row->lane;
+	f->lane = bpf_map_lookup_elem(&relay_lanes, &lane_id);
+	if (!f->lane)
+		return 0;
+	f->size = ulen - sizeof(*udp);
+	f->link = ctx->ingress_ifindex;
+	f->tot = tot;
+	return 1;
 }
 
 SEC("xdp")
@@ -444,11 +538,8 @@ int relay_forward(struct xdp_md *ctx)
 	struct ethhdr *eth = data;
 	struct relay_key key = {};
 	struct relay_addr dst = {};
-	struct relay_stats *st;
-	struct relay_lane *lane;
-	struct relay_row *row;
+	struct relay_fwd f;
 	struct udphdr *udp;
-	__u64 now, size;
 
 	if ((void *)(eth + 1) > data_end)
 		return XDP_PASS;
@@ -466,11 +557,10 @@ int relay_forward(struct xdp_md *ctx)
 		dst.addr[10] = 0xff;
 		dst.addr[11] = 0xff;
 		__builtin_memcpy(&dst.addr[12], &iph->daddr, 4);
-		row = lookup(udp, data_end, bpf_ntohs(iph->tot_len), sizeof(*iph),
-			     &dst, &key, &lane, &st, &now, &size);
-		if (!row)
+		if (!lookup(ctx, udp, data_end, bpf_ntohs(iph->tot_len),
+			    sizeof(*iph), &dst, &key, &f))
 			return XDP_PASS;
-		return forward4(ctx, eth, iph, udp, row, lane, st, now, size);
+		return forward4(ctx, eth, iph, udp, &f);
 	}
 	if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6 = (void *)(eth + 1);
@@ -480,12 +570,11 @@ int relay_forward(struct xdp_md *ctx)
 		udp = (void *)(ip6 + 1);
 		__builtin_memcpy(key.addr, &ip6->saddr, 16);
 		__builtin_memcpy(dst.addr, &ip6->daddr, 16);
-		row = lookup(udp, data_end,
-			     (__u32)bpf_ntohs(ip6->payload_len) + sizeof(*ip6),
-			     sizeof(*ip6), &dst, &key, &lane, &st, &now, &size);
-		if (!row)
+		if (!lookup(ctx, udp, data_end,
+			    (__u32)bpf_ntohs(ip6->payload_len) + sizeof(*ip6),
+			    sizeof(*ip6), &dst, &key, &f))
 			return XDP_PASS;
-		return forward6(ctx, eth, ip6, udp, row, lane, st, now, size);
+		return forward6(ctx, eth, ip6, udp, &f);
 	}
 	return XDP_PASS;
 }

@@ -31,19 +31,30 @@ type RelayConfig struct {
 	// per second. Zero turns the meter off. The bursts are in bytes.
 	LaneRate, LaneBurst     uint64
 	TunnelRate, TunnelBurst uint64
+	// NextHopCache is the time that a row keeps the next hop of a route
+	// lookup, so a route or neighbor change takes effect after this time at
+	// most. Zero does a lookup for each packet.
+	NextHopCache time.Duration
+	// Redirect sends with a redirect to the same link and not with XDP_TX.
+	// A driver that flushes each XDP_TX packet (ena) is faster with it.
+	Redirect bool
 }
 
 // Relay is the XDP program of a PSP relay. It sends a PSP packet that
 // matches a row (sender address and port, SPI) to the next hop of the row
-// with XDP_TX. It gives other packets to the kernel (XDP_PASS). Each row has
-// a lane with its meter and counters, which a change to the row keeps.
+// with XDP_TX, or with a redirect to the same link. It gives other packets to
+// the kernel (XDP_PASS). Each row has a lane with its meter and counters,
+// which a change to the row keeps.
 type Relay struct {
 	objs relayObjects
 	link link.Link
+	// laneMeter is true when the rows have a meter.
+	laneMeter bool
 
 	mu    sync.Mutex
 	free  []uint32 // Lanes of deleted rows, oldest first.
 	lanes uint32   // Lanes given out so far.
+	gen   uint32   // The gen of the last row with a new next hop.
 }
 
 // RelayRow is the next hop of a row and its limits.
@@ -89,6 +100,10 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tunnel meter: %w", err)
 	}
+	var redirect uint32
+	if cfg.Redirect {
+		redirect = 1
+	}
 	vars := map[string]any{
 		"relay_port":   be16(cfg.Port),
 		"max_len":      cfg.MaxLen,
@@ -98,6 +113,8 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 		"tunnel_rate":  cfg.TunnelRate,
 		"tunnel_burst": cfg.TunnelBurst,
 		"tunnel_fill":  tunnelFill,
+		"hop_time":     uint64(max(cfg.NextHopCache, 0)),
+		"redirect":     redirect,
 	}
 	for name, v := range vars {
 		vs, ok := spec.Variables[name]
@@ -108,7 +125,11 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 			return nil, fmt.Errorf("failed to set %s: %w", name, err)
 		}
 	}
-	r := &Relay{}
+	r := &Relay{laneMeter: cfg.LaneRate > 0}
+	if !r.laneMeter {
+		// The program does not read the lane meters.
+		spec.Maps["relay_meters"].MaxEntries = 1
+	}
 	if err := spec.LoadAndAssign(&r.objs, nil); err != nil {
 		return nil, fmt.Errorf("failed to load relay program: %w", err)
 	}
@@ -191,9 +212,14 @@ func (r *Relay) PutRow(sender netip.AddrPort, spi uint32, row RelayRow) error {
 			return err
 		}
 	}
+	next, port := row.Next.Addr().As16(), be16(row.Next.Port())
+	if added || v.Next != next || v.NextPort != port {
+		// A lane keeps a next hop only for the gen of its lookup.
+		r.gen++
+		v.Gen = r.gen
+	}
 	v.Tunnel = row.Tunnel
-	v.Next = row.Next.Addr().As16()
-	v.NextPort = be16(row.Next.Port())
+	v.Next, v.NextPort = next, port
 	v.Expires = uint64(max(row.Expires, 0))
 	if err := r.objs.RelayRows.Update(&k, &v, ebpf.UpdateAny); err != nil {
 		if added {
@@ -216,7 +242,11 @@ func (r *Relay) newLane() (uint32, error) {
 	default:
 		return 0, errors.New("all lanes are in use")
 	}
-	if err := r.objs.RelayLanes.Update(lane, relayRelayLane{}, ebpf.UpdateLock); err != nil {
+	err := r.objs.RelayLanes.Update(lane, relayRelayLane{}, ebpf.UpdateAny)
+	if err == nil && r.laneMeter {
+		err = r.objs.RelayMeters.Update(lane, relayRelayMeter{}, ebpf.UpdateLock)
+	}
+	if err != nil {
 		r.free = append(r.free, lane)
 		return 0, err
 	}
@@ -255,20 +285,28 @@ func (r *Relay) Counters(sender netip.AddrPort, spi uint32) (RelayCounters, erro
 // lane returns the counters of a lane.
 func (r *Relay) lane(lane uint32) (RelayCounters, error) {
 	var v relayRelayLane
-	if err := r.objs.RelayLanes.LookupWithFlags(lane, &v, ebpf.LookupLock); err != nil {
+	if err := r.objs.RelayLanes.Lookup(lane, &v); err != nil {
 		return RelayCounters{}, err
 	}
-	return counters(&v), nil
+	c := RelayCounters{Packets: v.Packets, Bytes: v.Bytes, Used: time.Duration(v.Used)}
+	if r.laneMeter {
+		var m relayRelayMeter
+		if err := r.objs.RelayMeters.LookupWithFlags(lane, &m, ebpf.LookupLock); err != nil {
+			return RelayCounters{}, err
+		}
+		c.Drops = m.Drops
+	}
+	return c, nil
 }
 
 // PutTunnel adds the tunnel meter id with a full bucket.
 func (r *Relay) PutTunnel(id uint32) error {
-	return r.objs.RelayTunnels.Update(id, relayRelayTunnel{}, ebpf.UpdateAny)
+	return r.objs.RelayTunnels.Update(id, relayRelayMeter{}, ebpf.UpdateAny)
 }
 
 // DeleteTunnel removes the tunnel meter id and returns its drops.
 func (r *Relay) DeleteTunnel(id uint32) (uint64, error) {
-	var v relayRelayTunnel
+	var v relayRelayMeter
 	if err := r.objs.RelayTunnels.LookupWithFlags(id, &v, ebpf.LookupLock); err != nil {
 		return 0, err
 	}
@@ -277,7 +315,7 @@ func (r *Relay) DeleteTunnel(id uint32) (uint64, error) {
 
 // TunnelDrops returns the drops of the tunnel meter id.
 func (r *Relay) TunnelDrops(id uint32) (uint64, error) {
-	var v relayRelayTunnel
+	var v relayRelayMeter
 	if err := r.objs.RelayTunnels.LookupWithFlags(id, &v, ebpf.LookupLock); err != nil {
 		return 0, err
 	}
@@ -314,10 +352,6 @@ func Monotonic() time.Duration {
 
 func rowKey(sender netip.AddrPort, spi uint32) relayRelayKey {
 	return relayRelayKey{Addr: sender.Addr().As16(), Port: be16(sender.Port()), Spi: be32(spi)}
-}
-
-func counters(v *relayRelayLane) RelayCounters {
-	return RelayCounters{Packets: v.Packets, Bytes: v.Bytes, Drops: v.Drops, Used: time.Duration(v.Used)}
 }
 
 // be16 and be32 return v with its bytes in network order in memory.
