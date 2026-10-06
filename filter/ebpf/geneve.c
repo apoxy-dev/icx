@@ -29,6 +29,11 @@ parse_genevehdr(struct hdr_cursor *nh, void *data_end, struct genevehdr **ghdr)
 	if ((gh->ver_opt_len >> 6) != 0) // Only version 0 supported
 		return -1;
 
+	// A Geneve sender sets the 6 reserved flag bits to 0. Other protocols on
+	// the port have a bit there: a VPC path probe has its version in this byte.
+	if (gh->flags & 0x3f)
+		return -1;
+
 	// Check that the protocol type is valid (IPv4 or IPv6 or Unknown (out-of-band messages))
 	__u16 ptype = bpf_ntohs(gh->proto_type);
 	if (ptype != ETH_P_IP && ptype != ETH_P_IPV6 && ptype != 0)
@@ -83,7 +88,7 @@ static __always_inline int geneve(struct xdp_md *ctx)
 	void *data = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
 	int *qidconf, index = ctx->rx_queue_index;
-	int nh_type, ip_proto;
+	int nh_type, ip_proto, udp_len;
 	struct hdr_cursor nh = { .pos = data };
 	struct ethhdr *eth;
 	struct iphdr *iph;
@@ -120,7 +125,8 @@ static __always_inline int geneve(struct xdp_md *ctx)
 		return XDP_PASS;
 	}
 
-	if (parse_udphdr(&nh, data_end, &udph) < 0)
+	udp_len = parse_udphdr(&nh, data_end, &udph);
+	if (udp_len < 0)
 		return XDP_PASS;
 
 	key.port = bpf_ntohs(udph->dest);
@@ -138,8 +144,10 @@ static __always_inline int geneve(struct xdp_md *ctx)
 		}
 	}
 
-	// Now make sure it's Geneve traffic.
-	if (parse_genevehdr(&nh, data_end, &geneve) < 0)
+	// Now make sure it's Geneve traffic. The bytes after a UDP datagram that is
+	// shorter than a Geneve header are link padding, so they are not a header.
+	if (udp_len < (int)sizeof(struct genevehdr) ||
+	    parse_genevehdr(&nh, data_end, &geneve) < 0)
 		return XDP_PASS;
 
 	// This frame matched a registered bind (our underlay addr:port) and parsed as
