@@ -102,12 +102,13 @@ func udpPayload(frame []byte) []byte {
 // TestGeneveSharedPort checks which packets to a bound address the Geneve
 // program takes. VPC v2 packets and QUIC use the same port, and must pass.
 func TestGeneveSharedPort(t *testing.T) {
+	needXSK(t)
 	ns := newTestNS(t)
 	dst4, dst6 := netip.AddrPortFrom(relay4, relayPort), netip.AddrPortFrom(relay6, relayPort)
 	src4, src6 := netip.AddrPortFrom(sender4, 4000), netip.AddrPortFrom(sender6, 4000)
 	g, err := Geneve(net.UDPAddrFromAddrPort(dst4), net.UDPAddrFromAddrPort(dst6))
 	if errors.Is(err, unix.EPERM) {
-		t.Skipf("cannot load BPF programs: %v", err)
+		skipOrFail(t, "cannot load BPF programs: %v", err)
 	}
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = g.Close() })

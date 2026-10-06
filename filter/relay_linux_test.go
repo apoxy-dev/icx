@@ -79,11 +79,47 @@ type testNS struct {
 	work    chan func()
 }
 
+// requireBPFEnv is set where the tests have the rights to load and run BPF
+// programs, as in the privileged CI lanes.
+const requireBPFEnv = "ICX_REQUIRE_BPF"
+
+// skipOrFail skips a test that the process has no rights for. It fails the
+// test when requireBPFEnv is set, so a CI lane cannot pass with a skip.
+func skipOrFail(t testing.TB, format string, args ...any) {
+	t.Helper()
+	if os.Getenv(requireBPFEnv) != "" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// noXSK returns the error of a kernel with no AF_XDP sockets, as that of the
+// arm64 CI runners. Such a kernel cannot load a program with a socket map.
+func noXSK() error {
+	fd, err := unix.Socket(unix.AF_XDP, unix.SOCK_RAW, 0)
+	if err == nil {
+		_ = unix.Close(fd)
+	}
+	if errors.Is(err, unix.EAFNOSUPPORT) {
+		return err
+	}
+	return nil
+}
+
+// needXSK skips a test of the All or Geneve program on a kernel with no
+// AF_XDP sockets.
+func needXSK(t testing.TB) {
+	t.Helper()
+	if err := noXSK(); err != nil {
+		t.Skipf("the kernel has no AF_XDP sockets: %v", err)
+	}
+}
+
 // newTestNS makes a testNS. It skips the test without NET_ADMIN.
 func newTestNS(t testing.TB) *testNS {
 	t.Helper()
 	if ok, _ := permissions.IsNetAdmin(); !ok {
-		t.Skip("needs NET_ADMIN")
+		skipOrFail(t, "needs NET_ADMIN")
 	}
 	ns := &testNS{work: make(chan func())}
 	errc := make(chan error, 1)
@@ -105,7 +141,7 @@ func newTestNS(t testing.TB) *testNS {
 		}
 	}()
 	if err := <-errc; err != nil {
-		t.Skipf("cannot set up the test netns: %v", err)
+		skipOrFail(t, "cannot set up the test netns: %v", err)
 	}
 	t.Cleanup(func() { close(ns.work) })
 	return ns
@@ -276,7 +312,7 @@ func newTestRelay(t testing.TB, cfg RelayConfig) *Relay {
 	cfg.MaxLen = testMaxLen
 	r, err := NewRelay(cfg)
 	if errors.Is(err, unix.EPERM) {
-		t.Skipf("cannot load BPF programs: %v", err)
+		skipOrFail(t, "cannot load BPF programs: %v", err)
 	}
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Close() })
@@ -988,6 +1024,7 @@ func TestRelayMeterManyThreads(t *testing.T) {
 // TestRelayChain checks that the Geneve program sends the packets that it
 // passes to the relay program.
 func TestRelayChain(t *testing.T) {
+	needXSK(t)
 	ns := newTestNS(t)
 	r := newTestRelay(t, RelayConfig{})
 	g, err := Geneve(&net.UDPAddr{IP: relay4.AsSlice(), Port: relayPort})
@@ -1018,8 +1055,8 @@ type genericResult struct {
 // from the peer netns, as a wire does and as a sender with UDP GSO does. The
 // kernel gives a GSO message to generic XDP as one datagram.
 func TestRelayGeneric(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("needs root")
+	if ok, _ := permissions.IsNetAdmin(); !ok {
+		skipOrFail(t, "needs NET_ADMIN")
 	}
 	cases := []struct {
 		name  string
@@ -1041,6 +1078,10 @@ func TestRelayGeneric(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			res := runGeneric(t, tc.cfg, tc.gso, tc.size)
+			// Root in a container can be without the rights for a netns or BPF.
+			if errors.Is(res.err, unix.EPERM) {
+				skipOrFail(t, "cannot run the program in a test netns: %v", res.err)
+			}
 			require.NoError(t, res.err)
 			assert.Equal(t, tc.spisA, res.spisA)
 			assert.Equal(t, tc.spisB, res.spisB)

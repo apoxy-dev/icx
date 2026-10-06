@@ -94,6 +94,38 @@ jobs:
         # redirect program and bind AF_XDP sockets on the runner's real kernel.
         run: dagger call -v integration --src=.
 
+  kernels:
+    name: Kernels (${{ matrix.arch }})
+    needs: unit
+    # Load the XDP programs on each supported kernel in a QEMU guest. The guest
+    # needs no KVM, so it runs on the same Blacksmith runners as the other jobs.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-16vcpu-ubuntu-2204
+            arch: amd64
+          - runner: blacksmith-16vcpu-ubuntu-2204-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          check-latest: true
+
+      - uses: ./.github/actions/setup-dagger
+
+      - name: Load the XDP programs on each kernel via Dagger
+        env:
+          SHUTUP: 1
+        timeout-minutes: 20
+        run: dagger call -v kernels --src=.
+
   build-cli:
     name: Build icx (${{ matrix.goarch }})
     runs-on: ubuntu-latest

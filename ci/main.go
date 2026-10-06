@@ -8,6 +8,8 @@
 //     the cli module, unprivileged, race detector on — the fast feedback check.
 //   - Integration: the whole tree plus the cli module WITH the root capability
 //     set, on a real kernel, so the veth/AF_XDP/forwarder tests actually run.
+//   - Kernels: the test that loads the XDP programs, on each supported kernel
+//     in a QEMU guest.
 //   - Bench / Benchstat: `go test -bench -benchmem` and an A/B baseline diff,
 //     feeding the performance thread (the open P-series findings).
 //
@@ -34,6 +36,23 @@ const goImage = "golang:1.25-bookworm"
 // benchstatPkg is pinned-by-module benchstat; installed on demand by Benchstat
 // so the common lanes don't pay for it.
 const benchstatPkg = "golang.org/x/perf/cmd/benchstat@latest"
+
+// vimtoPkg is the tool that runs a Go test in a QEMU guest.
+const vimtoPkg = "lmb.io/vimto@v0.4.0"
+
+// kernelImage has a kernel at /boot/vmlinuz for each of its tags.
+const kernelImage = "ghcr.io/cilium/ci-kernels"
+
+// loadTest is the test that loads each XDP program.
+const loadTest = "TestProgramsLoad"
+
+// requireBPFEnv makes a filter test fail where it skips for a lack of rights.
+// The lanes that give the tests those rights set it.
+const requireBPFEnv = "ICX_REQUIRE_BPF"
+
+// defaultKernels are the long-term kernels that have all helpers of the
+// programs (Linux 5.11), and the newest stable kernel.
+var defaultKernels = []string{"5.15", "6.1", "6.6", "6.12", "stable"}
 
 // privilegedPkgRe matches the packages whose tests HARD-FAIL without the root
 // capability set: they create veth pairs / AF_XDP sockets and call t.Fatal on
@@ -102,7 +121,61 @@ func (m *Icx) Integration(
 	// +default=true
 	race bool,
 ) (string, error) {
-	return runSuite(ctx, m.BuilderContainer(src), goTestArgs(race), []string{"./..."}, true)
+	c := m.BuilderContainer(src).WithEnvVariable(requireBPFEnv, "1")
+	return runSuite(ctx, c, goTestArgs(race), []string{"./..."}, true)
+}
+
+// Kernels loads the XDP programs on each kernel, which is a tag of
+// ghcr.io/cilium/ci-kernels. A QEMU guest without KVM runs the load test, so
+// each runner can run it. A kernel that rejects a program fails the call.
+func (m *Icx) Kernels(
+	ctx context.Context,
+	src *dagger.Directory,
+	// Kernels to test. The default is 5.15, 6.1, 6.6, 6.12 and stable.
+	// +optional
+	kernels []string,
+) (string, error) {
+	if len(kernels) == 0 {
+		kernels = defaultKernels
+	}
+	platform, err := dag.DefaultPlatform(ctx)
+	if err != nil {
+		return "", fmt.Errorf("default platform: %w", err)
+	}
+	qemu := "qemu-system-x86"
+	if strings.HasPrefix(string(platform), "linux/arm64") {
+		qemu = "qemu-system-arm"
+	}
+	c := m.BuilderContainer(src).
+		WithExec([]string{"apt-get", "install", "-y", "-qq", "--no-install-recommends", qemu}).
+		// vimto runs only as a static binary.
+		WithEnvVariable("CGO_ENABLED", "0").
+		WithExec([]string{"go", "install", vimtoPkg}).
+		WithoutEnvVariable("CGO_ENABLED").
+		WithEnvVariable("VIMTO_DISABLE_KVM", "true").
+		WithEnvVariable(requireBPFEnv, "1")
+
+	var b strings.Builder
+	var errs []error
+	for _, k := range kernels {
+		fmt.Fprintf(&b, "===== kernel %s =====\n", k)
+		vmlinuz := dag.Container().From(kernelImage + ":" + k).File("/boot/vmlinuz")
+		out, err := execStdout(ctx, c.
+			WithFile("/kernel/vmlinuz", vmlinuz).
+			WithExec([]string{
+				"vimto", "-kernel", "/kernel/vmlinuz", "-memory", "size=1G", "-smp", "cpus=2", "--",
+				"go", "test", "-count=1", "-v", "-run", "^" + loadTest + "$", "./filter",
+			}))
+		b.WriteString(out)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("kernel %s: %w", k, err))
+		case !strings.Contains(out, "--- PASS: "+loadTest+" ") || strings.Contains(out, "--- SKIP: "):
+			// A run with no test or with a skip also exits with 0.
+			errs = append(errs, fmt.Errorf("kernel %s: the load test did not run all cases", k))
+		}
+	}
+	return b.String(), errors.Join(errs...)
 }
 
 // Bench runs the Go benchmarks with -benchmem and no race detector (the race
