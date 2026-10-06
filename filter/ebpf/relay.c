@@ -532,6 +532,10 @@ static __always_inline int lookup(struct xdp_md *ctx, struct udphdr *udp,
 	if ((void *)(psp + 8) > data_end || udp->dest != relay_port)
 		return 0;
 	ulen = bpf_ntohs(udp->len);
+	/* An old kernel knows no bounds of a byte swap, and the sum of a packet
+	 * pointer and ulen needs them. The compiler must keep the mask. */
+	barrier_var(ulen);
+	ulen &= 0xffff;
 	if (ulen < sizeof(*udp) + PSP_OVERHEAD || ulen != tot - hlen ||
 	    (void *)udp + ulen > data_end)
 		return 0;
