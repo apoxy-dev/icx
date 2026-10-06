@@ -52,6 +52,8 @@ type Relay struct {
 	link link.Link
 	// laneMeter is true when the rows have a meter.
 	laneMeter bool
+	// laneFull and tunnelFull are the tokens of a full bucket, in byte-ns.
+	laneFull, tunnelFull uint64
 
 	mu    sync.Mutex
 	free  []uint32 // Lanes of deleted rows, oldest first.
@@ -128,6 +130,14 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 		}
 	}
 	r := &Relay{laneMeter: cfg.LaneRate > 0}
+	// A new bucket must be full. With zero tokens the program fills it for
+	// the time since the host started, which is short on a new host.
+	if cfg.LaneRate > 0 {
+		r.laneFull = cfg.LaneBurst * uint64(time.Second)
+	}
+	if cfg.TunnelRate > 0 {
+		r.tunnelFull = cfg.TunnelBurst * uint64(time.Second)
+	}
 	if !r.laneMeter {
 		// The program does not read the lane meters.
 		spec.Maps["relay_meters"].MaxEntries = 1
@@ -246,7 +256,7 @@ func (r *Relay) newLane() (uint32, error) {
 	}
 	err := r.objs.RelayLanes.Update(lane, relayRelayLane{}, ebpf.UpdateAny)
 	if err == nil && r.laneMeter {
-		err = r.objs.RelayMeters.Update(lane, relayRelayMeter{}, ebpf.UpdateLock)
+		err = r.objs.RelayMeters.Update(lane, relayRelayMeter{Tokens: r.laneFull}, ebpf.UpdateLock)
 	}
 	if err != nil {
 		r.free = append(r.free, lane)
@@ -303,7 +313,7 @@ func (r *Relay) lane(lane uint32) (RelayCounters, error) {
 
 // PutTunnel adds the tunnel meter id with a full bucket.
 func (r *Relay) PutTunnel(id uint32) error {
-	if err := r.objs.RelayTunnels.Update(id, relayRelayMeter{}, ebpf.UpdateAny); err != nil {
+	if err := r.objs.RelayTunnels.Update(id, relayRelayMeter{Tokens: r.tunnelFull}, ebpf.UpdateAny); err != nil {
 		return err
 	}
 	// The program finds a tunnel by its shares, so the bucket comes first.

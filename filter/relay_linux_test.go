@@ -710,6 +710,23 @@ func TestRelayForward(t *testing.T) {
 	}
 }
 
+// TestRelayNewBucketIsFull checks that a new meter has its burst at once. It
+// must not depend on the time since the host started.
+func TestRelayNewBucketIsFull(t *testing.T) {
+	r := newTestRelay(t, RelayConfig{LaneRate: 1, LaneBurst: 250, TunnelRate: 1, TunnelBurst: 1000})
+	src := netip.AddrPortFrom(sender4, 4000)
+	require.NoError(t, r.PutTunnel(3))
+	require.NoError(t, r.PutRow(src, testSPI, RelayRow{Next: netip.AddrPortFrom(next4, nextPort), Tunnel: 3, Expires: Monotonic() + time.Hour}))
+	k := rowKey(src, testSPI)
+	var row relayRelayRow
+	require.NoError(t, r.objs.RelayRows.Lookup(&k, &row))
+	var lane, tunnel relayRelayMeter
+	require.NoError(t, r.objs.RelayMeters.LookupWithFlags(row.Lane, &lane, ebpf.LookupLock))
+	require.NoError(t, r.objs.RelayTunnels.LookupWithFlags(uint32(3), &tunnel, ebpf.LookupLock))
+	assert.Equal(t, 250*uint64(time.Second), lane.Tokens, "lane meter")
+	assert.Equal(t, 1000*uint64(time.Second), tunnel.Tokens, "tunnel limit")
+}
+
 func TestRelayRows(t *testing.T) {
 	ns := newTestNS(t)
 	r := newTestRelay(t, RelayConfig{LaneRate: 1, LaneBurst: 250, TunnelRate: 1, TunnelBurst: 1000})
